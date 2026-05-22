@@ -4,12 +4,14 @@ import express, { NextFunction, Request, Response } from "express";
 import { deleteUser, listUsers, login, me, register, requireAuth, updateUser } from "./controller/auth.controller";
 import {
   attendanceUpload,
+  deleteRecord as deleteAttendanceRecord,
   imports as attendanceImports,
   index as attendanceIndex,
   manualSave,
   previewImport,
   saveImport,
-  showImport
+  showImport,
+  updateRecord as updateAttendanceRecord
 } from "./controller/attendance.controller";
 import {
   deletePenalty,
@@ -100,6 +102,9 @@ app.get("/api/attendance/imports/:importId", showImport);
 app.post("/api/attendance/manual", manualSave);
 app.post("/api/attendance/import/preview", attendanceUpload.single("file"), previewImport);
 app.post("/api/attendance/import/save", attendanceUpload.single("file"), saveImport);
+app.put("/api/attendance/:id", updateAttendanceRecord);
+app.patch("/api/attendance/:id", updateAttendanceRecord);
+app.delete("/api/attendance/:id", deleteAttendanceRecord);
 
 app.get("/api/fines", fines);
 app.get("/api/fines/summary", summary);

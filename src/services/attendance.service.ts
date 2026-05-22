@@ -355,9 +355,24 @@ async function insertAttendanceRecord(client: PoolClient, importId: string | nul
   return result.rows[0];
 }
 
-async function insertFineIfNeeded(client: PoolClient, record: AttendanceRecord) {
-  if (!record.no_of_absences || record.no_of_absences <= 0) return null;
+function createValidationError(message: string, statusCode = 400) {
+  const error = new Error(message);
+  (error as any).statusCode = statusCode;
+  return error;
+}
 
+function validateAttendanceInput(input: RawImportRow) {
+  const preview = buildPreview("manual-attendance", "manual", [input]);
+  const row = preview.rows[0];
+
+  if (!row || row.errors.length > 0) {
+    throw createValidationError(row?.errors.join(" ") || "Please provide a valid attendance record.");
+  }
+
+  return row;
+}
+
+async function findMatchingPenalty(client: PoolClient, noOfAbsences: number) {
   const penaltyResult = await client.query(
     `
       SELECT *
@@ -366,11 +381,46 @@ async function insertFineIfNeeded(client: PoolClient, record: AttendanceRecord) 
       ORDER BY no_of_absences DESC
       LIMIT 1
     `,
-    [record.no_of_absences]
+    [noOfAbsences]
   );
 
-  const penalty = penaltyResult.rows[0];
+  return penaltyResult.rows[0] ?? null;
+}
+
+async function syncFineForAttendanceRecord(client: PoolClient, record: AttendanceRecord) {
+  if (!record.no_of_absences || record.no_of_absences <= 0) {
+    await client.query("DELETE FROM fines WHERE attendance_record_id = $1", [record.id]);
+    return null;
+  }
+
+  const penalty = await findMatchingPenalty(client, record.no_of_absences);
   const penaltyText = penalty?.prescribed_penalty ?? "No prescribed penalty configured.";
+
+  const existingFineResult = await client.query<FineRecord>(
+    "SELECT * FROM fines WHERE attendance_record_id = $1 LIMIT 1",
+    [record.id]
+  );
+  const existingFine = existingFineResult.rows[0];
+
+  if (existingFine) {
+    const fineResult = await client.query<FineRecord>(
+      `
+        UPDATE fines
+        SET
+          penalty_id = $2,
+          student_id = $3,
+          name = $4,
+          no_of_absences = $5,
+          prescribed_penalty = $6,
+          updated_at = NOW()
+        WHERE id = $1
+        RETURNING *
+      `,
+      [existingFine.id, penalty?.id ?? null, record.student_id, record.name, record.no_of_absences, penaltyText]
+    );
+
+    return fineResult.rows[0];
+  }
 
   const fineResult = await client.query<FineRecord>(
     `
@@ -390,6 +440,10 @@ async function insertFineIfNeeded(client: PoolClient, record: AttendanceRecord) 
   );
 
   return fineResult.rows[0];
+}
+
+async function insertFineIfNeeded(client: PoolClient, record: AttendanceRecord) {
+  return syncFineForAttendanceRecord(client, record);
 }
 
 export async function previewAttendanceFile(file: UploadedAttendanceFile): Promise<AttendancePreviewResult> {
@@ -449,14 +503,7 @@ export async function saveAttendanceFile(file: UploadedAttendanceFile): Promise<
 
 
 export async function saveManualAttendanceRecord(input: RawImportRow) {
-  const preview = buildPreview("manual-attendance", "manual", [input]);
-  const row = preview.rows[0];
-
-  if (!row || row.errors.length > 0) {
-    const validationError = new Error(row?.errors.join(" ") || "Please provide a valid attendance record.");
-    (validationError as any).statusCode = 400;
-    throw validationError;
-  }
+  const row = validateAttendanceInput(input);
 
   return withTransaction(async (client) => {
     await upsertStudent(client, row);
@@ -467,6 +514,79 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       record,
       fine
     };
+  });
+}
+
+export async function updateAttendanceRecord(id: string, input: RawImportRow) {
+  const row = validateAttendanceInput(input);
+
+  return withTransaction(async (client) => {
+    const existingResult = await client.query<AttendanceRecord>(
+      "SELECT * FROM attendance_records WHERE id = $1 LIMIT 1",
+      [id]
+    );
+
+    if (!existingResult.rows[0]) {
+      throw createValidationError("Attendance record not found.", 404);
+    }
+
+    await upsertStudent(client, row);
+
+    const updatedResult = await client.query<AttendanceRecord>(
+      `
+        UPDATE attendance_records
+        SET
+          student_id = $2,
+          name = $3,
+          year_level = NULLIF($4, ''),
+          college = NULLIF($5, ''),
+          program = NULLIF($6, ''),
+          institution = NULLIF($7, ''),
+          no_of_absences = $8,
+          remarks = NULLIF($9, ''),
+          updated_at = NOW()
+        WHERE id = $1
+        RETURNING *
+      `,
+      [
+        id,
+        row.studentId,
+        row.name,
+        row.yearLevel ?? "",
+        row.college ?? "",
+        row.program ?? "",
+        row.institution ?? "",
+        row.noOfAbsences ?? 0,
+        row.remarks ?? ""
+      ]
+    );
+
+    const record = updatedResult.rows[0];
+    const fine = await syncFineForAttendanceRecord(client, record);
+
+    return {
+      record,
+      fine
+    };
+  });
+}
+
+export async function deleteAttendanceRecord(id: string) {
+  return withTransaction(async (client) => {
+    const existingResult = await client.query<AttendanceRecord>(
+      "SELECT * FROM attendance_records WHERE id = $1 LIMIT 1",
+      [id]
+    );
+    const record = existingResult.rows[0];
+
+    if (!record) {
+      throw createValidationError("Attendance record not found.", 404);
+    }
+
+    await client.query("DELETE FROM fines WHERE attendance_record_id = $1", [id]);
+    await client.query("DELETE FROM attendance_records WHERE id = $1", [id]);
+
+    return record;
   });
 }
 

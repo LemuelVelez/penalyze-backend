@@ -2,6 +2,7 @@ import { NextFunction, Request, Response } from "express";
 import multer from "multer";
 
 import {
+  deleteAttendanceRecord,
   getAttendanceImport,
   listAttendanceImports,
   listAttendanceRecords,
@@ -9,6 +10,7 @@ import {
   saveAttendanceFile,
   saveManualAttendanceRecord,
   saveAttendanceRows,
+  updateAttendanceRecord,
   UploadedAttendanceFile
 } from "../services/attendance.service";
 
@@ -59,6 +61,39 @@ export async function manualSave(req: Request, res: Response, next: NextFunction
   try {
     const result = await saveManualAttendanceRecord(req.body ?? {});
     res.status(201).json({ message: "Manual attendance saved successfully.", data: result });
+  } catch (error) {
+    next(error);
+  }
+}
+
+
+export async function updateRecord(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "Attendance record ID is required." });
+      return;
+    }
+
+    const result = await updateAttendanceRecord(id, req.body ?? {});
+    res.json({ message: "Attendance record updated successfully.", data: result });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteRecord(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "Attendance record ID is required." });
+      return;
+    }
+
+    const result = await deleteAttendanceRecord(id);
+    res.json({ message: "Attendance record deleted successfully.", data: result });
   } catch (error) {
     next(error);
   }
