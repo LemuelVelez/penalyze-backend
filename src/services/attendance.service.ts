@@ -185,10 +185,20 @@ function getByAliases(row: RawImportRow, aliases: readonly string[]) {
 }
 
 function parseOptionalAbsences(value: unknown) {
-  const text = cleanText(value);
+  const text = cleanText(value).toLowerCase();
   if (!text) return 0;
 
-  const parsed = Number(text.replace(/,/g, ""));
+  const normalizedText = text.replace(/,/g, "").replace(/\s+/g, " ").trim();
+  const rangedAbsenceMatch = normalizedText.match(
+    /^(\d+)\s*(?:absences?\s*)?(?:\+|plus|or more(?: absences?)?|and above(?: absences?)?|or above(?: absences?)?|and up(?: absences?)?|or higher(?: absences?)?|and higher(?: absences?)?)$/
+  );
+
+  if (rangedAbsenceMatch) {
+    const rangedValue = Number(rangedAbsenceMatch[1]);
+    return Number.isInteger(rangedValue) && rangedValue >= 0 ? rangedValue : null;
+  }
+
+  const parsed = Number(normalizedText);
   if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) return null;
 
   return parsed;
