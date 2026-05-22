@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { NextFunction, Request, Response } from "express";
 
-import { UserRecord, UserRole } from "../database/model/schema.model";
+import type { UserRecord, UserRole } from "../database/model/schema.model";
 import { query } from "../lib/db";
 
 type JwtPayload = {
@@ -99,18 +99,11 @@ function publicUser(user: UserRecord) {
   };
 }
 
-async function countUsers() {
-  const result = await query<{ count: string }>("SELECT COUNT(*)::TEXT AS count FROM users");
-  return Number(result.rows[0]?.count ?? 0);
-}
-
 export async function register(req: Request, res: Response, next: NextFunction) {
   try {
     const name = cleanText(req.body?.name);
     const email = normalizeEmail(req.body?.email);
     const password = String(req.body?.password ?? "");
-    const requestedRole = cleanText(req.body?.role) as UserRole;
-
     if (!name) {
       res.status(400).json({ message: "Name is required." });
       return;
@@ -126,8 +119,7 @@ export async function register(req: Request, res: Response, next: NextFunction) 
       return;
     }
 
-    const existingUsers = await countUsers();
-    const role: UserRole = existingUsers === 0 ? "admin" : requestedRole === "admin" ? "admin" : "staff";
+    const role: UserRole = "admin";
     const passwordHash = hashPassword(password);
 
     const result = await query<UserRecord>(
