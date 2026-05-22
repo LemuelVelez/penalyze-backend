@@ -66,7 +66,8 @@ function getEventPayload(req: Request) {
   return {
     eventId: req.body?.eventId,
     eventName: req.body?.eventName,
-    eventDate: req.body?.eventDate,
+    eventStartAt: req.body?.eventStartAt,
+    eventEndAt: req.body?.eventEndAt,
     eventDescription: req.body?.eventDescription
   };
 }

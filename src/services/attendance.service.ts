@@ -27,6 +27,8 @@ type RawImportRow = Record<string, unknown>;
 type SaveRowsInput = {
   eventId?: string;
   eventName?: string;
+  eventStartAt?: string;
+  eventEndAt?: string;
   eventDate?: string;
   eventDescription?: string;
   fileName?: string;
@@ -42,6 +44,10 @@ export type DeletedAttendanceImportsResult = {
 export type AttendanceEventInput = {
   name?: string;
   eventName?: string;
+  eventStartAt?: string;
+  event_start_at?: string;
+  eventEndAt?: string;
+  event_end_at?: string;
   eventDate?: string;
   event_date?: string;
   description?: string;
@@ -50,6 +56,27 @@ export type AttendanceEventInput = {
 
 const HEADER_ALIASES = {
   eventName: ["event", "event name", "event_name", "activity", "activity name", "occasion"],
+  eventStartAt: [
+    "event start at",
+    "event_start_at",
+    "event start",
+    "event_start",
+    "start at",
+    "start date",
+    "start time",
+    "started at"
+  ],
+  eventEndAt: [
+    "event end at",
+    "event_end_at",
+    "event end",
+    "event_end",
+    "end at",
+    "end date",
+    "end time",
+    "ended at"
+  ],
+  scannedAt: ["scanned at", "scanned_at", "scan time", "scan date", "date scanned", "time scanned", "timestamp"],
   studentId: ["studentid", "student id", "student_id", "student no", "student no.", "id number", "id", "school id"],
   name: ["name", "full name", "student name", "learner name"],
   yearLevel: ["yearlevel", "year level", "year_level", "grade", "grade level", "level"],
@@ -88,6 +115,22 @@ function cleanText(value: unknown) {
 function cleanOptionalText(value: unknown) {
   const text = cleanText(value);
   return text || null;
+}
+
+function isNumericDateCandidate(value: string) {
+  return /^\d+(?:\.\d+)?$/.test(value.trim());
+}
+
+function parseExcelSerialDate(value: string) {
+  const serial = Number(value);
+  if (!Number.isFinite(serial) || serial <= 0 || serial > 100000) return null;
+
+  const wholeDays = Math.floor(serial);
+  const timeFraction = serial - wholeDays;
+  const milliseconds = Math.round((wholeDays - 25569) * 86400000 + timeFraction * 86400000);
+  const date = new Date(milliseconds);
+
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function getFileExtension(fileName: string) {
@@ -237,6 +280,10 @@ function normalizeImportRows(rows: RawImportRow[] | ParsedAttendanceRow[]): Pars
     const eventName = cleanText(
       (inputRow as ParsedAttendanceRow).eventName ?? getByAliases(raw, HEADER_ALIASES.eventName)
     );
+    const eventStartAtInput =
+      (inputRow as ParsedAttendanceRow).eventStartAt ?? getByAliases(raw, HEADER_ALIASES.eventStartAt);
+    const eventEndAtInput = (inputRow as ParsedAttendanceRow).eventEndAt ?? getByAliases(raw, HEADER_ALIASES.eventEndAt);
+    const scannedAtInput = (inputRow as ParsedAttendanceRow).scannedAt ?? getByAliases(raw, HEADER_ALIASES.scannedAt);
     const studentId = cleanText((inputRow as ParsedAttendanceRow).studentId ?? getByAliases(raw, HEADER_ALIASES.studentId));
     const name = cleanText((inputRow as ParsedAttendanceRow).name ?? getByAliases(raw, HEADER_ALIASES.name));
     const yearLevel = cleanText((inputRow as ParsedAttendanceRow).yearLevel ?? getByAliases(raw, HEADER_ALIASES.yearLevel));
@@ -248,15 +295,27 @@ function normalizeImportRows(rows: RawImportRow[] | ParsedAttendanceRow[]): Pars
     const remarks = cleanText((inputRow as ParsedAttendanceRow).remarks ?? getByAliases(raw, HEADER_ALIASES.remarks));
     const absencesInput = (inputRow as ParsedAttendanceRow).noOfAbsences ?? getByAliases(raw, HEADER_ALIASES.noOfAbsences);
     const noOfAbsences = parseOptionalAbsences(absencesInput);
+    const eventStartAt = normalizeOptionalTimestamp(eventStartAtInput, "Event start at");
+    const eventEndAt = normalizeOptionalTimestamp(eventEndAtInput, "Event end at");
+    const scannedAt = normalizeOptionalTimestamp(scannedAtInput, "Scanned at");
 
     const errors: string[] = [];
     if (!studentId) errors.push("Student ID is required.");
     if (!name) errors.push("Name is required.");
     if (noOfAbsences === null) errors.push("No. of Absences must be a whole number.");
+    if (eventStartAt.error) errors.push(eventStartAt.error);
+    if (eventEndAt.error) errors.push(eventEndAt.error);
+    if (scannedAt.error) errors.push(scannedAt.error);
+    if (eventStartAt.value && eventEndAt.value && new Date(eventEndAt.value).getTime() < new Date(eventStartAt.value).getTime()) {
+      errors.push("Event end at must be after event start at.");
+    }
 
     return {
       rowNumber,
       eventName,
+      eventStartAt: eventStartAt.value ?? undefined,
+      eventEndAt: eventEndAt.value ?? undefined,
+      scannedAt: scannedAt.value ?? undefined,
       studentId,
       name,
       yearLevel,
@@ -339,23 +398,44 @@ function createValidationError(message: string, statusCode = 400) {
   return error;
 }
 
-function normalizeEventDate(value: unknown) {
+function normalizeOptionalTimestamp(value: unknown, label = "Date and time") {
   const text = cleanText(value);
-  if (!text) return null;
+  if (!text) return { value: null as string | null, error: "" };
 
-  const date = new Date(text);
+  const serialDate = isNumericDateCandidate(text) ? parseExcelSerialDate(text) : null;
+  const date = serialDate ?? new Date(text);
+
   if (Number.isNaN(date.getTime())) {
-    throw createValidationError("Event date must be a valid date.");
+    return { value: null as string | null, error: `${label} must be a valid date and time.` };
   }
 
-  return text.slice(0, 10);
+  return { value: date.toISOString(), error: "" };
 }
 
 function getEventInput(input: AttendanceEventInput | SaveRowsInput | RawImportRow) {
+  const eventStartAt = normalizeOptionalTimestamp(
+    (input as AttendanceEventInput).eventStartAt ??
+      (input as AttendanceEventInput).event_start_at ??
+      (input as AttendanceEventInput).eventDate ??
+      (input as AttendanceEventInput).event_date,
+    "Event start at"
+  );
+  const eventEndAt = normalizeOptionalTimestamp(
+    (input as AttendanceEventInput).eventEndAt ?? (input as AttendanceEventInput).event_end_at,
+    "Event end at"
+  );
+
+  if (eventStartAt.error) throw createValidationError(eventStartAt.error);
+  if (eventEndAt.error) throw createValidationError(eventEndAt.error);
+  if (eventStartAt.value && eventEndAt.value && new Date(eventEndAt.value).getTime() < new Date(eventStartAt.value).getTime()) {
+    throw createValidationError("Event end at must be after event start at.");
+  }
+
   return {
     id: cleanText((input as SaveRowsInput).eventId),
     name: cleanText((input as AttendanceEventInput).name || (input as AttendanceEventInput).eventName),
-    eventDate: normalizeEventDate((input as AttendanceEventInput).eventDate ?? (input as AttendanceEventInput).event_date),
+    eventStartAt: eventStartAt.value,
+    eventEndAt: eventEndAt.value,
     description: cleanOptionalText((input as AttendanceEventInput).description ?? (input as AttendanceEventInput).eventDescription)
   };
 }
@@ -413,11 +493,11 @@ async function findOrCreateAttendanceEvent(
 
   const createdResult = await client.query<AttendanceEventRecord>(
     `
-      INSERT INTO attendance_events (name, event_date, description)
-      VALUES ($1, $2, $3)
+      INSERT INTO attendance_events (name, event_start_at, event_end_at, description)
+      VALUES ($1, $2, $3, $4)
       RETURNING *, 0::INT AS attendees_count
     `,
-    [name, eventInput.eventDate, eventInput.description]
+    [name, eventInput.eventStartAt, eventInput.eventEndAt, eventInput.description]
   );
 
   return createdResult.rows[0];
@@ -472,7 +552,8 @@ async function insertAttendanceRecord(
             college = NULLIF($6, ''),
             program = NULLIF($7, ''),
             institution = NULLIF($8, ''),
-            remarks = NULLIF($9, ''),
+            scanned_at = COALESCE($9::TIMESTAMPTZ, scanned_at),
+            remarks = NULLIF($10, ''),
             updated_at = NOW()
           WHERE id = $1
           RETURNING *
@@ -486,6 +567,7 @@ async function insertAttendanceRecord(
           row.college ?? "",
           row.program ?? "",
           row.institution ?? "",
+          row.scannedAt ?? null,
           row.remarks ?? ""
         ]
       );
@@ -506,9 +588,10 @@ async function insertAttendanceRecord(
         program,
         institution,
         no_of_absences,
+        scanned_at,
         remarks
       )
-      VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), $9, NULLIF($10, ''))
+      VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), $9, $10::TIMESTAMPTZ, NULLIF($11, ''))
       RETURNING *
     `,
     [
@@ -521,6 +604,7 @@ async function insertAttendanceRecord(
       row.program ?? "",
       row.institution ?? "",
       row.noOfAbsences ?? 0,
+      row.scannedAt ?? null,
       row.remarks ?? ""
     ]
   );
@@ -776,7 +860,18 @@ export async function saveAttendanceRows(input: SaveRowsInput): Promise<SavedAtt
     const affectedStudentIds: string[] = [];
 
     for (const row of validRows) {
-      const event = row.eventName ? await findOrCreateAttendanceEvent(client, input, row.eventName) : defaultEvent;
+      const event = row.eventName
+        ? await findOrCreateAttendanceEvent(
+            client,
+            {
+              ...input,
+              eventName: row.eventName,
+              eventStartAt: row.eventStartAt ?? input.eventStartAt,
+              eventEndAt: row.eventEndAt ?? input.eventEndAt
+            },
+            row.eventName
+          )
+        : defaultEvent;
 
       if (!event) {
         throw createValidationError("Event name is required when saving an uploaded attendance file.");
@@ -874,7 +969,8 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
           program = NULLIF($7, ''),
           institution = NULLIF($8, ''),
           no_of_absences = $9,
-          remarks = NULLIF($10, ''),
+          scanned_at = $10::TIMESTAMPTZ,
+          remarks = NULLIF($11, ''),
           updated_at = NOW()
         WHERE id = $1
         RETURNING *
@@ -889,6 +985,7 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
         row.program ?? "",
         row.institution ?? "",
         row.noOfAbsences ?? 0,
+        row.scannedAt ?? null,
         row.remarks ?? ""
       ]
     );
@@ -1006,7 +1103,7 @@ export async function listAttendanceEvents(limit = 100, offset = 0) {
       FROM attendance_events e
       LEFT JOIN attendance_records ar ON ar.event_id = e.id
       GROUP BY e.id
-      ORDER BY COALESCE(e.event_date, e.created_at::DATE) DESC, e.created_at DESC
+      ORDER BY COALESCE(e.event_start_at, e.event_end_at, e.created_at) DESC, e.created_at DESC
       LIMIT $1 OFFSET $2
     `,
     [limit, offset]
@@ -1025,11 +1122,11 @@ export async function createAttendanceEvent(input: AttendanceEventInput) {
   return withTransaction(async (client) => {
     const result = await client.query<AttendanceEventRecord>(
       `
-        INSERT INTO attendance_events (name, event_date, description)
-        VALUES ($1, $2, $3)
+        INSERT INTO attendance_events (name, event_start_at, event_end_at, description)
+        VALUES ($1, $2, $3, $4)
         RETURNING *, 0::INT AS attendees_count
       `,
-      [eventInput.name, eventInput.eventDate, eventInput.description]
+      [eventInput.name, eventInput.eventStartAt, eventInput.eventEndAt, eventInput.description]
     );
 
     await syncAllEventAbsences(client);
@@ -1051,11 +1148,11 @@ export async function updateAttendanceEvent(id: string, input: AttendanceEventIn
     const result = await client.query<AttendanceEventRecord>(
       `
         UPDATE attendance_events
-        SET name = $2, event_date = $3, description = $4, updated_at = NOW()
+        SET name = $2, event_start_at = $3, event_end_at = $4, description = $5, updated_at = NOW()
         WHERE id = $1
         RETURNING *
       `,
-      [id, eventInput.name, eventInput.eventDate, eventInput.description]
+      [id, eventInput.name, eventInput.eventStartAt, eventInput.eventEndAt, eventInput.description]
     );
 
     return (await getAttendanceEventById(client, result.rows[0].id)) ?? result.rows[0];

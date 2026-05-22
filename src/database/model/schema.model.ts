@@ -37,7 +37,8 @@ export type StudentRecord = {
 export type AttendanceEventRecord = {
   id: string;
   name: string;
-  event_date: Date | string | null;
+  event_start_at: Date | string | null;
+  event_end_at: Date | string | null;
   description: string | null;
   attendees_count: number;
   created_at: Date;
@@ -70,6 +71,7 @@ export type AttendanceRecord = {
   institution: string | null;
   no_of_absences: number;
   remarks: string | null;
+  scanned_at: Date | string | null;
   created_at: Date;
   updated_at: Date;
 };
@@ -98,6 +100,9 @@ export type FineRecord = {
 export type AttendanceImportInput = {
   eventId?: string;
   eventName?: string;
+  eventStartAt?: string;
+  eventEndAt?: string;
+  scannedAt?: string;
   studentId: string;
   name: string;
   yearLevel?: string;
