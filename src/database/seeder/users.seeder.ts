@@ -1,4 +1,5 @@
 import "dotenv/config";
+import crypto from "crypto";
 
 import { closeDatabasePool, query } from "../../lib/db";
 
@@ -34,6 +35,18 @@ function getEnvValue(keys: string[]) {
 
 function normalizeRole(role: string): SeedUserRole {
   return role === "staff" ? "staff" : "admin";
+}
+
+function hashPassword(password: string) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function isCurrentPasswordHash(storedHash: string) {
+  const [salt, hash] = storedHash.split(":");
+
+  return Boolean(salt && hash);
 }
 
 function getSeedUserCredentials() {
@@ -72,6 +85,25 @@ export async function seedUser(): Promise<SeedUserResult> {
   const existingUser = existingResult.rows[0];
 
   if (existingUser) {
+    if (!isCurrentPasswordHash(existingUser.password_hash)) {
+      const passwordHash = hashPassword(password);
+      const updatedResult = await query<SeedUserRecord>(
+        `
+          UPDATE users
+          SET password_hash = $1, updated_at = NOW()
+          WHERE id = $2
+          RETURNING id, name, email, password_hash, role, created_at, updated_at
+        `,
+        [passwordHash, existingUser.id]
+      );
+
+      return {
+        user: updatedResult.rows[0] ?? existingUser,
+        email,
+        alreadySeeded: true
+      };
+    }
+
     return {
       user: existingUser,
       email,
@@ -79,13 +111,14 @@ export async function seedUser(): Promise<SeedUserResult> {
     };
   }
 
+  const passwordHash = hashPassword(password);
   const result = await query<SeedUserRecord>(
     `
       INSERT INTO users (name, email, password_hash, role)
-      VALUES ($1, $2, crypt($3, gen_salt('bf')), $4)
+      VALUES ($1, $2, $3, $4)
       RETURNING id, name, email, password_hash, role, created_at, updated_at
     `,
-    [name, email, password, role]
+    [name, email, passwordHash, role]
   );
 
   return {

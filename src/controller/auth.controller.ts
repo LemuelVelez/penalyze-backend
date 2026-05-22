@@ -88,6 +88,23 @@ function verifyPassword(password: string, storedHash: string) {
   return crypto.timingSafeEqual(computed, stored);
 }
 
+async function verifyLegacyPostgresPassword(password: string, storedHash: string) {
+  if (!storedHash || storedHash.includes(":")) {
+    return false;
+  }
+
+  try {
+    const result = await query<{ matches: boolean }>(
+      "SELECT crypt($1, $2) = $2 AS matches",
+      [password, storedHash]
+    );
+
+    return result.rows[0]?.matches === true;
+  } catch {
+    return false;
+  }
+}
+
 function publicUser(user: UserRecord) {
   return {
     id: user.id,
@@ -161,12 +178,35 @@ export async function login(req: Request, res: Response, next: NextFunction) {
       return;
     }
 
-    const result = await query<UserRecord>("SELECT * FROM users WHERE email = $1 LIMIT 1", [email]);
+    const result = await query<UserRecord>("SELECT * FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1", [email]);
     const user = result.rows[0];
 
-    if (!user || !verifyPassword(password, user.password_hash)) {
+    if (!user) {
       res.status(401).json({ message: "Invalid email or password." });
       return;
+    }
+
+    const isCurrentPassword = verifyPassword(password, user.password_hash);
+    const isLegacyPassword = isCurrentPassword
+      ? false
+      : await verifyLegacyPostgresPassword(password, user.password_hash);
+
+    if (!isCurrentPassword && !isLegacyPassword) {
+      res.status(401).json({ message: "Invalid email or password." });
+      return;
+    }
+
+    if (isLegacyPassword) {
+      const migratedPasswordHash = hashPassword(password);
+
+      await query(
+        `
+          UPDATE users
+          SET password_hash = $1, updated_at = NOW()
+          WHERE id = $2
+        `,
+        [migratedPasswordHash, user.id]
+      );
     }
 
     const token = signToken({ sub: user.id, email: user.email, name: user.name, role: user.role });
