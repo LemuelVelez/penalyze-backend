@@ -217,7 +217,8 @@ export async function index(req: Request, res: Response, next: NextFunction) {
     const offset = toPositiveInt(req.query.offset, 0);
     const studentId = req.query.studentId ? String(req.query.studentId).trim() : undefined;
     const eventId = req.query.eventId ? String(req.query.eventId).trim() : undefined;
-    const records = await listAttendanceRecords(limit, offset, studentId, eventId);
+    const college = req.query.college ? String(req.query.college).trim() : undefined;
+    const records = await listAttendanceRecords(limit, offset, studentId, eventId, college);
 
     res.json({ data: records });
   } catch (error) {
