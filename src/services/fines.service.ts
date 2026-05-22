@@ -2,6 +2,19 @@ import { FineRecord, FineStatus, PenaltyRecord } from "../database/model/schema.
 import { DEFAULT_PENALTIES } from "../database/seeder/penalties.seeder";
 import { query } from "../lib/db";
 
+function validatePenaltyInput(noOfAbsences: number, prescribedPenalty: string) {
+  if (!Number.isInteger(noOfAbsences) || noOfAbsences <= 0) {
+    throw new Error("No. of Absences must be a positive whole number.");
+  }
+
+  const cleanPenalty = String(prescribedPenalty ?? "").trim();
+  if (!cleanPenalty) {
+    throw new Error("Prescribed penalty is required.");
+  }
+
+  return cleanPenalty;
+}
+
 export async function listPenalties() {
   const result = await query<PenaltyRecord>(
     `
@@ -30,14 +43,7 @@ export async function getPenaltyByAbsences(noOfAbsences: number) {
 }
 
 export async function upsertPenalty(noOfAbsences: number, prescribedPenalty: string) {
-  if (!Number.isInteger(noOfAbsences) || noOfAbsences <= 0) {
-    throw new Error("No. of Absences must be a positive whole number.");
-  }
-
-  const cleanPenalty = String(prescribedPenalty ?? "").trim();
-  if (!cleanPenalty) {
-    throw new Error("Prescribed penalty is required.");
-  }
+  const cleanPenalty = validatePenaltyInput(noOfAbsences, prescribedPenalty);
 
   const result = await query<PenaltyRecord>(
     `
@@ -50,6 +56,90 @@ export async function upsertPenalty(noOfAbsences: number, prescribedPenalty: str
       RETURNING *
     `,
     [noOfAbsences, cleanPenalty]
+  );
+
+  return result.rows[0];
+}
+
+export async function updatePenalty(id: string, noOfAbsences: number, prescribedPenalty: string) {
+  const cleanPenalty = validatePenaltyInput(noOfAbsences, prescribedPenalty);
+
+  const duplicate = await query<PenaltyRecord>(
+    `
+      SELECT *
+      FROM penalties
+      WHERE no_of_absences = $1
+        AND id <> $2
+      LIMIT 1
+    `,
+    [noOfAbsences, id]
+  );
+
+  if (duplicate.rows[0]) {
+    throw new Error("A penalty for this number of absences already exists.");
+  }
+
+  const result = await query<PenaltyRecord>(
+    `
+      UPDATE penalties
+      SET no_of_absences = $2,
+          prescribed_penalty = $3,
+          updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `,
+    [id, noOfAbsences, cleanPenalty]
+  );
+
+  if (!result.rows[0]) {
+    throw new Error("Penalty not found.");
+  }
+
+  await query(
+    `
+      UPDATE fines
+      SET prescribed_penalty = $2,
+          updated_at = NOW()
+      WHERE penalty_id = $1
+    `,
+    [id, cleanPenalty]
+  );
+
+  return result.rows[0];
+}
+
+export async function deletePenalty(id: string) {
+  const existing = await query<PenaltyRecord>(
+    `
+      SELECT *
+      FROM penalties
+      WHERE id = $1
+      LIMIT 1
+    `,
+    [id]
+  );
+
+  if (!existing.rows[0]) {
+    throw new Error("Penalty not found.");
+  }
+
+  await query(
+    `
+      UPDATE fines
+      SET penalty_id = NULL,
+          updated_at = NOW()
+      WHERE penalty_id = $1
+    `,
+    [id]
+  );
+
+  const result = await query<PenaltyRecord>(
+    `
+      DELETE FROM penalties
+      WHERE id = $1
+      RETURNING *
+    `,
+    [id]
   );
 
   return result.rows[0];
@@ -90,7 +180,7 @@ export async function listFines(options: { status?: FineStatus; studentId?: stri
       SELECT *
       FROM fines
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY created_at DESC
+      ORDER BY created_at DESC, updated_at DESC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
     params

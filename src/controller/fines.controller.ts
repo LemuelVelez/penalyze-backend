@@ -2,14 +2,18 @@ import { NextFunction, Request, Response } from "express";
 
 import { FineStatus } from "../database/model/schema.model";
 import {
+  deletePenalty as deletePenaltyRecord,
   getFineSummary,
   getPenaltyByAbsences,
   listFines,
   listPenalties,
   seedDefaultPenalties,
   updateFineStatus,
+  updatePenalty as updatePenaltyRecord,
   upsertPenalty
 } from "../services/fines.service";
+
+const fineStatuses: FineStatus[] = ["unpaid", "paid", "waived"];
 
 function toPositiveInt(value: unknown, fallback: number) {
   const parsed = Number(value);
@@ -19,6 +23,13 @@ function toPositiveInt(value: unknown, fallback: number) {
 function getRouteParam(req: Request, key: string) {
   const value = req.params[key];
   return Array.isArray(value) ? value[0] : value;
+}
+
+function getPenaltyPayload(req: Request) {
+  return {
+    noOfAbsences: Number(req.body?.noOfAbsences ?? req.body?.no_of_absences),
+    prescribedPenalty: String(req.body?.prescribedPenalty ?? req.body?.prescribed_penalty ?? "").trim()
+  };
 }
 
 export async function penalties(_req: Request, res: Response, next: NextFunction) {
@@ -41,11 +52,44 @@ export async function seedPenalties(_req: Request, res: Response, next: NextFunc
 
 export async function savePenalty(req: Request, res: Response, next: NextFunction) {
   try {
-    const noOfAbsences = Number(req.body?.noOfAbsences ?? req.body?.no_of_absences);
-    const prescribedPenalty = String(req.body?.prescribedPenalty ?? req.body?.prescribed_penalty ?? "").trim();
+    const { noOfAbsences, prescribedPenalty } = getPenaltyPayload(req);
     const row = await upsertPenalty(noOfAbsences, prescribedPenalty);
 
     res.status(201).json({ message: "Penalty saved successfully.", data: row });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function updatePenalty(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "Penalty ID is required." });
+      return;
+    }
+
+    const { noOfAbsences, prescribedPenalty } = getPenaltyPayload(req);
+    const row = await updatePenaltyRecord(id, noOfAbsences, prescribedPenalty);
+
+    res.json({ message: "Penalty updated successfully.", data: row });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deletePenalty(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "Penalty ID is required." });
+      return;
+    }
+
+    const row = await deletePenaltyRecord(id);
+    res.json({ message: "Penalty deleted successfully.", data: row });
   } catch (error) {
     next(error);
   }
@@ -75,7 +119,13 @@ export async function matchPenalty(req: Request, res: Response, next: NextFuncti
 
 export async function fines(req: Request, res: Response, next: NextFunction) {
   try {
-    const status = req.query.status as FineStatus | undefined;
+    const status = req.query.status ? (String(req.query.status) as FineStatus) : undefined;
+
+    if (status && !fineStatuses.includes(status)) {
+      res.status(400).json({ message: "Invalid fine status." });
+      return;
+    }
+
     const studentId = req.query.studentId ? String(req.query.studentId) : undefined;
     const limit = toPositiveInt(req.query.limit, 100);
     const offset = toPositiveInt(req.query.offset, 0);

@@ -11,12 +11,14 @@ import {
   showImport
 } from "./controller/attendance.controller";
 import {
+  deletePenalty,
   fines,
   matchPenalty,
   penalties,
   savePenalty,
   seedPenalties,
   summary,
+  updatePenalty,
   updateStatus
 } from "./controller/fines.controller";
 import { query } from "./lib/db";
@@ -99,6 +101,9 @@ app.get("/api/fines/penalties", penalties);
 app.post("/api/fines/penalties", savePenalty);
 app.post("/api/fines/penalties/seed", seedPenalties);
 app.get("/api/fines/penalties/match/:noOfAbsences", matchPenalty);
+app.put("/api/fines/penalties/:id", updatePenalty);
+app.patch("/api/fines/penalties/:id", updatePenalty);
+app.delete("/api/fines/penalties/:id", deletePenalty);
 
 app.use((_req: Request, res: Response) => {
   res.status(404).json({ message: "Route not found." });
