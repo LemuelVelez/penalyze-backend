@@ -23,14 +23,37 @@ import { query } from "./lib/db";
 
 const app = express();
 const PORT = Number(process.env.PORT ?? 3000);
-const FRONTEND_URL = process.env.Frontend_URL || process.env.FRONTEND_URL || "http://localhost:8081";
+const DEFAULT_FRONTEND_ORIGINS = ["http://localhost:5173", "http://localhost:8081"];
+
+function normalizeOrigin(value: string) {
+  return value.trim().replace(/\/+$/, "");
+}
+
+function parseAllowedOrigins() {
+  const configuredOrigins = [process.env.FRONTEND_ORIGINS, process.env.FRONTEND_URL, process.env.Frontend_URL]
+    .flatMap((value) => String(value ?? "").split(","))
+    .map(normalizeOrigin)
+    .filter(Boolean);
+
+  return Array.from(new Set([...configuredOrigins, ...DEFAULT_FRONTEND_ORIGINS]));
+}
+
+const ALLOWED_ORIGINS = parseAllowedOrigins();
 
 app.use((req: Request, res: Response, next: NextFunction) => {
-  res.header("Access-Control-Allow-Origin", FRONTEND_URL);
-  res.header("Vary", "Origin");
+  const requestOrigin = req.headers.origin ? normalizeOrigin(req.headers.origin) : "";
+  const allowedOrigin = requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin) ? requestOrigin : "";
+
+  if (allowedOrigin) {
+    res.header("Access-Control-Allow-Origin", allowedOrigin);
+    res.header("Vary", "Origin");
+  } else if (!requestOrigin && ALLOWED_ORIGINS[0]) {
+    res.header("Access-Control-Allow-Origin", ALLOWED_ORIGINS[0]);
+  }
+
   res.header("Access-Control-Allow-Credentials", "true");
   res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
 
   if (req.method === "OPTIONS") {
     res.sendStatus(204);

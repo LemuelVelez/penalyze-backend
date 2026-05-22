@@ -100,7 +100,8 @@ export async function index(req: Request, res: Response, next: NextFunction) {
   try {
     const limit = toPositiveInt(req.query.limit, 100);
     const offset = toPositiveInt(req.query.offset, 0);
-    const records = await listAttendanceRecords(limit, offset);
+    const studentId = req.query.studentId ? String(req.query.studentId).trim() : undefined;
+    const records = await listAttendanceRecords(limit, offset, studentId);
 
     res.json({ data: records });
   } catch (error) {

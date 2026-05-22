@@ -437,15 +437,30 @@ export async function saveAttendanceFile(file: UploadedAttendanceFile): Promise<
   });
 }
 
-export async function listAttendanceRecords(limit = 100, offset = 0) {
+export async function listAttendanceRecords(limit = 100, offset = 0, studentId?: string) {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  if (studentId) {
+    params.push(studentId);
+    clauses.push(`LOWER(TRIM(student_id)) = LOWER(TRIM($${params.length}))`);
+  }
+
+  params.push(limit);
+  const limitPosition = params.length;
+
+  params.push(offset);
+  const offsetPosition = params.length;
+
   const result = await query<AttendanceRecord>(
     `
       SELECT *
       FROM attendance_records
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY created_at DESC
-      LIMIT $1 OFFSET $2
+      LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
-    [limit, offset]
+    params
   );
 
   return result.rows;

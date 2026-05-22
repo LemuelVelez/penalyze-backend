@@ -76,7 +76,7 @@ export async function listFines(options: { status?: FineStatus; studentId?: stri
 
   if (options.studentId) {
     params.push(options.studentId);
-    clauses.push(`student_id = $${params.length}`);
+    clauses.push(`LOWER(TRIM(student_id)) = LOWER(TRIM($${params.length}))`);
   }
 
   params.push(options.limit ?? 100);
