@@ -527,55 +527,6 @@ async function insertAttendanceRecord(
   eventId: string | null,
   row: ParsedAttendanceRow
 ) {
-  if (eventId) {
-    const existingResult = await client.query<AttendanceRecord>(
-      `
-        SELECT *
-        FROM attendance_records
-        WHERE event_id = $1 AND LOWER(TRIM(student_id)) = LOWER(TRIM($2))
-        LIMIT 1
-      `,
-      [eventId, row.studentId]
-    );
-
-    const existing = existingResult.rows[0];
-
-    if (existing) {
-      const result = await client.query<AttendanceRecord>(
-        `
-          UPDATE attendance_records
-          SET
-            import_id = COALESCE($2, import_id),
-            student_id = $3,
-            name = $4,
-            year_level = NULLIF($5, ''),
-            college = NULLIF($6, ''),
-            program = NULLIF($7, ''),
-            institution = NULLIF($8, ''),
-            scanned_at = COALESCE($9::TIMESTAMPTZ, scanned_at),
-            remarks = NULLIF($10, ''),
-            updated_at = NOW()
-          WHERE id = $1
-          RETURNING *
-        `,
-        [
-          existing.id,
-          importId,
-          row.studentId,
-          row.name,
-          row.yearLevel ?? "",
-          row.college ?? "",
-          row.program ?? "",
-          row.institution ?? "",
-          row.scannedAt ?? null,
-          row.remarks ?? ""
-        ]
-      );
-
-      return result.rows[0];
-    }
-  }
-
   const result = await client.query<AttendanceRecord>(
     `
       INSERT INTO attendance_records (
@@ -1208,7 +1159,7 @@ export async function listAttendanceRecords(limit = 100, offset = 0, studentId?:
       FROM attendance_records ar
       LEFT JOIN attendance_events ae ON ae.id = ar.event_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY ar.created_at DESC
+      ORDER BY COALESCE(ar.scanned_at, ar.created_at) DESC, ar.created_at DESC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
     params
