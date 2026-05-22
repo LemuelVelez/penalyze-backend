@@ -3,6 +3,7 @@ import { PoolClient } from "pg";
 
 import {
   ACCEPTED_ATTENDANCE_EXTENSIONS,
+  AttendanceEventRecord,
   AttendanceImportRecord,
   AttendancePreviewResult,
   AttendanceRecord,
@@ -24,12 +25,26 @@ export type UploadedAttendanceFile = {
 type RawImportRow = Record<string, unknown>;
 
 type SaveRowsInput = {
+  eventId?: string;
+  eventName?: string;
+  eventDate?: string;
+  eventDescription?: string;
   fileName?: string;
   fileType?: string;
   rows: RawImportRow[] | ParsedAttendanceRow[];
 };
 
+export type AttendanceEventInput = {
+  name?: string;
+  eventName?: string;
+  eventDate?: string;
+  event_date?: string;
+  description?: string;
+  eventDescription?: string;
+};
+
 const HEADER_ALIASES = {
+  eventName: ["event", "event name", "event_name", "activity", "activity name", "occasion"],
   studentId: ["studentid", "student id", "student_id", "student no", "student no.", "id number", "id", "school id"],
   name: ["name", "full name", "student name", "learner name"],
   yearLevel: ["yearlevel", "year level", "year_level", "grade", "grade level", "level"],
@@ -63,6 +78,11 @@ function cleanText(value: unknown) {
     .replace(/^\uFEFF/, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function cleanOptionalText(value: unknown) {
+  const text = cleanText(value);
+  return text || null;
 }
 
 function getFileExtension(fileName: string) {
@@ -209,6 +229,9 @@ function normalizeImportRows(rows: RawImportRow[] | ParsedAttendanceRow[]): Pars
     const raw = (inputRow as ParsedAttendanceRow).raw ?? inputRow;
     const rowNumber = Number((inputRow as ParsedAttendanceRow).rowNumber ?? index + 2);
 
+    const eventName = cleanText(
+      (inputRow as ParsedAttendanceRow).eventName ?? getByAliases(raw, HEADER_ALIASES.eventName)
+    );
     const studentId = cleanText((inputRow as ParsedAttendanceRow).studentId ?? getByAliases(raw, HEADER_ALIASES.studentId));
     const name = cleanText((inputRow as ParsedAttendanceRow).name ?? getByAliases(raw, HEADER_ALIASES.name));
     const yearLevel = cleanText((inputRow as ParsedAttendanceRow).yearLevel ?? getByAliases(raw, HEADER_ALIASES.yearLevel));
@@ -228,6 +251,7 @@ function normalizeImportRows(rows: RawImportRow[] | ParsedAttendanceRow[]): Pars
 
     return {
       rowNumber,
+      eventName,
       studentId,
       name,
       yearLevel,
@@ -304,6 +328,96 @@ async function parseFileToRawRows(file: UploadedAttendanceFile) {
   return textToRows(file.buffer.toString("utf8"));
 }
 
+function createValidationError(message: string, statusCode = 400) {
+  const error = new Error(message);
+  (error as any).statusCode = statusCode;
+  return error;
+}
+
+function normalizeEventDate(value: unknown) {
+  const text = cleanText(value);
+  if (!text) return null;
+
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) {
+    throw createValidationError("Event date must be a valid date.");
+  }
+
+  return text.slice(0, 10);
+}
+
+function getEventInput(input: AttendanceEventInput | SaveRowsInput | RawImportRow) {
+  return {
+    id: cleanText((input as SaveRowsInput).eventId),
+    name: cleanText((input as AttendanceEventInput).name || (input as AttendanceEventInput).eventName),
+    eventDate: normalizeEventDate((input as AttendanceEventInput).eventDate ?? (input as AttendanceEventInput).event_date),
+    description: cleanOptionalText((input as AttendanceEventInput).description ?? (input as AttendanceEventInput).eventDescription)
+  };
+}
+
+async function getAttendanceEventById(client: PoolClient, id: string) {
+  const result = await client.query<AttendanceEventRecord>(
+    `
+      SELECT
+        e.*,
+        COUNT(DISTINCT ar.student_id)::INT AS attendees_count
+      FROM attendance_events e
+      LEFT JOIN attendance_records ar ON ar.event_id = e.id
+      WHERE e.id = $1
+      GROUP BY e.id
+      LIMIT 1
+    `,
+    [id]
+  );
+
+  return result.rows[0] ?? null;
+}
+
+async function findOrCreateAttendanceEvent(
+  client: PoolClient,
+  input: AttendanceEventInput | SaveRowsInput | RawImportRow,
+  fallbackName = ""
+) {
+  const eventInput = getEventInput(input);
+
+  if (eventInput.id) {
+    const event = await getAttendanceEventById(client, eventInput.id);
+    if (!event) throw createValidationError("Attendance event not found.", 404);
+    return event;
+  }
+
+  const name = eventInput.name || cleanText(fallbackName);
+  if (!name) return null;
+
+  const existingResult = await client.query<AttendanceEventRecord>(
+    `
+      SELECT
+        e.*,
+        COUNT(DISTINCT ar.student_id)::INT AS attendees_count
+      FROM attendance_events e
+      LEFT JOIN attendance_records ar ON ar.event_id = e.id
+      WHERE LOWER(TRIM(e.name)) = LOWER(TRIM($1))
+      GROUP BY e.id
+      ORDER BY e.created_at DESC
+      LIMIT 1
+    `,
+    [name]
+  );
+
+  if (existingResult.rows[0]) return existingResult.rows[0];
+
+  const createdResult = await client.query<AttendanceEventRecord>(
+    `
+      INSERT INTO attendance_events (name, event_date, description)
+      VALUES ($1, $2, $3)
+      RETURNING *, 0::INT AS attendees_count
+    `,
+    [name, eventInput.eventDate, eventInput.description]
+  );
+
+  return createdResult.rows[0];
+}
+
 async function upsertStudent(client: PoolClient, row: ParsedAttendanceRow) {
   await client.query(
     `
@@ -322,11 +436,64 @@ async function upsertStudent(client: PoolClient, row: ParsedAttendanceRow) {
   );
 }
 
-async function insertAttendanceRecord(client: PoolClient, importId: string | null, row: ParsedAttendanceRow) {
+async function insertAttendanceRecord(
+  client: PoolClient,
+  importId: string | null,
+  eventId: string | null,
+  row: ParsedAttendanceRow
+) {
+  if (eventId) {
+    const existingResult = await client.query<AttendanceRecord>(
+      `
+        SELECT *
+        FROM attendance_records
+        WHERE event_id = $1 AND LOWER(TRIM(student_id)) = LOWER(TRIM($2))
+        LIMIT 1
+      `,
+      [eventId, row.studentId]
+    );
+
+    const existing = existingResult.rows[0];
+
+    if (existing) {
+      const result = await client.query<AttendanceRecord>(
+        `
+          UPDATE attendance_records
+          SET
+            import_id = COALESCE($2, import_id),
+            student_id = $3,
+            name = $4,
+            year_level = NULLIF($5, ''),
+            college = NULLIF($6, ''),
+            program = NULLIF($7, ''),
+            institution = NULLIF($8, ''),
+            remarks = NULLIF($9, ''),
+            updated_at = NOW()
+          WHERE id = $1
+          RETURNING *
+        `,
+        [
+          existing.id,
+          importId,
+          row.studentId,
+          row.name,
+          row.yearLevel ?? "",
+          row.college ?? "",
+          row.program ?? "",
+          row.institution ?? "",
+          row.remarks ?? ""
+        ]
+      );
+
+      return result.rows[0];
+    }
+  }
+
   const result = await client.query<AttendanceRecord>(
     `
       INSERT INTO attendance_records (
         import_id,
+        event_id,
         student_id,
         name,
         year_level,
@@ -336,11 +503,12 @@ async function insertAttendanceRecord(client: PoolClient, importId: string | nul
         no_of_absences,
         remarks
       )
-      VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8, NULLIF($9, ''))
+      VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), $9, NULLIF($10, ''))
       RETURNING *
     `,
     [
       importId,
+      eventId,
       row.studentId,
       row.name,
       row.yearLevel ?? "",
@@ -353,12 +521,6 @@ async function insertAttendanceRecord(client: PoolClient, importId: string | nul
   );
 
   return result.rows[0];
-}
-
-function createValidationError(message: string, statusCode = 400) {
-  const error = new Error(message);
-  (error as any).statusCode = statusCode;
-  return error;
 }
 
 function validateAttendanceInput(input: RawImportRow) {
@@ -446,6 +608,84 @@ async function insertFineIfNeeded(client: PoolClient, record: AttendanceRecord) 
   return syncFineForAttendanceRecord(client, record);
 }
 
+async function countAttendanceEvents(client: PoolClient) {
+  const result = await client.query<{ total: string }>("SELECT COUNT(*)::TEXT AS total FROM attendance_events");
+  return Number(result.rows[0]?.total ?? 0);
+}
+
+async function getAllEventStudentIds(client: PoolClient) {
+  const result = await client.query<{ student_id: string }>(
+    `
+      SELECT DISTINCT student_id
+      FROM attendance_records
+      WHERE event_id IS NOT NULL
+    `
+  );
+
+  return result.rows.map((row) => row.student_id);
+}
+
+async function syncAbsencesForStudents(client: PoolClient, studentIds: string[]) {
+  const uniqueStudentIds = Array.from(new Set(studentIds.map(cleanText).filter(Boolean)));
+  const records: AttendanceRecord[] = [];
+  const fines: FineRecord[] = [];
+  const totalEvents = await countAttendanceEvents(client);
+
+  for (const studentId of uniqueStudentIds) {
+    const attendedResult = await client.query<{ total: string }>(
+      `
+        SELECT COUNT(DISTINCT event_id)::TEXT AS total
+        FROM attendance_records
+        WHERE event_id IS NOT NULL AND LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+      `,
+      [studentId]
+    );
+    const attendedEvents = Number(attendedResult.rows[0]?.total ?? 0);
+    const noOfAbsences = Math.max(totalEvents - attendedEvents, 0);
+
+    const updatedResult = await client.query<AttendanceRecord>(
+      `
+        UPDATE attendance_records
+        SET no_of_absences = $2, updated_at = NOW()
+        WHERE event_id IS NOT NULL AND LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        RETURNING *
+      `,
+      [studentId, noOfAbsences]
+    );
+
+    for (const record of updatedResult.rows) {
+      records.push(record);
+      const fine = await syncFineForAttendanceRecord(client, record);
+      if (fine) fines.push(fine);
+    }
+  }
+
+  return { records, fines };
+}
+
+async function syncAllEventAbsences(client: PoolClient) {
+  const studentIds = await getAllEventStudentIds(client);
+  return syncAbsencesForStudents(client, studentIds);
+}
+
+async function listRecordsByIds(client: PoolClient, ids: string[]) {
+  const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
+  if (!uniqueIds.length) return [];
+
+  const result = await client.query<AttendanceRecord>(
+    `
+      SELECT ar.*, ae.name AS event_name
+      FROM attendance_records ar
+      LEFT JOIN attendance_events ae ON ae.id = ar.event_id
+      WHERE ar.id = ANY($1::uuid[])
+      ORDER BY ar.created_at DESC
+    `,
+    [uniqueIds]
+  );
+
+  return result.rows;
+}
+
 export async function previewAttendanceFile(file: UploadedAttendanceFile): Promise<AttendancePreviewResult> {
   if (!file?.buffer?.length) {
     throw new Error("Please upload a valid Excel, text, or document file.");
@@ -459,58 +699,92 @@ export async function previewAttendanceFile(file: UploadedAttendanceFile): Promi
 export async function saveAttendanceRows(input: SaveRowsInput): Promise<SavedAttendanceImportResult> {
   const preview = buildPreview(input.fileName ?? "manual-import", input.fileType ?? "json", input.rows);
   const validRows = preview.rows.filter((row) => row.errors.length === 0);
+  const hasEventContext = Boolean(cleanText(input.eventId) || cleanText(input.eventName) || validRows.some((row) => row.eventName));
+
+  if (!hasEventContext) {
+    throw createValidationError("Event name is required when saving an uploaded attendance file.");
+  }
 
   return withTransaction(async (client) => {
+    const defaultEvent = cleanText(input.eventId) || cleanText(input.eventName) ? await findOrCreateAttendanceEvent(client, input) : null;
+
     const importResult = await client.query<AttendanceImportRecord>(
       `
-        INSERT INTO attendance_imports (file_name, file_type, rows_total, rows_valid, rows_invalid, status)
-        VALUES ($1, $2, $3, $4, $5, 'saved')
+        INSERT INTO attendance_imports (event_id, file_name, file_type, rows_total, rows_valid, rows_invalid, status)
+        VALUES ($1, $2, $3, $4, $5, $6, 'saved')
         RETURNING *
       `,
-      [preview.fileName, preview.fileType, preview.rowsTotal, preview.rowsValid, preview.rowsInvalid]
+      [defaultEvent?.id ?? null, preview.fileName, preview.fileType, preview.rowsTotal, preview.rowsValid, preview.rowsInvalid]
     );
 
     const importId = importResult.rows[0].id;
-    const savedRecords: AttendanceRecord[] = [];
-    const createdFines: FineRecord[] = [];
+    const savedRecordIds: string[] = [];
+    const affectedStudentIds: string[] = [];
 
     for (const row of validRows) {
-      await upsertStudent(client, row);
-      const record = await insertAttendanceRecord(client, importId, row);
-      savedRecords.push(record);
+      const event = row.eventName ? await findOrCreateAttendanceEvent(client, input, row.eventName) : defaultEvent;
 
-      const fine = await insertFineIfNeeded(client, record);
-      if (fine) createdFines.push(fine);
+      if (!event) {
+        throw createValidationError("Event name is required when saving an uploaded attendance file.");
+      }
+
+      await upsertStudent(client, row);
+      const record = await insertAttendanceRecord(client, importId, event.id, row);
+      savedRecordIds.push(record.id);
+      affectedStudentIds.push(record.student_id);
     }
+
+    const synced = await syncAbsencesForStudents(client, affectedStudentIds);
+    const savedRecords = await listRecordsByIds(client, savedRecordIds);
 
     return {
       ...preview,
       importId,
+      event: defaultEvent,
       savedRecords,
-      createdFines
+      createdFines: synced.fines
     };
   });
 }
 
-export async function saveAttendanceFile(file: UploadedAttendanceFile): Promise<SavedAttendanceImportResult> {
+export async function saveAttendanceFile(
+  file: UploadedAttendanceFile,
+  options: Omit<SaveRowsInput, "rows" | "fileName" | "fileType"> = {}
+): Promise<SavedAttendanceImportResult> {
   const preview = await previewAttendanceFile(file);
   return saveAttendanceRows({
+    ...options,
     fileName: preview.fileName,
     fileType: preview.fileType,
     rows: preview.rows
   });
 }
 
-
 export async function saveManualAttendanceRecord(input: RawImportRow) {
   const row = validateAttendanceInput(input);
 
   return withTransaction(async (client) => {
+    const event = await findOrCreateAttendanceEvent(client, input);
+
     await upsertStudent(client, row);
-    const record = await insertAttendanceRecord(client, null, row);
+    const record = await insertAttendanceRecord(client, null, event?.id ?? null, row);
+
+    if (event) {
+      const synced = await syncAbsencesForStudents(client, [record.student_id]);
+      const updatedRecord = (await listRecordsByIds(client, [record.id]))[0] ?? record;
+      const fine = synced.fines.find((item) => item.attendance_record_id === record.id) ?? null;
+
+      return {
+        event,
+        record: updatedRecord,
+        fine
+      };
+    }
+
     const fine = await insertFineIfNeeded(client, record);
 
     return {
+      event,
       record,
       fine
     };
@@ -525,31 +799,35 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
       "SELECT * FROM attendance_records WHERE id = $1 LIMIT 1",
       [id]
     );
+    const existingRecord = existingResult.rows[0];
 
-    if (!existingResult.rows[0]) {
+    if (!existingRecord) {
       throw createValidationError("Attendance record not found.", 404);
     }
 
+    const event = await findOrCreateAttendanceEvent(client, input);
     await upsertStudent(client, row);
 
     const updatedResult = await client.query<AttendanceRecord>(
       `
         UPDATE attendance_records
         SET
-          student_id = $2,
-          name = $3,
-          year_level = NULLIF($4, ''),
-          college = NULLIF($5, ''),
-          program = NULLIF($6, ''),
-          institution = NULLIF($7, ''),
-          no_of_absences = $8,
-          remarks = NULLIF($9, ''),
+          event_id = $2,
+          student_id = $3,
+          name = $4,
+          year_level = NULLIF($5, ''),
+          college = NULLIF($6, ''),
+          program = NULLIF($7, ''),
+          institution = NULLIF($8, ''),
+          no_of_absences = $9,
+          remarks = NULLIF($10, ''),
           updated_at = NOW()
         WHERE id = $1
         RETURNING *
       `,
       [
         id,
+        event?.id ?? null,
         row.studentId,
         row.name,
         row.yearLevel ?? "",
@@ -562,9 +840,24 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
     );
 
     const record = updatedResult.rows[0];
+    const affectedStudentIds = [existingRecord.student_id, record.student_id];
+
+    if (existingRecord.event_id || record.event_id) {
+      const synced = await syncAbsencesForStudents(client, affectedStudentIds);
+      const updatedRecord = (await listRecordsByIds(client, [record.id]))[0] ?? record;
+      const fine = synced.fines.find((item) => item.attendance_record_id === record.id) ?? null;
+
+      return {
+        event,
+        record: updatedRecord,
+        fine
+      };
+    }
+
     const fine = await syncFineForAttendanceRecord(client, record);
 
     return {
+      event,
       record,
       fine
     };
@@ -586,17 +879,114 @@ export async function deleteAttendanceRecord(id: string) {
     await client.query("DELETE FROM fines WHERE attendance_record_id = $1", [id]);
     await client.query("DELETE FROM attendance_records WHERE id = $1", [id]);
 
+    if (record.event_id) {
+      await syncAbsencesForStudents(client, [record.student_id]);
+    }
+
     return record;
   });
 }
 
-export async function listAttendanceRecords(limit = 100, offset = 0, studentId?: string) {
+export async function listAttendanceEvents(limit = 100, offset = 0) {
+  const result = await query<AttendanceEventRecord>(
+    `
+      SELECT
+        e.*,
+        COUNT(DISTINCT ar.student_id)::INT AS attendees_count
+      FROM attendance_events e
+      LEFT JOIN attendance_records ar ON ar.event_id = e.id
+      GROUP BY e.id
+      ORDER BY COALESCE(e.event_date, e.created_at::DATE) DESC, e.created_at DESC
+      LIMIT $1 OFFSET $2
+    `,
+    [limit, offset]
+  );
+
+  return result.rows;
+}
+
+export async function createAttendanceEvent(input: AttendanceEventInput) {
+  const eventInput = getEventInput(input);
+
+  if (!eventInput.name) {
+    throw createValidationError("Event name is required.");
+  }
+
+  return withTransaction(async (client) => {
+    const result = await client.query<AttendanceEventRecord>(
+      `
+        INSERT INTO attendance_events (name, event_date, description)
+        VALUES ($1, $2, $3)
+        RETURNING *, 0::INT AS attendees_count
+      `,
+      [eventInput.name, eventInput.eventDate, eventInput.description]
+    );
+
+    await syncAllEventAbsences(client);
+    return result.rows[0];
+  });
+}
+
+export async function updateAttendanceEvent(id: string, input: AttendanceEventInput) {
+  const eventInput = getEventInput(input);
+
+  if (!eventInput.name) {
+    throw createValidationError("Event name is required.");
+  }
+
+  return withTransaction(async (client) => {
+    const existing = await getAttendanceEventById(client, id);
+    if (!existing) throw createValidationError("Attendance event not found.", 404);
+
+    const result = await client.query<AttendanceEventRecord>(
+      `
+        UPDATE attendance_events
+        SET name = $2, event_date = $3, description = $4, updated_at = NOW()
+        WHERE id = $1
+        RETURNING *
+      `,
+      [id, eventInput.name, eventInput.eventDate, eventInput.description]
+    );
+
+    return (await getAttendanceEventById(client, result.rows[0].id)) ?? result.rows[0];
+  });
+}
+
+export async function deleteAttendanceEvent(id: string) {
+  return withTransaction(async (client) => {
+    const existing = await getAttendanceEventById(client, id);
+    if (!existing) throw createValidationError("Attendance event not found.", 404);
+
+    await client.query(
+      `
+        DELETE FROM fines
+        WHERE attendance_record_id IN (
+          SELECT id FROM attendance_records WHERE event_id = $1
+        )
+      `,
+      [id]
+    );
+    await client.query("DELETE FROM attendance_records WHERE event_id = $1", [id]);
+    await client.query("UPDATE attendance_imports SET event_id = NULL WHERE event_id = $1", [id]);
+    await client.query("DELETE FROM attendance_events WHERE id = $1", [id]);
+    await syncAllEventAbsences(client);
+
+    return existing;
+  });
+}
+
+export async function listAttendanceRecords(limit = 100, offset = 0, studentId?: string, eventId?: string) {
   const clauses: string[] = [];
   const params: unknown[] = [];
 
   if (studentId) {
     params.push(studentId);
-    clauses.push(`LOWER(TRIM(student_id)) = LOWER(TRIM($${params.length}))`);
+    clauses.push(`LOWER(TRIM(ar.student_id)) = LOWER(TRIM($${params.length}))`);
+  }
+
+  if (eventId) {
+    params.push(eventId);
+    clauses.push(`ar.event_id = $${params.length}`);
   }
 
   params.push(limit);
@@ -607,10 +997,11 @@ export async function listAttendanceRecords(limit = 100, offset = 0, studentId?:
 
   const result = await query<AttendanceRecord>(
     `
-      SELECT *
-      FROM attendance_records
+      SELECT ar.*, ae.name AS event_name
+      FROM attendance_records ar
+      LEFT JOIN attendance_events ae ON ae.id = ar.event_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY created_at DESC
+      ORDER BY ar.created_at DESC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
     params
@@ -622,9 +1013,10 @@ export async function listAttendanceRecords(limit = 100, offset = 0, studentId?:
 export async function listAttendanceImports(limit = 50, offset = 0) {
   const result = await query<AttendanceImportRecord>(
     `
-      SELECT *
-      FROM attendance_imports
-      ORDER BY created_at DESC
+      SELECT ai.*, ae.name AS event_name
+      FROM attendance_imports ai
+      LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+      ORDER BY ai.created_at DESC
       LIMIT $1 OFFSET $2
     `,
     [limit, offset]
@@ -634,18 +1026,26 @@ export async function listAttendanceImports(limit = 50, offset = 0) {
 }
 
 export async function getAttendanceImport(importId: string) {
-  const importResult = await query<AttendanceImportRecord>("SELECT * FROM attendance_imports WHERE id = $1 LIMIT 1", [
-    importId
-  ]);
+  const importResult = await query<AttendanceImportRecord>(
+    `
+      SELECT ai.*, ae.name AS event_name
+      FROM attendance_imports ai
+      LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+      WHERE ai.id = $1
+      LIMIT 1
+    `,
+    [importId]
+  );
 
   if (!importResult.rows[0]) return null;
 
   const recordsResult = await query<AttendanceRecord>(
     `
-      SELECT *
-      FROM attendance_records
-      WHERE import_id = $1
-      ORDER BY created_at ASC
+      SELECT ar.*, ae.name AS event_name
+      FROM attendance_records ar
+      LEFT JOIN attendance_events ae ON ae.id = ar.event_id
+      WHERE ar.import_id = $1
+      ORDER BY ar.created_at ASC
     `,
     [importId]
   );

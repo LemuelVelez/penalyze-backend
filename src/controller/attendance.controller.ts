@@ -2,14 +2,18 @@ import { NextFunction, Request, Response } from "express";
 import multer from "multer";
 
 import {
+  createAttendanceEvent,
+  deleteAttendanceEvent,
   deleteAttendanceRecord,
   getAttendanceImport,
+  listAttendanceEvents,
   listAttendanceImports,
   listAttendanceRecords,
   previewAttendanceFile,
   saveAttendanceFile,
-  saveManualAttendanceRecord,
   saveAttendanceRows,
+  saveManualAttendanceRecord,
+  updateAttendanceEvent,
   updateAttendanceRecord,
   UploadedAttendanceFile
 } from "../services/attendance.service";
@@ -56,6 +60,67 @@ function getUploadedFile(req: Request) {
   return req.file as UploadedAttendanceFile | undefined;
 }
 
+function getEventPayload(req: Request) {
+  return {
+    eventId: req.body?.eventId,
+    eventName: req.body?.eventName,
+    eventDate: req.body?.eventDate,
+    eventDescription: req.body?.eventDescription
+  };
+}
+
+export async function events(req: Request, res: Response, next: NextFunction) {
+  try {
+    const limit = toPositiveInt(req.query.limit, 100);
+    const offset = toPositiveInt(req.query.offset, 0);
+    const records = await listAttendanceEvents(limit, offset);
+
+    res.json({ data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function saveEvent(req: Request, res: Response, next: NextFunction) {
+  try {
+    const result = await createAttendanceEvent(req.body ?? {});
+    res.status(201).json({ message: "Attendance event saved successfully.", data: result });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function updateEvent(req: Request, res: Response, next: NextFunction) {
+  try {
+    const eventId = getRouteParam(req, "eventId");
+
+    if (!eventId) {
+      res.status(400).json({ message: "Attendance event ID is required." });
+      return;
+    }
+
+    const result = await updateAttendanceEvent(eventId, req.body ?? {});
+    res.json({ message: "Attendance event updated successfully.", data: result });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteEvent(req: Request, res: Response, next: NextFunction) {
+  try {
+    const eventId = getRouteParam(req, "eventId");
+
+    if (!eventId) {
+      res.status(400).json({ message: "Attendance event ID is required." });
+      return;
+    }
+
+    const result = await deleteAttendanceEvent(eventId);
+    res.json({ message: "Attendance event deleted successfully.", data: result });
+  } catch (error) {
+    next(error);
+  }
+}
 
 export async function manualSave(req: Request, res: Response, next: NextFunction) {
   try {
@@ -65,7 +130,6 @@ export async function manualSave(req: Request, res: Response, next: NextFunction
     next(error);
   }
 }
-
 
 export async function updateRecord(req: Request, res: Response, next: NextFunction) {
   try {
@@ -117,9 +181,10 @@ export async function previewImport(req: Request, res: Response, next: NextFunct
 export async function saveImport(req: Request, res: Response, next: NextFunction) {
   try {
     const file = getUploadedFile(req);
+    const eventPayload = getEventPayload(req);
 
     if (file) {
-      const result = await saveAttendanceFile(file);
+      const result = await saveAttendanceFile(file, eventPayload);
       res.status(201).json({ message: "Attendance imported successfully.", data: result });
       return;
     }
@@ -131,6 +196,7 @@ export async function saveImport(req: Request, res: Response, next: NextFunction
     }
 
     const result = await saveAttendanceRows({
+      ...eventPayload,
       fileName: req.body?.fileName ?? "preview-import",
       fileType: req.body?.fileType ?? "json",
       rows
@@ -147,7 +213,8 @@ export async function index(req: Request, res: Response, next: NextFunction) {
     const limit = toPositiveInt(req.query.limit, 100);
     const offset = toPositiveInt(req.query.offset, 0);
     const studentId = req.query.studentId ? String(req.query.studentId).trim() : undefined;
-    const records = await listAttendanceRecords(limit, offset, studentId);
+    const eventId = req.query.eventId ? String(req.query.eventId).trim() : undefined;
+    const records = await listAttendanceRecords(limit, offset, studentId, eventId);
 
     res.json({ data: records });
   } catch (error) {

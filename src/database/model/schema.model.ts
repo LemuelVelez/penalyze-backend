@@ -1,6 +1,7 @@
 export const TABLES = {
   users: "users",
   students: "students",
+  attendanceEvents: "attendance_events",
   attendanceImports: "attendance_imports",
   attendanceRecords: "attendance_records",
   penalties: "penalties",
@@ -33,8 +34,20 @@ export type StudentRecord = {
   updated_at: Date;
 };
 
+export type AttendanceEventRecord = {
+  id: string;
+  name: string;
+  event_date: Date | string | null;
+  description: string | null;
+  attendees_count: number;
+  created_at: Date;
+  updated_at: Date;
+};
+
 export type AttendanceImportRecord = {
   id: string;
+  event_id: string | null;
+  event_name?: string | null;
   file_name: string;
   file_type: string;
   rows_total: number;
@@ -47,6 +60,8 @@ export type AttendanceImportRecord = {
 export type AttendanceRecord = {
   id: string;
   import_id: string | null;
+  event_id: string | null;
+  event_name?: string | null;
   student_id: string;
   name: string;
   year_level: string | null;
@@ -81,6 +96,8 @@ export type FineRecord = {
 };
 
 export type AttendanceImportInput = {
+  eventId?: string;
+  eventName?: string;
   studentId: string;
   name: string;
   yearLevel?: string;
@@ -108,6 +125,7 @@ export type AttendancePreviewResult = {
 
 export type SavedAttendanceImportResult = AttendancePreviewResult & {
   importId: string;
+  event: AttendanceEventRecord | null;
   savedRecords: AttendanceRecord[];
   createdFines: FineRecord[];
 };

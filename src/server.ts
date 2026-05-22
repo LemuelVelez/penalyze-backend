@@ -4,13 +4,17 @@ import express, { NextFunction, Request, Response } from "express";
 import { deleteUser, listUsers, login, me, register, requireAuth, updateUser } from "./controller/auth.controller";
 import {
   attendanceUpload,
+  deleteEvent as deleteAttendanceEvent,
   deleteRecord as deleteAttendanceRecord,
+  events as attendanceEvents,
   imports as attendanceImports,
   index as attendanceIndex,
   manualSave,
   previewImport,
+  saveEvent as saveAttendanceEvent,
   saveImport,
   showImport,
+  updateEvent as updateAttendanceEvent,
   updateRecord as updateAttendanceRecord
 } from "./controller/attendance.controller";
 import {
@@ -96,6 +100,11 @@ app.patch("/api/users/:id", requireAuth, updateUser);
 app.put("/api/users/:id", requireAuth, updateUser);
 app.delete("/api/users/:id", requireAuth, deleteUser);
 
+app.get("/api/attendance/events", attendanceEvents);
+app.post("/api/attendance/events", saveAttendanceEvent);
+app.put("/api/attendance/events/:eventId", updateAttendanceEvent);
+app.patch("/api/attendance/events/:eventId", updateAttendanceEvent);
+app.delete("/api/attendance/events/:eventId", deleteAttendanceEvent);
 app.get("/api/attendance", attendanceIndex);
 app.get("/api/attendance/imports", attendanceImports);
 app.get("/api/attendance/imports/:importId", showImport);
