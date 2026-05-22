@@ -1,11 +1,12 @@
 import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
 
-import { login, me, register, requireAuth } from "./controller/auth.controller";
+import { deleteUser, listUsers, login, me, register, requireAuth, updateUser } from "./controller/auth.controller";
 import {
   attendanceUpload,
   imports as attendanceImports,
   index as attendanceIndex,
+  manualSave,
   previewImport,
   saveImport,
   showImport
@@ -88,9 +89,15 @@ app.post("/api/auth/register", register);
 app.post("/api/auth/login", login);
 app.get("/api/auth/me", requireAuth, me);
 
+app.get("/api/users", requireAuth, listUsers);
+app.patch("/api/users/:id", requireAuth, updateUser);
+app.put("/api/users/:id", requireAuth, updateUser);
+app.delete("/api/users/:id", requireAuth, deleteUser);
+
 app.get("/api/attendance", attendanceIndex);
 app.get("/api/attendance/imports", attendanceImports);
 app.get("/api/attendance/imports/:importId", showImport);
+app.post("/api/attendance/manual", manualSave);
 app.post("/api/attendance/import/preview", attendanceUpload.single("file"), previewImport);
 app.post("/api/attendance/import/save", attendanceUpload.single("file"), saveImport);
 

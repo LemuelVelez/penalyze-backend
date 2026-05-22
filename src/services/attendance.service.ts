@@ -322,7 +322,7 @@ async function upsertStudent(client: PoolClient, row: ParsedAttendanceRow) {
   );
 }
 
-async function insertAttendanceRecord(client: PoolClient, importId: string, row: ParsedAttendanceRow) {
+async function insertAttendanceRecord(client: PoolClient, importId: string | null, row: ParsedAttendanceRow) {
   const result = await client.query<AttendanceRecord>(
     `
       INSERT INTO attendance_records (
@@ -444,6 +444,29 @@ export async function saveAttendanceFile(file: UploadedAttendanceFile): Promise<
     fileName: preview.fileName,
     fileType: preview.fileType,
     rows: preview.rows
+  });
+}
+
+
+export async function saveManualAttendanceRecord(input: RawImportRow) {
+  const preview = buildPreview("manual-attendance", "manual", [input]);
+  const row = preview.rows[0];
+
+  if (!row || row.errors.length > 0) {
+    const validationError = new Error(row?.errors.join(" ") || "Please provide a valid attendance record.");
+    (validationError as any).statusCode = 400;
+    throw validationError;
+  }
+
+  return withTransaction(async (client) => {
+    await upsertStudent(client, row);
+    const record = await insertAttendanceRecord(client, null, row);
+    const fine = await insertFineIfNeeded(client, record);
+
+    return {
+      record,
+      fine
+    };
   });
 }
 

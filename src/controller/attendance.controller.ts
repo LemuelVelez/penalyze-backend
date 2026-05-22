@@ -7,6 +7,7 @@ import {
   listAttendanceRecords,
   previewAttendanceFile,
   saveAttendanceFile,
+  saveManualAttendanceRecord,
   saveAttendanceRows,
   UploadedAttendanceFile
 } from "../services/attendance.service";
@@ -51,6 +52,16 @@ function getRouteParam(req: Request, key: string) {
 
 function getUploadedFile(req: Request) {
   return req.file as UploadedAttendanceFile | undefined;
+}
+
+
+export async function manualSave(req: Request, res: Response, next: NextFunction) {
+  try {
+    const result = await saveManualAttendanceRecord(req.body ?? {});
+    res.status(201).json({ message: "Manual attendance saved successfully.", data: result });
+  } catch (error) {
+    next(error);
+  }
 }
 
 export async function previewImport(req: Request, res: Response, next: NextFunction) {

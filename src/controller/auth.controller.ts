@@ -105,6 +105,11 @@ async function verifyLegacyPostgresPassword(password: string, storedHash: string
   }
 }
 
+function getRouteParam(req: Request, key: string) {
+  const value = req.params[key];
+  return Array.isArray(value) ? value[0] : value;
+}
+
 function publicUser(user: UserRecord) {
   return {
     id: user.id,
@@ -262,6 +267,128 @@ export async function me(req: AuthenticatedRequest, res: Response, next: NextFun
     }
 
     res.json({ data: { user: publicUser(user) } });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function listUsers(_req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  try {
+    const result = await query<UserRecord>(
+      `
+        SELECT *
+        FROM users
+        ORDER BY created_at DESC
+      `
+    );
+
+    res.json({ data: result.rows.map(publicUser) });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function updateUser(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  try {
+    const userId = getRouteParam(req, "id");
+    const name = req.body?.name === undefined ? undefined : cleanText(req.body.name);
+    const email = req.body?.email === undefined ? undefined : normalizeEmail(req.body.email);
+    const password = req.body?.password === undefined ? undefined : String(req.body.password ?? "");
+
+    if (!userId) {
+      res.status(400).json({ message: "User ID is required." });
+      return;
+    }
+
+    if (name !== undefined && !name) {
+      res.status(400).json({ message: "Name is required." });
+      return;
+    }
+
+    if (email !== undefined && !email) {
+      res.status(400).json({ message: "Email is required." });
+      return;
+    }
+
+    if (password !== undefined && password.length > 0 && password.length < 6) {
+      res.status(400).json({ message: "Password must be at least 6 characters." });
+      return;
+    }
+
+    const fields: string[] = [];
+    const params: unknown[] = [];
+
+    if (name !== undefined) {
+      params.push(name);
+      fields.push(`name = $${params.length}`);
+    }
+
+    if (email !== undefined) {
+      params.push(email);
+      fields.push(`email = $${params.length}`);
+    }
+
+    if (password !== undefined && password.length > 0) {
+      params.push(hashPassword(password));
+      fields.push(`password_hash = $${params.length}`);
+    }
+
+    if (!fields.length) {
+      res.status(400).json({ message: "No user changes were provided." });
+      return;
+    }
+
+    params.push(userId);
+    const result = await query<UserRecord>(
+      `
+        UPDATE users
+        SET ${fields.join(", ")}, updated_at = NOW()
+        WHERE id = $${params.length}
+        RETURNING *
+      `,
+      params
+    );
+
+    const user = result.rows[0];
+    if (!user) {
+      res.status(404).json({ message: "User not found." });
+      return;
+    }
+
+    res.json({ message: "User updated successfully.", data: publicUser(user) });
+  } catch (error: any) {
+    if (String(error?.code) === "23505") {
+      res.status(409).json({ message: "Email is already registered." });
+      return;
+    }
+
+    next(error);
+  }
+}
+
+export async function deleteUser(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  try {
+    const userId = getRouteParam(req, "id");
+
+    if (!userId) {
+      res.status(400).json({ message: "User ID is required." });
+      return;
+    }
+
+    if (req.user?.sub === userId) {
+      res.status(400).json({ message: "You cannot delete your currently signed-in account." });
+      return;
+    }
+
+    const result = await query<UserRecord>("DELETE FROM users WHERE id = $1 RETURNING *", [userId]);
+    const user = result.rows[0];
+
+    if (!user) {
+      res.status(404).json({ message: "User not found." });
+      return;
+    }
+
+    res.json({ message: "User deleted successfully.", data: { id: user.id } });
   } catch (error) {
     next(error);
   }
