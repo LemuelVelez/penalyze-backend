@@ -4,6 +4,8 @@ import multer from "multer";
 import {
   createAttendanceEvent,
   deleteAttendanceEvent,
+  deleteAttendanceImport,
+  deleteAttendanceImports,
   deleteAttendanceRecord,
   getAttendanceImport,
   listAttendanceEvents,
@@ -229,6 +231,31 @@ export async function imports(req: Request, res: Response, next: NextFunction) {
     const records = await listAttendanceImports(limit, offset);
 
     res.json({ data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteImport(req: Request, res: Response, next: NextFunction) {
+  try {
+    const importId = getRouteParam(req, "importId");
+
+    if (!importId) {
+      res.status(400).json({ message: "Attendance import ID is required." });
+      return;
+    }
+
+    const result = await deleteAttendanceImport(importId);
+    res.json({ message: "Attendance import deleted successfully.", data: result });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteImports(_req: Request, res: Response, next: NextFunction) {
+  try {
+    const result = await deleteAttendanceImports();
+    res.json({ message: "Attendance imports deleted successfully.", data: result });
   } catch (error) {
     next(error);
   }

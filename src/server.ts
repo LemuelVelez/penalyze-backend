@@ -5,6 +5,8 @@ import { deleteUser, listUsers, login, me, register, requireAuth, updateUser } f
 import {
   attendanceUpload,
   deleteEvent as deleteAttendanceEvent,
+  deleteImport as deleteAttendanceImport,
+  deleteImports as deleteAttendanceImports,
   deleteRecord as deleteAttendanceRecord,
   events as attendanceEvents,
   imports as attendanceImports,
@@ -107,7 +109,9 @@ app.patch("/api/attendance/events/:eventId", updateAttendanceEvent);
 app.delete("/api/attendance/events/:eventId", deleteAttendanceEvent);
 app.get("/api/attendance", attendanceIndex);
 app.get("/api/attendance/imports", attendanceImports);
+app.delete("/api/attendance/imports", deleteAttendanceImports);
 app.get("/api/attendance/imports/:importId", showImport);
+app.delete("/api/attendance/imports/:importId", deleteAttendanceImport);
 app.post("/api/attendance/manual", manualSave);
 app.post("/api/attendance/import/preview", attendanceUpload.single("file"), previewImport);
 app.post("/api/attendance/import/save", attendanceUpload.single("file"), saveImport);

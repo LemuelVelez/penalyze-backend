@@ -34,6 +34,11 @@ type SaveRowsInput = {
   rows: RawImportRow[] | ParsedAttendanceRow[];
 };
 
+export type DeletedAttendanceImportsResult = {
+  deletedCount: number;
+  deletedImports: AttendanceImportRecord[];
+};
+
 export type AttendanceEventInput = {
   name?: string;
   eventName?: string;
@@ -686,6 +691,55 @@ async function listRecordsByIds(client: PoolClient, ids: string[]) {
   return result.rows;
 }
 
+async function getAttendanceImportById(client: PoolClient, importId: string) {
+  const result = await client.query<AttendanceImportRecord>(
+    `
+      SELECT ai.*, ae.name AS event_name
+      FROM attendance_imports ai
+      LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+      WHERE ai.id = $1
+      LIMIT 1
+    `,
+    [importId]
+  );
+
+  return result.rows[0] ?? null;
+}
+
+async function getStudentIdsAffectedByImports(client: PoolClient, importIds: string[]) {
+  const uniqueImportIds = Array.from(new Set(importIds.filter(Boolean)));
+  if (!uniqueImportIds.length) return [];
+
+  const result = await client.query<{ student_id: string }>(
+    `
+      SELECT DISTINCT student_id
+      FROM attendance_records
+      WHERE import_id = ANY($1::uuid[]) AND event_id IS NOT NULL
+    `,
+    [uniqueImportIds]
+  );
+
+  return result.rows.map((row) => row.student_id);
+}
+
+async function deleteAttendanceImportRecords(client: PoolClient, importIds: string[]) {
+  const uniqueImportIds = Array.from(new Set(importIds.filter(Boolean)));
+  if (!uniqueImportIds.length) return;
+
+  await client.query(
+    `
+      DELETE FROM fines
+      WHERE attendance_record_id IN (
+        SELECT id FROM attendance_records WHERE import_id = ANY($1::uuid[])
+      )
+    `,
+    [uniqueImportIds]
+  );
+
+  await client.query("DELETE FROM attendance_records WHERE import_id = ANY($1::uuid[])", [uniqueImportIds]);
+  await client.query("DELETE FROM attendance_imports WHERE id = ANY($1::uuid[])", [uniqueImportIds]);
+}
+
 export async function previewAttendanceFile(file: UploadedAttendanceFile): Promise<AttendancePreviewResult> {
   if (!file?.buffer?.length) {
     throw new Error("Please upload a valid Excel, text, or document file.");
@@ -884,6 +938,62 @@ export async function deleteAttendanceRecord(id: string) {
     }
 
     return record;
+  });
+}
+
+export async function deleteAttendanceImport(importId: string) {
+  return withTransaction(async (client) => {
+    const importRecord = await getAttendanceImportById(client, importId);
+
+    if (!importRecord) {
+      throw createValidationError("Attendance import not found.", 404);
+    }
+
+    const affectedStudentIds = await getStudentIdsAffectedByImports(client, [importId]);
+
+    await deleteAttendanceImportRecords(client, [importId]);
+
+    if (affectedStudentIds.length) {
+      await syncAbsencesForStudents(client, affectedStudentIds);
+    }
+
+    return importRecord;
+  });
+}
+
+export async function deleteAttendanceImports(): Promise<DeletedAttendanceImportsResult> {
+  return withTransaction(async (client) => {
+    const importsResult = await client.query<AttendanceImportRecord>(
+      `
+        SELECT ai.*, ae.name AS event_name
+        FROM attendance_imports ai
+        LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+        ORDER BY ai.created_at DESC
+      `
+    );
+
+    const deletedImports = importsResult.rows;
+    const importIds = deletedImports.map((record) => record.id);
+
+    if (!importIds.length) {
+      return {
+        deletedCount: 0,
+        deletedImports: []
+      };
+    }
+
+    const affectedStudentIds = await getStudentIdsAffectedByImports(client, importIds);
+
+    await deleteAttendanceImportRecords(client, importIds);
+
+    if (affectedStudentIds.length) {
+      await syncAbsencesForStudents(client, affectedStudentIds);
+    }
+
+    return {
+      deletedCount: deletedImports.length,
+      deletedImports
+    };
   });
 }
 
