@@ -117,6 +117,24 @@ function cleanOptionalText(value: unknown) {
   return text || null;
 }
 
+const ATTENDANCE_RECORD_SELECT = `
+  ar.id,
+  ar.import_id,
+  ar.event_id,
+  ae.name AS event_name,
+  COALESCE(NULLIF(TRIM(s.student_id), ''), ar.student_id) AS student_id,
+  COALESCE(NULLIF(TRIM(s.name), ''), ar.name) AS name,
+  COALESCE(NULLIF(TRIM(s.year_level), ''), ar.year_level) AS year_level,
+  COALESCE(NULLIF(TRIM(s.college), ''), ar.college) AS college,
+  COALESCE(NULLIF(TRIM(s.program), ''), ar.program) AS program,
+  COALESCE(NULLIF(TRIM(s.institution), ''), ar.institution) AS institution,
+  ar.no_of_absences,
+  ar.remarks,
+  ar.scanned_at,
+  ar.created_at,
+  ar.updated_at
+`;
+
 function isNumericDateCandidate(value: string) {
   return /^\d+(?:\.\d+)?$/.test(value.trim());
 }
@@ -392,6 +410,58 @@ async function parseFileToRawRows(file: UploadedAttendanceFile) {
   return textToRows(file.buffer.toString("utf8"));
 }
 
+function getParsedAttendanceRowTime(row: ParsedAttendanceRow) {
+  const value = row.scannedAt;
+  const time = value ? new Date(value).getTime() : 0;
+
+  return Number.isNaN(time) ? 0 : time;
+}
+
+function getAttendanceRowMergeKey(row: ParsedAttendanceRow, input: SaveRowsInput) {
+  const eventKey = cleanText(row.eventName) || cleanText(input.eventId) || cleanText(input.eventName) || "no-event";
+  return `${normalizeHeader(eventKey)}:${cleanText(row.studentId).toLowerCase()}`;
+}
+
+function mergeAttendanceImportRowsByStudentAndEvent(rows: ParsedAttendanceRow[], input: SaveRowsInput) {
+  const mergedRows = new Map<string, ParsedAttendanceRow>();
+
+  rows.forEach((row) => {
+    const key = getAttendanceRowMergeKey(row, input);
+    const current = mergedRows.get(key);
+
+    if (!current) {
+      mergedRows.set(key, { ...row });
+      return;
+    }
+
+    const currentTime = getParsedAttendanceRowTime(current);
+    const rowTime = getParsedAttendanceRowTime(row);
+    const latestRow = rowTime >= currentTime ? row : current;
+    const oldestRow = latestRow === row ? current : row;
+    const remarks = Array.from(new Set([current.remarks, row.remarks].map(cleanText).filter(Boolean))).join("; ");
+
+    mergedRows.set(key, {
+      ...current,
+      eventName: latestRow.eventName || oldestRow.eventName || current.eventName,
+      eventStartAt: latestRow.eventStartAt || oldestRow.eventStartAt,
+      eventEndAt: latestRow.eventEndAt || oldestRow.eventEndAt,
+      scannedAt: latestRow.scannedAt || oldestRow.scannedAt,
+      studentId: latestRow.studentId || oldestRow.studentId,
+      name: latestRow.name || oldestRow.name,
+      yearLevel: latestRow.yearLevel || oldestRow.yearLevel,
+      college: latestRow.college || oldestRow.college,
+      program: latestRow.program || oldestRow.program,
+      institution: latestRow.institution || oldestRow.institution,
+      noOfAbsences: Math.max(current.noOfAbsences ?? 0, row.noOfAbsences ?? 0),
+      remarks,
+      raw: { ...current.raw, ...row.raw },
+      errors: []
+    });
+  });
+
+  return Array.from(mergedRows.values());
+}
+
 function createValidationError(message: string, statusCode = 400) {
   const error = new Error(message);
   (error as any).statusCode = statusCode;
@@ -648,12 +718,11 @@ async function insertFineIfNeeded(client: PoolClient, record: AttendanceRecord) 
   return syncFineForAttendanceRecord(client, record);
 }
 
-type AttendanceStudentCollegeScope = {
+type AttendanceStudentScope = {
   student_id: string;
-  college: string | null;
 };
 
-async function getAttendanceStudentCollegeScopes(client: PoolClient, studentIds: string[] = []) {
+async function getAttendanceStudentScopes(client: PoolClient, studentIds: string[] = []) {
   const uniqueStudentIds = Array.from(new Set(studentIds.map((studentId) => cleanText(studentId).toLowerCase()).filter(Boolean)));
   const params: unknown[] = [];
   const clauses = ["event_id IS NOT NULL"];
@@ -663,9 +732,9 @@ async function getAttendanceStudentCollegeScopes(client: PoolClient, studentIds:
     clauses.push(`LOWER(TRIM(student_id)) = ANY($${params.length}::TEXT[])`);
   }
 
-  const result = await client.query<AttendanceStudentCollegeScope>(
+  const result = await client.query<AttendanceStudentScope>(
     `
-      SELECT DISTINCT student_id, NULLIF(TRIM(college), '') AS college
+      SELECT DISTINCT student_id
       FROM attendance_records
       WHERE ${clauses.join(" AND ")}
     `,
@@ -675,55 +744,51 @@ async function getAttendanceStudentCollegeScopes(client: PoolClient, studentIds:
   return result.rows;
 }
 
-async function countAttendanceEventsByCollege(client: PoolClient, college: string | null) {
+async function countAttendanceEvents(client: PoolClient) {
   const result = await client.query<{ total: string }>(
     `
       SELECT COUNT(DISTINCT event_id)::TEXT AS total
       FROM attendance_records
       WHERE event_id IS NOT NULL
-        AND COALESCE(NULLIF(TRIM(college), ''), '') = COALESCE(NULLIF(TRIM($1::TEXT), ''), '')
-    `,
-    [college ?? ""]
+    `
   );
 
   return Number(result.rows[0]?.total ?? 0);
 }
 
-async function countStudentAttendanceEventsByCollege(client: PoolClient, studentId: string, college: string | null) {
+async function countStudentAttendanceEvents(client: PoolClient, studentId: string) {
   const result = await client.query<{ total: string }>(
     `
       SELECT COUNT(DISTINCT event_id)::TEXT AS total
       FROM attendance_records
       WHERE event_id IS NOT NULL
         AND LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-        AND COALESCE(NULLIF(TRIM(college), ''), '') = COALESCE(NULLIF(TRIM($2::TEXT), ''), '')
     `,
-    [studentId, college ?? ""]
+    [studentId]
   );
 
   return Number(result.rows[0]?.total ?? 0);
 }
 
 async function syncAbsencesForStudents(client: PoolClient, studentIds: string[]) {
-  const scopes = await getAttendanceStudentCollegeScopes(client, studentIds);
+  const scopes = await getAttendanceStudentScopes(client, studentIds);
+  const totalEvents = await countAttendanceEvents(client);
   const records: AttendanceRecord[] = [];
   const fines: FineRecord[] = [];
 
   for (const scope of scopes) {
-    const totalEvents = await countAttendanceEventsByCollege(client, scope.college);
-    const attendedEvents = await countStudentAttendanceEventsByCollege(client, scope.student_id, scope.college);
+    const attendedEvents = await countStudentAttendanceEvents(client, scope.student_id);
     const noOfAbsences = Math.max(totalEvents - attendedEvents, 0);
 
     const updatedResult = await client.query<AttendanceRecord>(
       `
         UPDATE attendance_records
-        SET no_of_absences = $3, updated_at = NOW()
+        SET no_of_absences = $2, updated_at = NOW()
         WHERE event_id IS NOT NULL
           AND LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-          AND COALESCE(NULLIF(TRIM(college), ''), '') = COALESCE(NULLIF(TRIM($2::TEXT), ''), '')
         RETURNING *
       `,
-      [scope.student_id, scope.college ?? "", noOfAbsences]
+      [scope.student_id, noOfAbsences]
     );
 
     for (const record of updatedResult.rows) {
@@ -737,7 +802,7 @@ async function syncAbsencesForStudents(client: PoolClient, studentIds: string[])
 }
 
 async function syncAllEventAbsences(client: PoolClient) {
-  const scopes = await getAttendanceStudentCollegeScopes(client);
+  const scopes = await getAttendanceStudentScopes(client);
   return syncAbsencesForStudents(client, scopes.map((scope) => scope.student_id));
 }
 
@@ -747,9 +812,10 @@ async function listRecordsByIds(client: PoolClient, ids: string[]) {
 
   const result = await client.query<AttendanceRecord>(
     `
-      SELECT ar.*, ae.name AS event_name
+      SELECT ${ATTENDANCE_RECORD_SELECT}
       FROM attendance_records ar
       LEFT JOIN attendance_events ae ON ae.id = ar.event_id
+      LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
       WHERE ar.id = ANY($1::uuid[])
       ORDER BY ar.created_at DESC
     `,
@@ -842,8 +908,9 @@ export async function saveAttendanceRows(input: SaveRowsInput): Promise<SavedAtt
     const importId = importResult.rows[0].id;
     const savedRecordIds: string[] = [];
     const affectedStudentIds: string[] = [];
+    const rowsToSave = mergeAttendanceImportRowsByStudentAndEvent(validRows, input);
 
-    for (const row of validRows) {
+    for (const row of rowsToSave) {
       const event = row.eventName
         ? await findOrCreateAttendanceEvent(
             client,
@@ -1188,7 +1255,7 @@ export async function listAttendanceRecords(
 
   if (college) {
     params.push(college);
-    clauses.push(`LOWER(TRIM(COALESCE(ar.college, ''))) = LOWER(TRIM($${params.length}))`);
+    clauses.push(`LOWER(TRIM(COALESCE(NULLIF(TRIM(s.college), ''), ar.college, ''))) = LOWER(TRIM($${params.length}))`);
   }
 
   params.push(limit);
@@ -1199,9 +1266,10 @@ export async function listAttendanceRecords(
 
   const result = await query<AttendanceRecord>(
     `
-      SELECT ar.*, ae.name AS event_name
+      SELECT ${ATTENDANCE_RECORD_SELECT}
       FROM attendance_records ar
       LEFT JOIN attendance_events ae ON ae.id = ar.event_id
+      LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY COALESCE(ar.scanned_at, ar.created_at) DESC, ar.created_at DESC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
@@ -1243,9 +1311,10 @@ export async function getAttendanceImport(importId: string) {
 
   const recordsResult = await query<AttendanceRecord>(
     `
-      SELECT ar.*, ae.name AS event_name
+      SELECT ${ATTENDANCE_RECORD_SELECT}
       FROM attendance_records ar
       LEFT JOIN attendance_events ae ON ae.id = ar.event_id
+      LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
       WHERE ar.import_id = $1
       ORDER BY ar.created_at ASC
     `,
