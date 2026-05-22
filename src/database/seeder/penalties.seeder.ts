@@ -47,10 +47,46 @@ export const DEFAULT_PENALTIES: Array<Pick<PenaltyRecord, "no_of_absences" | "pr
   }
 ];
 
-export async function seedPenalties() {
+export type SeedPenaltiesResult = {
+  rows: PenaltyRecord[];
+  seededCount: number;
+  alreadySeeded: boolean;
+};
+
+export async function seedPenalties(): Promise<SeedPenaltiesResult> {
+  const absenceCounts = DEFAULT_PENALTIES.map((item) => item.no_of_absences);
+
+  const existingResult = await query<PenaltyRecord>(
+    `
+      SELECT *
+      FROM penalties
+      WHERE no_of_absences = ANY($1::int[])
+      ORDER BY no_of_absences ASC
+    `,
+    [absenceCounts]
+  );
+
+  const existingByAbsence = new Map(
+    existingResult.rows.map((penalty) => [penalty.no_of_absences, penalty])
+  );
+
+  const penaltiesToSeed = DEFAULT_PENALTIES.filter((item) => {
+    const existing = existingByAbsence.get(item.no_of_absences);
+
+    return !existing || existing.prescribed_penalty !== item.prescribed_penalty;
+  });
+
+  if (!penaltiesToSeed.length) {
+    return {
+      rows: existingResult.rows,
+      seededCount: 0,
+      alreadySeeded: true
+    };
+  }
+
   const seeded: PenaltyRecord[] = [];
 
-  for (const item of DEFAULT_PENALTIES) {
+  for (const item of penaltiesToSeed) {
     const result = await query<PenaltyRecord>(
       `
         INSERT INTO penalties (no_of_absences, prescribed_penalty)
@@ -67,13 +103,19 @@ export async function seedPenalties() {
     seeded.push(result.rows[0]);
   }
 
-  return seeded;
+  return {
+    rows: seeded,
+    seededCount: seeded.length,
+    alreadySeeded: false
+  };
 }
 
 if (require.main === module) {
   seedPenalties()
-    .then(async (rows) => {
-      console.log(`Seeded ${rows.length} penalties.`);
+    .then(async (result) => {
+      console.log(
+        result.alreadySeeded ? "Penalties already seeded." : `Seeded ${result.seededCount} penalties.`
+      );
       await closeDatabasePool();
     })
     .catch(async (error) => {

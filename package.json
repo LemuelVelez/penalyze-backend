@@ -8,8 +8,8 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "migrate": "tsx src/database/script/run-migrations.ts",
-    "seed": "tsx src/database/script/seed-penalties.ts"
+    "migrate": "tsx src/database/script/migration.ts",
+    "seed": "tsx src/database/script/seed.ts"
   },
   "keywords": [],
   "author": "",
