@@ -314,11 +314,14 @@ export async function saveImportWithProgress(
 ) {
   let clientCancelled = false;
 
-  req.on("close", () => {
+  const markClientCancelled = () => {
     if (!res.writableEnded) {
       clientCancelled = true;
     }
-  });
+  };
+
+  req.on("aborted", markClientCancelled);
+  res.on("close", markClientCancelled);
 
   try {
     const file = getUploadedFile(req);
