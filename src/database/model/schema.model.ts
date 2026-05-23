@@ -10,6 +10,7 @@ export const TABLES = {
 
 export type UserRole = "admin";
 export type ImportStatus = "previewed" | "saved" | "failed";
+export type AttendanceImportProgressStage = "preparing" | "parsing" | "validating" | "saving" | "syncing" | "completed";
 export type FineStatus = "unpaid" | "paid" | "waived";
 
 export type UserRecord = {
@@ -128,6 +129,16 @@ export type AttendancePreviewResult = {
   rowsValid: number;
   rowsInvalid: number;
   rows: ParsedAttendanceRow[];
+};
+
+export type AttendanceImportProgress = {
+  stage: AttendanceImportProgressStage;
+  percent: number;
+  message: string;
+  processedRows: number;
+  totalRows: number;
+  savedRecords: number;
+  createdFines: number;
 };
 
 export type SavedAttendanceImportResult = AttendancePreviewResult & {

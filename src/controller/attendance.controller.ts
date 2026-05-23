@@ -19,6 +19,7 @@ import {
   updateAttendanceRecord,
   UploadedAttendanceFile
 } from "../services/attendance.service";
+import { AttendanceImportProgress } from "../database/model/schema.model";
 
 const MAX_FILE_SIZE = Number(process.env.ATTENDANCE_UPLOAD_MAX_BYTES ?? 10 * 1024 * 1024);
 const ALLOWED_MIME_TYPES = new Set([
@@ -70,6 +71,31 @@ function getEventPayload(req: Request) {
     eventEndAt: req.body?.eventEndAt,
     eventDescription: req.body?.eventDescription
   };
+}
+
+type AttendanceImportProgressStreamMessage =
+  | { type: "progress"; progress: AttendanceImportProgress }
+  | { type: "success"; message: string; data: unknown }
+  | { type: "error"; message: string };
+
+function getErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function prepareProgressStream(res: Response) {
+  res.status(201);
+  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+
+  if (typeof res.flushHeaders === "function") {
+    res.flushHeaders();
+  }
+}
+
+function writeProgressStreamMessage(res: Response, message: AttendanceImportProgressStreamMessage) {
+  res.write(`${JSON.stringify(message)}\n`);
 }
 
 export async function events(req: Request, res: Response, next: NextFunction) {
@@ -207,6 +233,53 @@ export async function saveImport(req: Request, res: Response, next: NextFunction
 
     res.status(201).json({ message: "Attendance imported successfully.", data: result });
   } catch (error) {
+    next(error);
+  }
+}
+
+export async function saveImportWithProgress(req: Request, res: Response, next: NextFunction) {
+  try {
+    const file = getUploadedFile(req);
+    const eventPayload = getEventPayload(req);
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+
+    if (!file && !rows.length) {
+      res.status(400).json({ message: "Please upload a file or provide rows from the preview response." });
+      return;
+    }
+
+    prepareProgressStream(res);
+
+    const onProgress = (progress: AttendanceImportProgress) => {
+      writeProgressStreamMessage(res, { type: "progress", progress });
+    };
+
+    const result = file
+      ? await saveAttendanceFile(file, eventPayload, onProgress)
+      : await saveAttendanceRows({
+          ...eventPayload,
+          fileName: req.body?.fileName ?? "preview-import",
+          fileType: req.body?.fileType ?? "json",
+          rows,
+          onProgress
+        });
+
+    writeProgressStreamMessage(res, {
+      type: "success",
+      message: "Attendance imported successfully.",
+      data: result
+    });
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      writeProgressStreamMessage(res, {
+        type: "error",
+        message: getErrorMessage(error, "Unable to save attendance import.")
+      });
+      res.end();
+      return;
+    }
+
     next(error);
   }
 }

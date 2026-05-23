@@ -15,6 +15,7 @@ import {
   previewImport,
   saveEvent as saveAttendanceEvent,
   saveImport,
+  saveImportWithProgress,
   showImport,
   updateEvent as updateAttendanceEvent,
   updateRecord as updateAttendanceRecord
@@ -115,6 +116,7 @@ app.get("/api/attendance/imports/:importId", showImport);
 app.delete("/api/attendance/imports/:importId", deleteAttendanceImport);
 app.post("/api/attendance/manual", manualSave);
 app.post("/api/attendance/import/preview", attendanceUpload.single("file"), previewImport);
+app.post("/api/attendance/import/save/progress", attendanceUpload.single("file"), saveImportWithProgress);
 app.post("/api/attendance/import/save", attendanceUpload.single("file"), saveImport);
 app.put("/api/attendance/:id", updateAttendanceRecord);
 app.patch("/api/attendance/:id", updateAttendanceRecord);

@@ -4,6 +4,7 @@ import { PoolClient } from "pg";
 import {
   ACCEPTED_ATTENDANCE_EXTENSIONS,
   AttendanceEventRecord,
+  AttendanceImportProgress,
   AttendanceImportRecord,
   AttendancePreviewResult,
   AttendanceRecord,
@@ -34,7 +35,10 @@ type SaveRowsInput = {
   fileName?: string;
   fileType?: string;
   rows: RawImportRow[] | ParsedAttendanceRow[];
+  onProgress?: AttendanceImportProgressCallback;
 };
+
+type AttendanceImportProgressCallback = (progress: AttendanceImportProgress) => void | Promise<void>;
 
 export type DeletedAttendanceImportsResult = {
   deletedCount: number;
@@ -53,6 +57,33 @@ export type AttendanceEventInput = {
   description?: string;
   eventDescription?: string;
 };
+
+function clampAttendanceProgressPercent(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+async function emitAttendanceImportProgress(
+  onProgress: AttendanceImportProgressCallback | undefined,
+  progress: Partial<AttendanceImportProgress> & Pick<AttendanceImportProgress, "stage" | "message">
+) {
+  if (!onProgress) return;
+
+  await onProgress({
+    stage: progress.stage,
+    percent: clampAttendanceProgressPercent(progress.percent ?? 0),
+    message: progress.message,
+    processedRows: Math.max(0, Math.round(progress.processedRows ?? 0)),
+    totalRows: Math.max(0, Math.round(progress.totalRows ?? 0)),
+    savedRecords: Math.max(0, Math.round(progress.savedRecords ?? 0)),
+    createdFines: Math.max(0, Math.round(progress.createdFines ?? 0))
+  });
+}
+
+function getAttendanceRowSaveProgressPercent(processedRows: number, totalRows: number) {
+  if (totalRows <= 0) return 85;
+  return 25 + (processedRows / totalRows) * 60;
+}
 
 const HEADER_ALIASES = {
   eventName: ["event", "event name", "event_name", "activity", "activity name", "occasion"],
@@ -885,16 +916,27 @@ export async function previewAttendanceFile(file: UploadedAttendanceFile): Promi
 }
 
 export async function saveAttendanceRows(input: SaveRowsInput): Promise<SavedAttendanceImportResult> {
+  await emitAttendanceImportProgress(input.onProgress, {
+    stage: "validating",
+    percent: 10,
+    message: "Validating attendance rows...",
+    processedRows: 0,
+    totalRows: Array.isArray(input.rows) ? input.rows.length : 0
+  });
+
   const preview = buildPreview(input.fileName ?? "manual-import", input.fileType ?? "json", input.rows);
   const validRows = preview.rows.filter((row) => row.errors.length === 0);
-  const hasEventContext = Boolean(cleanText(input.eventId) || cleanText(input.eventName) || validRows.some((row) => row.eventName));
+  const hasEventContext = Boolean(
+    cleanText(input.eventId) || cleanText(input.eventName) || validRows.some((row) => row.eventName)
+  );
 
   if (!hasEventContext) {
     throw createValidationError("Event name is required when saving an uploaded attendance file.");
   }
 
-  return withTransaction(async (client) => {
-    const defaultEvent = cleanText(input.eventId) || cleanText(input.eventName) ? await findOrCreateAttendanceEvent(client, input) : null;
+  const result = await withTransaction(async (client) => {
+    const defaultEvent =
+      cleanText(input.eventId) || cleanText(input.eventName) ? await findOrCreateAttendanceEvent(client, input) : null;
 
     const importResult = await client.query<AttendanceImportRecord>(
       `
@@ -910,7 +952,16 @@ export async function saveAttendanceRows(input: SaveRowsInput): Promise<SavedAtt
     const affectedStudentIds: string[] = [];
     const rowsToSave = mergeAttendanceImportRowsByStudentAndEvent(validRows, input);
 
-    for (const row of rowsToSave) {
+    await emitAttendanceImportProgress(input.onProgress, {
+      stage: "saving",
+      percent: 25,
+      message: "Saving attendance records...",
+      processedRows: 0,
+      totalRows: rowsToSave.length,
+      savedRecords: 0
+    });
+
+    for (const [index, row] of rowsToSave.entries()) {
       const event = row.eventName
         ? await findOrCreateAttendanceEvent(
             client,
@@ -932,10 +983,38 @@ export async function saveAttendanceRows(input: SaveRowsInput): Promise<SavedAtt
       const record = await insertAttendanceRecord(client, importId, event.id, row);
       savedRecordIds.push(record.id);
       affectedStudentIds.push(record.student_id);
+
+      await emitAttendanceImportProgress(input.onProgress, {
+        stage: "saving",
+        percent: getAttendanceRowSaveProgressPercent(index + 1, rowsToSave.length),
+        message: "Saving attendance records...",
+        processedRows: index + 1,
+        totalRows: rowsToSave.length,
+        savedRecords: savedRecordIds.length
+      });
     }
+
+    await emitAttendanceImportProgress(input.onProgress, {
+      stage: "syncing",
+      percent: 90,
+      message: "Syncing absences and fines...",
+      processedRows: rowsToSave.length,
+      totalRows: rowsToSave.length,
+      savedRecords: savedRecordIds.length
+    });
 
     const synced = await syncAbsencesForStudents(client, affectedStudentIds);
     const savedRecords = await listRecordsByIds(client, savedRecordIds);
+
+    await emitAttendanceImportProgress(input.onProgress, {
+      stage: "syncing",
+      percent: 96,
+      message: "Finalizing attendance import...",
+      processedRows: rowsToSave.length,
+      totalRows: rowsToSave.length,
+      savedRecords: savedRecords.length,
+      createdFines: synced.fines.length
+    });
 
     return {
       ...preview,
@@ -945,15 +1024,46 @@ export async function saveAttendanceRows(input: SaveRowsInput): Promise<SavedAtt
       createdFines: synced.fines
     };
   });
+
+  await emitAttendanceImportProgress(input.onProgress, {
+    stage: "completed",
+    percent: 100,
+    message: "Attendance import completed.",
+    processedRows: result.savedRecords.length,
+    totalRows: result.savedRecords.length,
+    savedRecords: result.savedRecords.length,
+    createdFines: result.createdFines.length
+  });
+
+  return result;
 }
 
 export async function saveAttendanceFile(
   file: UploadedAttendanceFile,
-  options: Omit<SaveRowsInput, "rows" | "fileName" | "fileType"> = {}
+  options: Omit<SaveRowsInput, "rows" | "fileName" | "fileType"> = {},
+  onProgress?: AttendanceImportProgressCallback
 ): Promise<SavedAttendanceImportResult> {
+  await emitAttendanceImportProgress(onProgress ?? options.onProgress, {
+    stage: "parsing",
+    percent: 5,
+    message: "Reading uploaded attendance file...",
+    processedRows: 0,
+    totalRows: 0
+  });
+
   const preview = await previewAttendanceFile(file);
+
+  await emitAttendanceImportProgress(onProgress ?? options.onProgress, {
+    stage: "validating",
+    percent: 15,
+    message: "Preparing parsed attendance rows...",
+    processedRows: 0,
+    totalRows: preview.rows.length
+  });
+
   return saveAttendanceRows({
     ...options,
+    onProgress: onProgress ?? options.onProgress,
     fileName: preview.fileName,
     fileType: preview.fileType,
     rows: preview.rows
