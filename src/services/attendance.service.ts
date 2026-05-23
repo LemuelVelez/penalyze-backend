@@ -564,7 +564,9 @@ function getAttendanceRowMergeKey(
     cleanText(input.eventId) ||
     cleanText(input.eventName) ||
     "no-event";
-  return `${normalizeHeader(eventKey)}:${cleanText(row.studentId).toLowerCase()}`;
+  const collegeKey = cleanText(row.college) || "no-college";
+
+  return `${normalizeHeader(eventKey)}:${normalizeHeader(collegeKey)}:${cleanText(row.studentId).toLowerCase()}`;
 }
 
 function mergeAttendanceImportRowsByStudentAndEvent(
@@ -927,7 +929,21 @@ async function insertFineIfNeeded(
 
 type AttendanceStudentScope = {
   student_id: string;
+  college: string | null;
 };
+
+const ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL = `
+  LOWER(TRIM(COALESCE(
+    (
+      SELECT NULLIF(TRIM(s.college), '')
+      FROM students s
+      WHERE LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+      LIMIT 1
+    ),
+    NULLIF(TRIM(ar.college), ''),
+    ''
+  )))
+`;
 
 async function getAttendanceStudentScopes(
   client: PoolClient,
@@ -941,17 +957,20 @@ async function getAttendanceStudentScopes(
     ),
   );
   const params: unknown[] = [];
-  const clauses = ["event_id IS NOT NULL"];
+  const clauses = ["ar.event_id IS NOT NULL"];
 
   if (uniqueStudentIds.length) {
     params.push(uniqueStudentIds);
-    clauses.push(`LOWER(TRIM(student_id)) = ANY($${params.length}::TEXT[])`);
+    clauses.push(`LOWER(TRIM(ar.student_id)) = ANY($${params.length}::TEXT[])`);
   }
 
   const result = await client.query<AttendanceStudentScope>(
     `
-      SELECT DISTINCT student_id
-      FROM attendance_records
+      SELECT DISTINCT
+        ar.student_id,
+        COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), ''), '') AS college
+      FROM attendance_records ar
+      LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
       WHERE ${clauses.join(" AND ")}
     `,
     params,
@@ -960,13 +979,19 @@ async function getAttendanceStudentScopes(
   return result.rows;
 }
 
-async function countAttendanceEvents(client: PoolClient) {
+async function countAttendanceEvents(
+  client: PoolClient,
+  college: string | null,
+) {
   const result = await client.query<{ total: string }>(
     `
-      SELECT COUNT(DISTINCT event_id)::TEXT AS total
-      FROM attendance_records
-      WHERE event_id IS NOT NULL
+      SELECT COUNT(DISTINCT ar.event_id)::TEXT AS total
+      FROM attendance_records ar
+      LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+      WHERE ar.event_id IS NOT NULL
+        AND LOWER(TRIM(COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), ''), ''))) = LOWER(TRIM($1))
     `,
+    [college ?? ""],
   );
 
   return Number(result.rows[0]?.total ?? 0);
@@ -975,15 +1000,18 @@ async function countAttendanceEvents(client: PoolClient) {
 async function countStudentAttendanceEvents(
   client: PoolClient,
   studentId: string,
+  college: string | null,
 ) {
   const result = await client.query<{ total: string }>(
     `
-      SELECT COUNT(DISTINCT event_id)::TEXT AS total
-      FROM attendance_records
-      WHERE event_id IS NOT NULL
-        AND LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+      SELECT COUNT(DISTINCT ar.event_id)::TEXT AS total
+      FROM attendance_records ar
+      LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+      WHERE ar.event_id IS NOT NULL
+        AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM($1))
+        AND LOWER(TRIM(COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), ''), ''))) = LOWER(TRIM($2))
     `,
-    [studentId],
+    [studentId, college ?? ""],
   );
 
   return Number(result.rows[0]?.total ?? 0);
@@ -994,26 +1022,28 @@ async function syncAbsencesForStudents(
   studentIds: string[],
 ) {
   const scopes = await getAttendanceStudentScopes(client, studentIds);
-  const totalEvents = await countAttendanceEvents(client);
   const records: AttendanceRecord[] = [];
   const fines: FineRecord[] = [];
 
   for (const scope of scopes) {
+    const totalEvents = await countAttendanceEvents(client, scope.college);
     const attendedEvents = await countStudentAttendanceEvents(
       client,
       scope.student_id,
+      scope.college,
     );
     const noOfAbsences = Math.max(totalEvents - attendedEvents, 0);
 
     const updatedResult = await client.query<AttendanceRecord>(
       `
-        UPDATE attendance_records
-        SET no_of_absences = $2, updated_at = NOW()
-        WHERE event_id IS NOT NULL
-          AND LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        UPDATE attendance_records ar
+        SET no_of_absences = $3, updated_at = NOW()
+        WHERE ar.event_id IS NOT NULL
+          AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM($1))
+          AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = LOWER(TRIM($2))
         RETURNING *
       `,
-      [scope.student_id, noOfAbsences],
+      [scope.student_id, scope.college ?? "", noOfAbsences],
     );
 
     for (const record of updatedResult.rows) {
@@ -1066,25 +1096,6 @@ async function getAttendanceImportById(client: PoolClient, importId: string) {
   );
 
   return result.rows[0] ?? null;
-}
-
-async function getStudentIdsAffectedByImports(
-  client: PoolClient,
-  importIds: string[],
-) {
-  const uniqueImportIds = Array.from(new Set(importIds.filter(Boolean)));
-  if (!uniqueImportIds.length) return [];
-
-  const result = await client.query<{ student_id: string }>(
-    `
-      SELECT DISTINCT student_id
-      FROM attendance_records
-      WHERE import_id = ANY($1::uuid[]) AND event_id IS NOT NULL
-    `,
-    [uniqueImportIds],
-  );
-
-  return result.rows.map((row) => row.student_id);
 }
 
 async function deleteAttendanceImportRecords(
@@ -1228,7 +1239,6 @@ export async function saveAttendanceRows(
 
     const importId = importRecord.id;
     const savedRecordIds: string[] = [];
-    const affectedStudentIds: string[] = [];
     const rowsToSave = mergeAttendanceImportRowsByStudentAndEvent(
       validRows,
       input,
@@ -1275,7 +1285,6 @@ export async function saveAttendanceRows(
         row,
       );
       savedRecordIds.push(record.id);
-      affectedStudentIds.push(record.student_id);
 
       await emitAttendanceImportProgress(input.onProgress, {
         stage: "saving",
@@ -1303,7 +1312,7 @@ export async function saveAttendanceRows(
       savedRecords: savedRecordIds.length,
     });
 
-    const synced = await syncAbsencesForStudents(client, affectedStudentIds);
+    const synced = await syncAllEventAbsences(client);
     const savedRecords = await listRecordsByIds(client, savedRecordIds);
 
     await emitAttendanceImportProgress(input.onProgress, {
@@ -1391,7 +1400,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
     );
 
     if (event) {
-      const synced = await syncAbsencesForStudents(client, [record.student_id]);
+      const synced = await syncAllEventAbsences(client);
       const updatedRecord =
         (await listRecordsByIds(client, [record.id]))[0] ?? record;
       const fine =
@@ -1466,10 +1475,9 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
     );
 
     const record = updatedResult.rows[0];
-    const affectedStudentIds = [existingRecord.student_id, record.student_id];
 
     if (existingRecord.event_id || record.event_id) {
-      const synced = await syncAbsencesForStudents(client, affectedStudentIds);
+      const synced = await syncAllEventAbsences(client);
       const updatedRecord =
         (await listRecordsByIds(client, [record.id]))[0] ?? record;
       const fine =
@@ -1511,7 +1519,7 @@ export async function deleteAttendanceRecord(id: string) {
     await client.query("DELETE FROM attendance_records WHERE id = $1", [id]);
 
     if (record.event_id) {
-      await syncAbsencesForStudents(client, [record.student_id]);
+      await syncAllEventAbsences(client);
     }
 
     return record;
@@ -1526,15 +1534,8 @@ export async function deleteAttendanceImport(importId: string) {
       throw createValidationError("Attendance import not found.", 404);
     }
 
-    const affectedStudentIds = await getStudentIdsAffectedByImports(client, [
-      importId,
-    ]);
-
     await deleteAttendanceImportRecords(client, [importId]);
-
-    if (affectedStudentIds.length) {
-      await syncAbsencesForStudents(client, affectedStudentIds);
-    }
+    await syncAllEventAbsences(client);
 
     return importRecord;
   });
@@ -1561,16 +1562,8 @@ export async function deleteAttendanceImports(): Promise<DeletedAttendanceImport
       };
     }
 
-    const affectedStudentIds = await getStudentIdsAffectedByImports(
-      client,
-      importIds,
-    );
-
     await deleteAttendanceImportRecords(client, importIds);
-
-    if (affectedStudentIds.length) {
-      await syncAbsencesForStudents(client, affectedStudentIds);
-    }
+    await syncAllEventAbsences(client);
 
     return {
       deletedCount: deletedImports.length,

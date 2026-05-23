@@ -231,12 +231,16 @@ export async function listFines(options: { status?: FineStatus; studentId?: stri
   return result.rows;
 }
 
-async function getAttendanceEventCount() {
+async function getAttendanceEventCount(college?: string | null) {
   const result = await query<{ total: number }>(
     `
-      SELECT COUNT(*)::INT AS total
-      FROM attendance_events
-    `
+      SELECT COUNT(DISTINCT ar.event_id)::INT AS total
+      FROM attendance_records ar
+      LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+      WHERE ar.event_id IS NOT NULL
+        AND LOWER(TRIM(COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), ''), ''))) = LOWER(TRIM($1))
+    `,
+    [college ?? ""]
   );
 
   return Number(result.rows[0]?.total ?? 0);
@@ -412,7 +416,7 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
 
 export async function registerZeroAttendanceFine(input: ZeroAttendanceFineInput) {
   const cleanInput = validateZeroAttendanceInput(input);
-  const totalEvents = await getAttendanceEventCount();
+  const totalEvents = await getAttendanceEventCount(cleanInput.college);
 
   await upsertStudentRecord(cleanInput);
 
