@@ -24,6 +24,7 @@ import {
   fines,
   matchPenalty,
   penalties,
+  registerZeroAttendance,
   savePenalty,
   seedPenalties,
   summary,
@@ -121,6 +122,7 @@ app.delete("/api/attendance/:id", deleteAttendanceRecord);
 
 app.get("/api/fines", fines);
 app.get("/api/fines/summary", summary);
+app.post("/api/fines/zero-attendance", registerZeroAttendance);
 app.patch("/api/fines/:id/status", updateStatus);
 app.get("/api/fines/penalties", penalties);
 app.post("/api/fines/penalties", savePenalty);

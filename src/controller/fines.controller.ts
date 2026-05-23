@@ -7,6 +7,7 @@ import {
   getPenaltyByAbsences,
   listFines,
   listPenalties,
+  registerZeroAttendanceFine as registerZeroAttendanceFineRecord,
   seedDefaultPenalties,
   updateFineStatus,
   updatePenalty as updatePenaltyRecord,
@@ -29,6 +30,17 @@ function getPenaltyPayload(req: Request) {
   return {
     noOfAbsences: Number(req.body?.noOfAbsences ?? req.body?.no_of_absences),
     prescribedPenalty: String(req.body?.prescribedPenalty ?? req.body?.prescribed_penalty ?? "").trim()
+  };
+}
+
+function getZeroAttendancePayload(req: Request) {
+  return {
+    studentId: String(req.body?.studentId ?? req.body?.student_id ?? "").trim(),
+    name: String(req.body?.name ?? "").trim(),
+    yearLevel: String(req.body?.yearLevel ?? req.body?.year_level ?? "").trim(),
+    college: String(req.body?.college ?? "").trim(),
+    program: String(req.body?.program ?? "").trim(),
+    institution: String(req.body?.institution ?? "").trim()
   };
 }
 
@@ -112,6 +124,16 @@ export async function matchPenalty(req: Request, res: Response, next: NextFuncti
     }
 
     res.json({ data: row });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function registerZeroAttendance(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await registerZeroAttendanceFineRecord(getZeroAttendancePayload(req));
+
+    res.status(201).json({ message: "Zero attendance record and fine saved successfully.", data });
   } catch (error) {
     next(error);
   }
