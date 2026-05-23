@@ -31,6 +31,25 @@ function cleanOptionalText(value: unknown) {
   return cleanValue || null;
 }
 
+function getAttendanceRecordCollegeScopeSql(recordAlias: string) {
+  return `
+    LOWER(TRIM(COALESCE(
+      (
+        SELECT NULLIF(TRIM(scope_student.college), '')
+        FROM students scope_student
+        WHERE LOWER(TRIM(scope_student.student_id)) = LOWER(TRIM(${recordAlias}.student_id))
+        LIMIT 1
+      ),
+      NULLIF(TRIM(${recordAlias}.college), ''),
+      ''
+    )))
+  `;
+}
+
+const ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL =
+  getAttendanceRecordCollegeScopeSql("ar");
+
+
 function validateZeroAttendanceInput(input: ZeroAttendanceFineInput) {
   const studentId = String(input.studentId ?? "").trim();
   const name = String(input.name ?? "").trim();
@@ -236,9 +255,8 @@ async function getAttendanceEventCount(college?: string | null) {
     `
       SELECT COUNT(DISTINCT ar.event_id)::INT AS total
       FROM attendance_records ar
-      LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
       WHERE ar.event_id IS NOT NULL
-        AND LOWER(TRIM(COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), ''), ''))) = LOWER(TRIM($1))
+        AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = LOWER(TRIM($1))
     `,
     [college ?? ""]
   );
