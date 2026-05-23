@@ -5,12 +5,19 @@ export const TABLES = {
   attendanceImports: "attendance_imports",
   attendanceRecords: "attendance_records",
   penalties: "penalties",
-  fines: "fines"
+  fines: "fines",
 } as const;
 
 export type UserRole = "admin";
 export type ImportStatus = "previewed" | "saved" | "failed";
-export type AttendanceImportProgressStage = "preparing" | "parsing" | "validating" | "saving" | "syncing" | "completed";
+export type AttendanceImportProgressStage =
+  | "preparing"
+  | "parsing"
+  | "validating"
+  | "saving"
+  | "syncing"
+  | "completed"
+  | "cancelled";
 export type FineStatus = "unpaid" | "paid" | "waived";
 
 export type UserRecord = {
@@ -148,5 +155,12 @@ export type SavedAttendanceImportResult = AttendancePreviewResult & {
   createdFines: FineRecord[];
 };
 
-export const ACCEPTED_ATTENDANCE_EXTENSIONS = [".xlsx", ".xls", ".csv", ".txt", ".docx", ".doc"] as const;
+export const ACCEPTED_ATTENDANCE_EXTENSIONS = [
+  ".xlsx",
+  ".xls",
+  ".csv",
+  ".txt",
+  ".docx",
+  ".doc",
+] as const;
 export const REQUIRED_ATTENDANCE_FIELDS = ["studentId", "name"] as const;
