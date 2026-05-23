@@ -42,7 +42,7 @@ function normalizeOrigin(value: string) {
 }
 
 function parseAllowedOrigins() {
-  const configuredOrigins = [process.env.FRONTEND_ORIGINS, process.env.FRONTEND_URL, process.env.Frontend_URL]
+  const configuredOrigins = [process.env.CORS_ORIGIN, process.env.FRONTEND_ORIGINS, process.env.FRONTEND_URL, process.env.Frontend_URL]
     .flatMap((value) => String(value ?? "").split(","))
     .map(normalizeOrigin)
     .filter(Boolean);
