@@ -18,7 +18,8 @@ import {
   saveImportWithProgress,
   showImport,
   updateEvent as updateAttendanceEvent,
-  updateRecord as updateAttendanceRecord
+  updateRecord as updateAttendanceRecord,
+  updateRecordsBulk as updateAttendanceRecordsBulk
 } from "./controller/attendance.controller";
 import {
   deletePenalty,
@@ -118,6 +119,8 @@ app.post("/api/attendance/manual", manualSave);
 app.post("/api/attendance/import/preview", attendanceUpload.single("file"), previewImport);
 app.post("/api/attendance/import/save/progress", attendanceUpload.single("file"), saveImportWithProgress);
 app.post("/api/attendance/import/save", attendanceUpload.single("file"), saveImport);
+app.put("/api/attendance/bulk", updateAttendanceRecordsBulk);
+app.patch("/api/attendance/bulk", updateAttendanceRecordsBulk);
 app.put("/api/attendance/:id", updateAttendanceRecord);
 app.patch("/api/attendance/:id", updateAttendanceRecord);
 app.delete("/api/attendance/:id", deleteAttendanceRecord);

@@ -17,6 +17,7 @@ import {
   saveManualAttendanceRecord,
   updateAttendanceEvent,
   updateAttendanceRecord,
+  updateAttendanceRecords as updateAttendanceRecordsService,
   UploadedAttendanceFile,
 } from "../services/attendance.service";
 import { AttendanceImportProgress } from "../database/model/schema.model";
@@ -63,6 +64,15 @@ function toPositiveInt(value: unknown, fallback: number) {
 function getRouteParam(req: Request, key: string) {
   const value = req.params[key];
   return Array.isArray(value) ? value[0] : value;
+}
+
+function getBodyRecordIds(req: Request) {
+  const value = req.body?.recordIds ?? req.body?.ids;
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((id) => String(id ?? "").trim())
+    .filter(Boolean);
 }
 
 function getUploadedFile(req: Request) {
@@ -213,6 +223,34 @@ export async function updateRecord(
     const result = await updateAttendanceRecord(id, req.body ?? {});
     res.json({
       message: "Attendance record updated successfully.",
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function updateRecordsBulk(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const recordIds = getBodyRecordIds(req);
+
+    if (!recordIds.length) {
+      res.status(400).json({ message: "Attendance record IDs are required." });
+      return;
+    }
+
+    const payload = { ...(req.body ?? {}) };
+    delete payload.recordIds;
+    delete payload.ids;
+
+    const result = await updateAttendanceRecordsService(recordIds, payload);
+
+    res.json({
+      message: "Attendance records updated successfully.",
       data: result,
     });
   } catch (error) {

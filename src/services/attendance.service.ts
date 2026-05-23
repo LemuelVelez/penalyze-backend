@@ -62,6 +62,13 @@ export type AttendanceEventInput = {
   eventDescription?: string;
 };
 
+export type UpdatedAttendanceRecordsResult = {
+  event: AttendanceEventRecord | null;
+  records: AttendanceRecord[];
+  updatedRecordIds: string[];
+  fines: FineRecord[];
+};
+
 function clampAttendanceProgressPercent(value: number) {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(100, Math.round(value)));
@@ -966,6 +973,20 @@ function uniqueCleanTextValues(values: Array<string | null | undefined>) {
   );
 }
 
+function filterAttendanceFinesByRecordIds(
+  fines: Array<FineRecord | null>,
+  recordIds: string[],
+) {
+  const recordIdSet = new Set(recordIds);
+
+  return fines.filter((fine): fine is FineRecord => {
+    return Boolean(
+      fine?.attendance_record_id &&
+        recordIdSet.has(String(fine.attendance_record_id)),
+    );
+  });
+}
+
 async function lockAttendanceAbsenceSync(client: PoolClient) {
   await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
 }
@@ -1596,6 +1617,125 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       event,
       record,
       fine,
+    };
+  });
+}
+
+export async function updateAttendanceRecords(
+  ids: string[],
+  input: RawImportRow,
+): Promise<UpdatedAttendanceRecordsResult> {
+  const row = validateAttendanceInput(input);
+  const uniqueIds = uniqueCleanTextValues(ids);
+
+  if (!uniqueIds.length) {
+    throw createValidationError("Attendance record IDs are required.");
+  }
+
+  return withTransaction(async (client) => {
+    const existingResult = await client.query<AttendanceRecord>(
+      `
+        SELECT *
+        FROM attendance_records
+        WHERE id = ANY($1::uuid[])
+        ORDER BY id
+        FOR UPDATE
+      `,
+      [uniqueIds],
+    );
+    const existingRecords = existingResult.rows;
+
+    if (existingRecords.length !== uniqueIds.length) {
+      throw createValidationError(
+        "One or more attendance records were not found.",
+        404,
+      );
+    }
+
+    const existingCollegeScopeKeys = await getAttendanceRecordCollegeScopeKeys(
+      client,
+      uniqueIds,
+    );
+
+    const event = await findOrCreateAttendanceEvent(client, input);
+    await upsertStudent(client, row);
+
+    const updatedResult = await client.query<AttendanceRecord>(
+      `
+        UPDATE attendance_records
+        SET
+          event_id = $2,
+          student_id = $3,
+          name = $4,
+          year_level = NULLIF($5, ''),
+          college = NULLIF($6, ''),
+          program = NULLIF($7, ''),
+          institution = NULLIF($8, ''),
+          no_of_absences = $9,
+          scanned_at = $10::TIMESTAMPTZ,
+          remarks = NULLIF($11, ''),
+          updated_at = NOW()
+        WHERE id = ANY($1::uuid[])
+        RETURNING *
+      `,
+      [
+        uniqueIds,
+        event?.id ?? null,
+        row.studentId,
+        row.name,
+        row.yearLevel ?? "",
+        row.college ?? "",
+        row.program ?? "",
+        row.institution ?? "",
+        row.noOfAbsences ?? 0,
+        row.scannedAt ?? null,
+        row.remarks ?? "",
+      ],
+    );
+    const updatedRecords = updatedResult.rows;
+    const updatedRecordIds = updatedRecords.map((record) => record.id);
+    const shouldSyncAbsences =
+      existingRecords.some((record) => record.event_id) ||
+      updatedRecords.some((record) => record.event_id);
+
+    if (shouldSyncAbsences) {
+      const updatedCollegeScopeKeys = await getAttendanceRecordCollegeScopeKeys(
+        client,
+        updatedRecordIds,
+      );
+      const synced = await syncAbsencesForAttendanceCollegeScopes(client, [
+        ...existingCollegeScopeKeys,
+        ...updatedCollegeScopeKeys,
+      ]);
+      const refreshedRecordIds = Array.from(
+        new Set([
+          ...updatedRecordIds,
+          ...synced.records.map((record) => record.id),
+        ]),
+      );
+      const records = await listRecordsByIds(client, refreshedRecordIds);
+
+      return {
+        event,
+        records,
+        updatedRecordIds,
+        fines: filterAttendanceFinesByRecordIds(
+          synced.fines,
+          refreshedRecordIds,
+        ),
+      };
+    }
+
+    const fines = await Promise.all(
+      updatedRecords.map((record) => syncFineForAttendanceRecord(client, record)),
+    );
+    const records = await listRecordsByIds(client, updatedRecordIds);
+
+    return {
+      event,
+      records,
+      updatedRecordIds,
+      fines: filterAttendanceFinesByRecordIds(fines, updatedRecordIds),
     };
   });
 }
