@@ -8,7 +8,7 @@ export const TABLES = {
   fines: "fines",
 } as const;
 
-export type UserRole = "admin";
+export type UserRole = "admin" | "officer";
 export type ImportStatus = "previewed" | "saved" | "failed";
 export type AttendanceImportProgressStage =
   | "preparing"

@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
 
-import { deleteUser, listUsers, login, me, register, requireAuth, updateUser } from "./controller/auth.controller";
+import { deleteUser, listUsers, login, me, register, requireAdmin, requireAuth, updateUser } from "./controller/auth.controller";
 import {
   attendanceUpload,
   deleteEvent as deleteAttendanceEvent,
@@ -53,7 +53,6 @@ function parseAllowedOrigins() {
 }
 
 const ALLOWED_ORIGINS = parseAllowedOrigins();
-
 app.use((req: Request, res: Response, next: NextFunction) => {
   const requestOrigin = req.headers.origin ? normalizeOrigin(req.headers.origin) : "";
   const allowedOrigin = requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin) ? requestOrigin : "";
@@ -100,10 +99,10 @@ app.post("/api/auth/register", register);
 app.post("/api/auth/login", login);
 app.get("/api/auth/me", requireAuth, me);
 
-app.get("/api/users", requireAuth, listUsers);
-app.patch("/api/users/:id", requireAuth, updateUser);
-app.put("/api/users/:id", requireAuth, updateUser);
-app.delete("/api/users/:id", requireAuth, deleteUser);
+app.get("/api/users", requireAuth, requireAdmin, listUsers);
+app.patch("/api/users/:id", requireAuth, requireAdmin, updateUser);
+app.put("/api/users/:id", requireAuth, requireAdmin, updateUser);
+app.delete("/api/users/:id", requireAuth, requireAdmin, deleteUser);
 
 app.get("/api/attendance/events", attendanceEvents);
 app.post("/api/attendance/events", saveAttendanceEvent);

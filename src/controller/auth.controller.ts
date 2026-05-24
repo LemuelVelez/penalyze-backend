@@ -18,6 +18,7 @@ export type AuthenticatedRequest = Request & {
 
 const TOKEN_TTL_SECONDS = Number(process.env.JWT_TTL_SECONDS ?? 60 * 60 * 24 * 7);
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-before-production";
+const USER_ROLES: UserRole[] = ["admin", "officer"];
 
 function base64UrlEncode(input: Buffer | string) {
   return Buffer.from(input).toString("base64url");
@@ -58,6 +59,7 @@ function verifyToken(token: string): JwtPayload | null {
 
   const payload = JSON.parse(base64UrlDecode(body)) as JwtPayload;
   if (!payload?.sub || !payload?.email || !payload?.exp) return null;
+  if (!isUserRole(payload.role)) return null;
   if (payload.exp < Math.floor(Date.now() / 1000)) return null;
 
   return payload;
@@ -69,6 +71,15 @@ function normalizeEmail(value: unknown) {
 
 function cleanText(value: unknown) {
   return String(value ?? "").trim();
+}
+
+function isUserRole(value: unknown): value is UserRole {
+  return USER_ROLES.includes(String(value ?? "").trim().toLowerCase() as UserRole);
+}
+
+function parseUserRole(value: unknown, fallback: UserRole = "admin") {
+  const role = String(value ?? "").trim().toLowerCase();
+  return isUserRole(role) ? role : fallback;
 }
 
 function hashPassword(password: string) {
@@ -141,7 +152,7 @@ export async function register(req: Request, res: Response, next: NextFunction) 
       return;
     }
 
-    const role: UserRole = "admin";
+    const role = parseUserRole(req.body?.role, "admin");
     const passwordHash = hashPassword(password);
 
     const result = await query<UserRecord>(
@@ -251,6 +262,39 @@ export async function requireAuth(req: AuthenticatedRequest, res: Response, next
   }
 }
 
+export async function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  try {
+    if (!req.user?.sub) {
+      res.status(401).json({ message: "Authentication token is required." });
+      return;
+    }
+
+    const result = await query<UserRecord>("SELECT * FROM users WHERE id = $1 LIMIT 1", [req.user.sub]);
+    const user = result.rows[0];
+
+    if (!user) {
+      res.status(404).json({ message: "User not found." });
+      return;
+    }
+
+    if (user.role !== "admin") {
+      res.status(403).json({ message: "Only admin users can access user management." });
+      return;
+    }
+
+    req.user = {
+      ...req.user,
+      email: user.email,
+      name: user.name,
+      role: user.role
+    };
+
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
 export async function me(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   try {
     if (!req.user?.sub) {
@@ -294,6 +338,7 @@ export async function updateUser(req: AuthenticatedRequest, res: Response, next:
     const name = req.body?.name === undefined ? undefined : cleanText(req.body.name);
     const email = req.body?.email === undefined ? undefined : normalizeEmail(req.body.email);
     const password = req.body?.password === undefined ? undefined : String(req.body.password ?? "");
+    const role = req.body?.role === undefined ? undefined : parseUserRole(req.body.role);
 
     if (!userId) {
       res.status(400).json({ message: "User ID is required." });
@@ -315,6 +360,11 @@ export async function updateUser(req: AuthenticatedRequest, res: Response, next:
       return;
     }
 
+    if (req.body?.role !== undefined && !isUserRole(req.body.role)) {
+      res.status(400).json({ message: "Role must be admin or officer." });
+      return;
+    }
+
     const fields: string[] = [];
     const params: unknown[] = [];
 
@@ -331,6 +381,11 @@ export async function updateUser(req: AuthenticatedRequest, res: Response, next:
     if (password !== undefined && password.length > 0) {
       params.push(hashPassword(password));
       fields.push(`password_hash = $${params.length}`);
+    }
+
+    if (role !== undefined) {
+      params.push(role);
+      fields.push(`role = $${params.length}`);
     }
 
     if (!fields.length) {
