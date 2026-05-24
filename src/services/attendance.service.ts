@@ -689,6 +689,18 @@ function getEventInput(
   };
 }
 
+function getManualAttendanceEventInput(input: RawImportRow) {
+  const eventInput = input as Record<string, unknown>;
+
+  return {
+    eventId: cleanText(eventInput.eventId ?? eventInput.event_id),
+    eventName: cleanText(eventInput.eventName ?? eventInput.event_name),
+    eventStartAt: eventInput.eventStartAt ?? eventInput.event_start_at ?? eventInput.eventDate ?? eventInput.event_date,
+    eventEndAt: eventInput.eventEndAt ?? eventInput.event_end_at,
+    eventDescription: eventInput.eventDescription ?? eventInput.event_description ?? eventInput.description,
+  };
+}
+
 async function getAttendanceEventById(client: PoolClient, id: string) {
   const result = await client.query<AttendanceEventRecord>(
     `
@@ -1756,7 +1768,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
   const row = validateAttendanceInput(input);
 
   return withTransaction(async (client) => {
-    const event = await findOrCreateAttendanceEvent(client, input);
+    const event = await findOrCreateAttendanceEvent(client, getManualAttendanceEventInput(input));
 
     await upsertStudent(client, row);
     const record = await insertAttendanceRecord(
@@ -1848,7 +1860,7 @@ export async function updateAttendanceRecords(
     const existingZeroAttendanceCollegeScopeKeys =
       await getManualZeroAttendanceCollegeScopeKeys(client, uniqueIds);
 
-    const event = await findOrCreateAttendanceEvent(client, input);
+    const event = await findOrCreateAttendanceEvent(client, getManualAttendanceEventInput(input));
     await upsertStudent(client, row);
 
     const updatedResult = await client.query<AttendanceRecord>(
@@ -1976,7 +1988,7 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
     const existingZeroAttendanceCollegeScopeKeys =
       await getManualZeroAttendanceCollegeScopeKeys(client, [existingRecord.id]);
 
-    const event = await findOrCreateAttendanceEvent(client, input);
+    const event = await findOrCreateAttendanceEvent(client, getManualAttendanceEventInput(input));
     await upsertStudent(client, row);
 
     const updatedResult = await client.query<AttendanceRecord>(
