@@ -1097,6 +1097,51 @@ async function syncAbsencesForAttendanceRecordIds(
   return syncAbsencesForAttendanceCollegeScopes(client, collegeKeys);
 }
 
+function areCleanTextValueSetsEqual(
+  leftValues: Array<string | null | undefined>,
+  rightValues: Array<string | null | undefined>,
+) {
+  const leftSet = new Set(uniqueCleanTextValues(leftValues));
+  const rightSet = new Set(uniqueCleanTextValues(rightValues));
+
+  if (leftSet.size !== rightSet.size) return false;
+
+  return Array.from(leftSet).every((value) => rightSet.has(value));
+}
+
+function canSyncAttendanceUpdateByStudents(
+  existingRecords: AttendanceRecord[],
+  updatedRecords: AttendanceRecord[],
+  existingCollegeScopeKeys: string[],
+  updatedCollegeScopeKeys: string[],
+) {
+  if (
+    !areCleanTextValueSetsEqual(
+      existingCollegeScopeKeys,
+      updatedCollegeScopeKeys,
+    )
+  ) {
+    return false;
+  }
+
+  const updatedRecordById = new Map(
+    updatedRecords.map((record) => [record.id, record]),
+  );
+
+  return existingRecords.every((record) => {
+    const updatedRecord = updatedRecordById.get(record.id);
+
+    return (
+      Boolean(updatedRecord) &&
+      (record.event_id ?? null) === (updatedRecord?.event_id ?? null)
+    );
+  });
+}
+
+function getAttendanceRecordStudentIds(records: AttendanceRecord[]) {
+  return uniqueCleanTextValues(records.map((record) => record.student_id));
+}
+
 async function syncAbsencesForStudents(
   client: PoolClient,
   studentIds: string[],
@@ -1703,10 +1748,24 @@ export async function updateAttendanceRecords(
         client,
         updatedRecordIds,
       );
-      const synced = await syncAbsencesForAttendanceCollegeScopes(client, [
-        ...existingCollegeScopeKeys,
-        ...updatedCollegeScopeKeys,
-      ]);
+      const canUseStudentScopedSync = canSyncAttendanceUpdateByStudents(
+        existingRecords,
+        updatedRecords,
+        existingCollegeScopeKeys,
+        updatedCollegeScopeKeys,
+      );
+      const synced = canUseStudentScopedSync
+        ? await syncAbsencesForStudents(
+            client,
+            getAttendanceRecordStudentIds([
+              ...existingRecords,
+              ...updatedRecords,
+            ]),
+          )
+        : await syncAbsencesForAttendanceCollegeScopes(client, [
+            ...existingCollegeScopeKeys,
+            ...updatedCollegeScopeKeys,
+          ]);
       const refreshedRecordIds = Array.from(
         new Set([
           ...updatedRecordIds,
