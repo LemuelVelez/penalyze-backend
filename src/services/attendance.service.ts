@@ -938,18 +938,30 @@ type AttendanceRecordWithAbsenceScope = AttendanceRecord & {
   attendance_college_scope_key: string | null;
 };
 
-function getAttendanceRecordCollegeScopeSql(recordAlias: string) {
+function getAttendanceRecordScopeColumnSql(recordAlias: string, columnName: string) {
   return `
     LOWER(TRIM(COALESCE(
       (
-        SELECT NULLIF(TRIM(scope_student.college), '')
+        SELECT NULLIF(TRIM(scope_student.${columnName}), '')
         FROM students scope_student
         WHERE LOWER(TRIM(scope_student.student_id)) = LOWER(TRIM(${recordAlias}.student_id))
         LIMIT 1
       ),
-      NULLIF(TRIM(${recordAlias}.college), ''),
+      NULLIF(TRIM(${recordAlias}.${columnName}), ''),
       ''
     )))
+  `;
+}
+
+function getAttendanceRecordCollegeScopeSql(recordAlias: string) {
+  return `
+    CONCAT_WS(
+      '|',
+      ${getAttendanceRecordScopeColumnSql(recordAlias, "institution")},
+      ${getAttendanceRecordScopeColumnSql(recordAlias, "college")},
+      ${getAttendanceRecordScopeColumnSql(recordAlias, "program")},
+      ${getAttendanceRecordScopeColumnSql(recordAlias, "year_level")}
+    )
   `;
 }
 

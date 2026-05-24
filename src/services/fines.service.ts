@@ -31,18 +31,40 @@ function cleanOptionalText(value: unknown) {
   return cleanValue || null;
 }
 
-function getAttendanceRecordCollegeScopeSql(recordAlias: string) {
+function normalizeAcademicScopeValue(value: unknown) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function buildAcademicScopeKey(input: Pick<ReturnType<typeof validateZeroAttendanceInput>, "institution" | "college" | "program" | "yearLevel">) {
+  return [input.institution, input.college, input.program, input.yearLevel]
+    .map(normalizeAcademicScopeValue)
+    .join("|");
+}
+
+function getAttendanceRecordScopeColumnSql(recordAlias: string, columnName: string) {
   return `
     LOWER(TRIM(COALESCE(
       (
-        SELECT NULLIF(TRIM(scope_student.college), '')
+        SELECT NULLIF(TRIM(scope_student.${columnName}), '')
         FROM students scope_student
         WHERE LOWER(TRIM(scope_student.student_id)) = LOWER(TRIM(${recordAlias}.student_id))
         LIMIT 1
       ),
-      NULLIF(TRIM(${recordAlias}.college), ''),
+      NULLIF(TRIM(${recordAlias}.${columnName}), ''),
       ''
     )))
+  `;
+}
+
+function getAttendanceRecordCollegeScopeSql(recordAlias: string) {
+  return `
+    CONCAT_WS(
+      '|',
+      ${getAttendanceRecordScopeColumnSql(recordAlias, "institution")},
+      ${getAttendanceRecordScopeColumnSql(recordAlias, "college")},
+      ${getAttendanceRecordScopeColumnSql(recordAlias, "program")},
+      ${getAttendanceRecordScopeColumnSql(recordAlias, "year_level")}
+    )
   `;
 }
 
@@ -250,15 +272,15 @@ export async function listFines(options: { status?: FineStatus; studentId?: stri
   return result.rows;
 }
 
-async function getAttendanceEventCount(college?: string | null) {
+async function getAttendanceEventCount(input: ReturnType<typeof validateZeroAttendanceInput>) {
   const result = await query<{ total: number }>(
     `
       SELECT COUNT(DISTINCT ar.event_id)::INT AS total
       FROM attendance_records ar
       WHERE ar.event_id IS NOT NULL
-        AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = LOWER(TRIM($1))
+        AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1
     `,
-    [college ?? ""]
+    [buildAcademicScopeKey(input)]
   );
 
   return Number(result.rows[0]?.total ?? 0);
@@ -434,7 +456,7 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
 
 export async function registerZeroAttendanceFine(input: ZeroAttendanceFineInput) {
   const cleanInput = validateZeroAttendanceInput(input);
-  const totalEvents = await getAttendanceEventCount(cleanInput.college);
+  const totalEvents = await getAttendanceEventCount(cleanInput);
 
   await upsertStudentRecord(cleanInput);
 
