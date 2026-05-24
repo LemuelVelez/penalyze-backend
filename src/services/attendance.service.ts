@@ -976,8 +976,56 @@ const ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL =
   getAttendanceRecordCollegeScopeSql("ar");
 const ATTENDANCE_ATTENDED_RECORD_COLLEGE_SCOPE_SQL =
   getAttendanceRecordCollegeScopeSql("attended");
+const ATTENDANCE_ZERO_RECORD_COLLEGE_SCOPE_SQL =
+  getAttendanceRecordScopeColumnSql("ar", "college");
+const ATTENDANCE_ZERO_EVENT_COLLEGE_SCOPE_SQL =
+  getAttendanceRecordScopeColumnSql("event_record", "college");
 const ATTENDANCE_ABSENCE_SYNC_LOCK_SQL =
   "SELECT pg_advisory_xact_lock(hashtext('penalyze.attendance_absence_sync')::bigint)";
+
+function isZeroAttendanceRemark(value: unknown) {
+  return cleanText(value).toLowerCase().includes("zero attendance");
+}
+
+function isManualZeroAttendanceRecord(record: AttendanceRecord) {
+  return !record.event_id && isZeroAttendanceRemark(record.remarks);
+}
+
+function uniqueAttendanceRecords(records: AttendanceRecord[]) {
+  const recordsById = new Map<string, AttendanceRecord>();
+
+  records.forEach((record) => {
+    if (record.id) recordsById.set(record.id, record);
+  });
+
+  return Array.from(recordsById.values());
+}
+
+function uniqueFineRecords(fines: Array<FineRecord | null>) {
+  const finesById = new Map<string, FineRecord>();
+
+  fines.forEach((fine) => {
+    if (fine?.id) finesById.set(fine.id, fine);
+  });
+
+  return Array.from(finesById.values());
+}
+
+function uniqueTextValues(values: string[]) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function getZeroAttendanceCollegeKeysFromAttendanceScopeKeys(
+  collegeKeys: string[],
+) {
+  return uniqueCleanTextValues(
+    collegeKeys.map((collegeKey) => {
+      const segments = cleanText(collegeKey).split("|");
+
+      return segments.length > 1 ? segments[1] : collegeKey;
+    }),
+  );
+}
 
 function uniqueCleanTextValues(values: Array<string | null | undefined>) {
   return Array.from(
@@ -1085,16 +1133,128 @@ async function getAttendanceStudentIdsByCollegeScopeKeys(
   return uniqueCleanTextValues(result.rows.map((row) => row.student_id));
 }
 
+async function getManualZeroAttendanceCollegeScopeKeys(
+  client: PoolClient,
+  recordIds: string[],
+) {
+  const uniqueRecordIds = uniqueCleanTextValues(recordIds);
+  if (!uniqueRecordIds.length) return [];
+
+  const result = await client.query<{ college_key: string }>(
+    `
+      SELECT DISTINCT
+        ${ATTENDANCE_ZERO_RECORD_COLLEGE_SCOPE_SQL} AS college_key
+      FROM attendance_records ar
+      WHERE ar.id = ANY($1::uuid[])
+        AND ar.event_id IS NULL
+        AND LOWER(COALESCE(ar.remarks, '')) LIKE '%zero attendance%'
+    `,
+    [uniqueRecordIds],
+  );
+
+  return uniqueCleanTextValues(result.rows.map((row) => row.college_key));
+}
+
+async function syncManualZeroAttendanceAbsencesForCollegeScopes(
+  client: PoolClient,
+  collegeKeys: string[],
+) {
+  const uniqueCollegeKeys = uniqueCleanTextValues(collegeKeys);
+
+  if (!uniqueCollegeKeys.length) {
+    return { records: [] as AttendanceRecord[], fines: [] as FineRecord[] };
+  }
+
+  await lockAttendanceAbsenceSync(client);
+
+  const updatedResult = await client.query<AttendanceRecord>(
+    `
+      WITH college_event_totals AS (
+        SELECT
+          ${ATTENDANCE_ZERO_EVENT_COLLEGE_SCOPE_SQL} AS college_key,
+          COUNT(DISTINCT event_record.event_id)::INT AS total_events
+        FROM attendance_records event_record
+        WHERE event_record.event_id IS NOT NULL
+          AND ${ATTENDANCE_ZERO_EVENT_COLLEGE_SCOPE_SQL} = ANY($1::TEXT[])
+        GROUP BY ${ATTENDANCE_ZERO_EVENT_COLLEGE_SCOPE_SQL}
+      ),
+      target_records AS (
+        SELECT
+          ar.id,
+          COALESCE(cet.total_events, 0)::INT AS no_of_absences
+        FROM attendance_records ar
+        LEFT JOIN college_event_totals cet
+          ON cet.college_key = ${ATTENDANCE_ZERO_RECORD_COLLEGE_SCOPE_SQL}
+        WHERE ar.event_id IS NULL
+          AND LOWER(COALESCE(ar.remarks, '')) LIKE '%zero attendance%'
+          AND ${ATTENDANCE_ZERO_RECORD_COLLEGE_SCOPE_SQL} = ANY($1::TEXT[])
+        ORDER BY ar.id
+        FOR UPDATE OF ar
+      )
+      UPDATE attendance_records ar
+      SET no_of_absences = target.no_of_absences,
+          updated_at = CASE
+            WHEN ar.no_of_absences IS DISTINCT FROM target.no_of_absences THEN NOW()
+            ELSE ar.updated_at
+          END
+      FROM target_records target
+      WHERE ar.id = target.id
+      RETURNING ar.*
+    `,
+    [uniqueCollegeKeys],
+  );
+
+  const records = updatedResult.rows;
+  const fines: FineRecord[] = [];
+
+  for (const record of records) {
+    const fine = await syncFineForAttendanceRecord(client, record);
+    if (fine) fines.push(fine);
+  }
+
+  return { records, fines };
+}
+
+async function syncManualZeroAttendanceAbsencesForRecordIds(
+  client: PoolClient,
+  recordIds: string[],
+) {
+  const collegeKeys = await getManualZeroAttendanceCollegeScopeKeys(
+    client,
+    recordIds,
+  );
+
+  return syncManualZeroAttendanceAbsencesForCollegeScopes(client, collegeKeys);
+}
+
 async function syncAbsencesForAttendanceCollegeScopes(
   client: PoolClient,
   collegeKeys: string[],
 ) {
+  const uniqueCollegeKeys = uniqueCleanTextValues(collegeKeys);
   const studentIds = await getAttendanceStudentIdsByCollegeScopeKeys(
     client,
-    collegeKeys,
+    uniqueCollegeKeys,
   );
+  const attendanceSynced = await syncAbsencesForStudents(client, studentIds);
+  const zeroAttendanceCollegeKeys =
+    getZeroAttendanceCollegeKeysFromAttendanceScopeKeys(uniqueCollegeKeys);
+  const zeroAttendanceSynced =
+    await syncManualZeroAttendanceAbsencesForCollegeScopes(
+      client,
+      zeroAttendanceCollegeKeys,
+    );
 
-  return syncAbsencesForStudents(client, studentIds);
+  return {
+    records: uniqueAttendanceRecords([
+      ...attendanceSynced.records,
+      ...zeroAttendanceSynced.records,
+    ]),
+    fines: uniqueFineRecords([
+      ...attendanceSynced.fines,
+      ...zeroAttendanceSynced.fines,
+    ]),
+  };
 }
 
 async function syncAbsencesForAttendanceRecordIds(
@@ -1107,51 +1267,6 @@ async function syncAbsencesForAttendanceRecordIds(
   );
 
   return syncAbsencesForAttendanceCollegeScopes(client, collegeKeys);
-}
-
-function areCleanTextValueSetsEqual(
-  leftValues: Array<string | null | undefined>,
-  rightValues: Array<string | null | undefined>,
-) {
-  const leftSet = new Set(uniqueCleanTextValues(leftValues));
-  const rightSet = new Set(uniqueCleanTextValues(rightValues));
-
-  if (leftSet.size !== rightSet.size) return false;
-
-  return Array.from(leftSet).every((value) => rightSet.has(value));
-}
-
-function canSyncAttendanceUpdateByStudents(
-  existingRecords: AttendanceRecord[],
-  updatedRecords: AttendanceRecord[],
-  existingCollegeScopeKeys: string[],
-  updatedCollegeScopeKeys: string[],
-) {
-  if (
-    !areCleanTextValueSetsEqual(
-      existingCollegeScopeKeys,
-      updatedCollegeScopeKeys,
-    )
-  ) {
-    return false;
-  }
-
-  const updatedRecordById = new Map(
-    updatedRecords.map((record) => [record.id, record]),
-  );
-
-  return existingRecords.every((record) => {
-    const updatedRecord = updatedRecordById.get(record.id);
-
-    return (
-      Boolean(updatedRecord) &&
-      (record.event_id ?? null) === (updatedRecord?.event_id ?? null)
-    );
-  });
-}
-
-function getAttendanceRecordStudentIds(records: AttendanceRecord[]) {
-  return uniqueCleanTextValues(records.map((record) => record.student_id));
 }
 
 async function syncAbsencesForStudents(
@@ -1668,6 +1783,23 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       };
     }
 
+    if (isManualZeroAttendanceRecord(record)) {
+      const synced = await syncManualZeroAttendanceAbsencesForRecordIds(client, [
+        record.id,
+      ]);
+      const updatedRecord =
+        (await listRecordsByIds(client, [record.id]))[0] ?? record;
+      const fine =
+        synced.fines.find((item) => item.attendance_record_id === record.id) ??
+        null;
+
+      return {
+        event,
+        record: updatedRecord,
+        fine,
+      };
+    }
+
     const fine = await insertFineIfNeeded(client, record);
 
     return {
@@ -1713,6 +1845,8 @@ export async function updateAttendanceRecords(
       client,
       uniqueIds,
     );
+    const existingZeroAttendanceCollegeScopeKeys =
+      await getManualZeroAttendanceCollegeScopeKeys(client, uniqueIds);
 
     const event = await findOrCreateAttendanceEvent(client, input);
     await upsertStudent(client, row);
@@ -1751,37 +1885,48 @@ export async function updateAttendanceRecords(
     );
     const updatedRecords = updatedResult.rows;
     const updatedRecordIds = updatedRecords.map((record) => record.id);
-    const shouldSyncAbsences =
-      existingRecords.some((record) => record.event_id) ||
-      updatedRecords.some((record) => record.event_id);
+    const updatedCollegeScopeKeys = await getAttendanceRecordCollegeScopeKeys(
+      client,
+      updatedRecordIds,
+    );
+    const updatedZeroAttendanceCollegeScopeKeys =
+      await getManualZeroAttendanceCollegeScopeKeys(client, updatedRecordIds);
+    const attendanceSyncCollegeKeys = uniqueTextValues([
+      ...existingCollegeScopeKeys,
+      ...updatedCollegeScopeKeys,
+    ]);
+    const zeroAttendanceSyncCollegeKeys = uniqueTextValues([
+      ...existingZeroAttendanceCollegeScopeKeys,
+      ...updatedZeroAttendanceCollegeScopeKeys,
+    ]);
+    const shouldSyncAbsences = attendanceSyncCollegeKeys.length > 0;
+    const shouldSyncZeroAttendance = zeroAttendanceSyncCollegeKeys.length > 0;
 
-    if (shouldSyncAbsences) {
-      const updatedCollegeScopeKeys = await getAttendanceRecordCollegeScopeKeys(
-        client,
-        updatedRecordIds,
-      );
-      const canUseStudentScopedSync = canSyncAttendanceUpdateByStudents(
-        existingRecords,
-        updatedRecords,
-        existingCollegeScopeKeys,
-        updatedCollegeScopeKeys,
-      );
-      const synced = canUseStudentScopedSync
-        ? await syncAbsencesForStudents(
+    if (shouldSyncAbsences || shouldSyncZeroAttendance) {
+      const attendanceSynced = shouldSyncAbsences
+        ? await syncAbsencesForAttendanceCollegeScopes(
             client,
-            getAttendanceRecordStudentIds([
-              ...existingRecords,
-              ...updatedRecords,
-            ]),
+            attendanceSyncCollegeKeys,
           )
-        : await syncAbsencesForAttendanceCollegeScopes(client, [
-            ...existingCollegeScopeKeys,
-            ...updatedCollegeScopeKeys,
-          ]);
+        : { records: [] as AttendanceRecord[], fines: [] as FineRecord[] };
+      const zeroAttendanceSynced = shouldSyncZeroAttendance
+        ? await syncManualZeroAttendanceAbsencesForCollegeScopes(
+            client,
+            zeroAttendanceSyncCollegeKeys,
+          )
+        : { records: [] as AttendanceRecord[], fines: [] as FineRecord[] };
+      const syncedRecords = uniqueAttendanceRecords([
+        ...attendanceSynced.records,
+        ...zeroAttendanceSynced.records,
+      ]);
+      const syncedFines = uniqueFineRecords([
+        ...attendanceSynced.fines,
+        ...zeroAttendanceSynced.fines,
+      ]);
       const refreshedRecordIds = Array.from(
         new Set([
           ...updatedRecordIds,
-          ...synced.records.map((record) => record.id),
+          ...syncedRecords.map((record) => record.id),
         ]),
       );
       const records = await listRecordsByIds(client, refreshedRecordIds);
@@ -1791,7 +1936,7 @@ export async function updateAttendanceRecords(
         records,
         updatedRecordIds,
         fines: filterAttendanceFinesByRecordIds(
-          synced.fines,
+          syncedFines,
           refreshedRecordIds,
         ),
       };
@@ -1828,6 +1973,8 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
     const existingCollegeScopeKeys = existingRecord.event_id
       ? await getAttendanceRecordCollegeScopeKeys(client, [existingRecord.id])
       : [];
+    const existingZeroAttendanceCollegeScopeKeys =
+      await getManualZeroAttendanceCollegeScopeKeys(client, [existingRecord.id]);
 
     const event = await findOrCreateAttendanceEvent(client, input);
     await upsertStudent(client, row);
@@ -1867,18 +2014,41 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
 
     const record = updatedResult.rows[0];
 
-    if (existingRecord.event_id || record.event_id) {
-      const updatedCollegeScopeKeys = record.event_id
-        ? await getAttendanceRecordCollegeScopeKeys(client, [record.id])
-        : [];
-      const synced = await syncAbsencesForAttendanceCollegeScopes(client, [
-        ...existingCollegeScopeKeys,
-        ...updatedCollegeScopeKeys,
+    const updatedCollegeScopeKeys = record.event_id
+      ? await getAttendanceRecordCollegeScopeKeys(client, [record.id])
+      : [];
+    const updatedZeroAttendanceCollegeScopeKeys =
+      await getManualZeroAttendanceCollegeScopeKeys(client, [record.id]);
+    const attendanceSyncCollegeKeys = uniqueTextValues([
+      ...existingCollegeScopeKeys,
+      ...updatedCollegeScopeKeys,
+    ]);
+    const zeroAttendanceSyncCollegeKeys = uniqueTextValues([
+      ...existingZeroAttendanceCollegeScopeKeys,
+      ...updatedZeroAttendanceCollegeScopeKeys,
+    ]);
+
+    if (attendanceSyncCollegeKeys.length || zeroAttendanceSyncCollegeKeys.length) {
+      const attendanceSynced = attendanceSyncCollegeKeys.length
+        ? await syncAbsencesForAttendanceCollegeScopes(
+            client,
+            attendanceSyncCollegeKeys,
+          )
+        : { records: [] as AttendanceRecord[], fines: [] as FineRecord[] };
+      const zeroAttendanceSynced = zeroAttendanceSyncCollegeKeys.length
+        ? await syncManualZeroAttendanceAbsencesForCollegeScopes(
+            client,
+            zeroAttendanceSyncCollegeKeys,
+          )
+        : { records: [] as AttendanceRecord[], fines: [] as FineRecord[] };
+      const syncedFines = uniqueFineRecords([
+        ...attendanceSynced.fines,
+        ...zeroAttendanceSynced.fines,
       ]);
       const updatedRecord =
         (await listRecordsByIds(client, [record.id]))[0] ?? record;
       const fine =
-        synced.fines.find((item) => item.attendance_record_id === record.id) ??
+        syncedFines.find((item) => item.attendance_record_id === record.id) ??
         null;
 
       return {
