@@ -98,7 +98,7 @@ export type FineRecord = {
   penalty_id: string | null;
   student_id: string;
   name: string;
-  no_of_absences: number;
+  no_of_absences?: number;
   prescribed_penalty: string;
   status: FineStatus;
   attendance_event_id?: string | null;

@@ -849,6 +849,18 @@ function validateAttendanceInput(input: RawImportRow) {
   return row;
 }
 
+const FINE_RETURNING_COLUMNS_SQL = `
+  id,
+  attendance_record_id,
+  penalty_id,
+  student_id,
+  name,
+  prescribed_penalty,
+  status,
+  created_at,
+  updated_at
+`;
+
 async function findMatchingPenalty(client: PoolClient, noOfAbsences: number) {
   const penaltyResult = await client.query(
     `
@@ -896,7 +908,7 @@ async function syncFineForAttendanceRecord(
           prescribed_penalty = $5,
           updated_at = NOW()
         WHERE id = $1
-        RETURNING *, $6::INT AS no_of_absences
+        RETURNING ${FINE_RETURNING_COLUMNS_SQL}, $6::INT AS no_of_absences
       `,
       [
         existingFine.id,
@@ -922,7 +934,7 @@ async function syncFineForAttendanceRecord(
         status
       )
       VALUES ($1, $2, $3, $4, $5, 'unpaid')
-      RETURNING *, $6::INT AS no_of_absences
+      RETURNING ${FINE_RETURNING_COLUMNS_SQL}, $6::INT AS no_of_absences
     `,
     [
       record.id,
