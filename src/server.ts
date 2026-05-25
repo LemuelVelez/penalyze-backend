@@ -33,6 +33,12 @@ import {
   updatePenalty,
   updateStatus
 } from "./controller/fines.controller";
+import {
+  activate as activateSchoolYear,
+  index as schoolYears,
+  save as saveSchoolYear,
+  transfer as transferSchoolYearRecords
+} from "./controller/school-years.controller";
 import { query } from "./lib/db";
 
 const app = express();
@@ -103,6 +109,11 @@ app.get("/api/users", requireAuth, requireAdmin, listUsers);
 app.patch("/api/users/:id", requireAuth, requireAdmin, updateUser);
 app.put("/api/users/:id", requireAuth, requireAdmin, updateUser);
 app.delete("/api/users/:id", requireAuth, requireAdmin, deleteUser);
+
+app.get("/api/school-years", schoolYears);
+app.post("/api/school-years", saveSchoolYear);
+app.patch("/api/school-years/transfer", transferSchoolYearRecords);
+app.patch("/api/school-years/:id/activate", activateSchoolYear);
 
 app.get("/api/attendance/events", attendanceEvents);
 app.post("/api/attendance/events", saveAttendanceEvent);

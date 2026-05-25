@@ -1,10 +1,11 @@
-import { AttendanceRecord, FineRecord, FineStatus, PenaltyRecord, StudentRecord } from "../database/model/schema.model";
+import { AttendanceRecord, FineRecord, FineStatus, PenaltyRecord, SchoolYearRecord, StudentRecord } from "../database/model/schema.model";
 import { DEFAULT_PENALTIES } from "../database/seeder/penalties.seeder";
 import { query } from "../lib/db";
 
 export const ZERO_ATTENDANCE_REMARK = "Zero attendance registration from landing page.";
 
 type ZeroAttendanceFineInput = {
+  schoolYearId?: string | null;
   studentId: string;
   name: string;
   yearLevel?: string | null;
@@ -74,6 +75,7 @@ const ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL =
 function getFineTableColumnsSql(alias: string) {
   return [
     "id",
+    "school_year_id",
     "attendance_record_id",
     "penalty_id",
     "student_id",
@@ -89,6 +91,7 @@ function getFineTableColumnsSql(alias: string) {
 
 const FINE_RETURNING_COLUMNS_SQL = `
   id,
+  school_year_id,
   attendance_record_id,
   penalty_id,
   student_id,
@@ -99,6 +102,74 @@ const FINE_RETURNING_COLUMNS_SQL = `
   updated_at
 `;
 
+
+function getSchoolYearRangeFromDate(value: Date = new Date()) {
+  const year = value.getFullYear();
+  const month = value.getMonth() + 1;
+  const startYear = month >= 6 ? year : year - 1;
+  const endYear = startYear + 1;
+
+  return {
+    name: `${startYear}-${endYear}`,
+    startsAt: `${startYear}-06-01`,
+    endsAt: `${endYear}-05-31`,
+  };
+}
+
+async function ensureCurrentSchoolYear() {
+  const active = await query<SchoolYearRecord>(
+    `
+      SELECT *
+      FROM school_years
+      WHERE is_active = TRUE
+      ORDER BY starts_at DESC
+      LIMIT 1
+    `,
+  );
+
+  if (active.rows[0]) return active.rows[0];
+
+  const range = getSchoolYearRangeFromDate();
+  const result = await query<SchoolYearRecord>(
+    `
+      INSERT INTO school_years (name, starts_at, ends_at)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (name)
+      DO UPDATE SET
+        starts_at = EXCLUDED.starts_at,
+        ends_at = EXCLUDED.ends_at,
+        updated_at = NOW()
+      RETURNING *
+    `,
+    [range.name, range.startsAt, range.endsAt],
+  );
+
+  return result.rows[0];
+}
+
+async function resolveSchoolYearId(schoolYearId?: string | null) {
+  const cleanSchoolYearId = cleanOptionalText(schoolYearId);
+
+  if (cleanSchoolYearId) {
+    const result = await query<SchoolYearRecord>(
+      `
+        SELECT *
+        FROM school_years
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [cleanSchoolYearId],
+    );
+
+    if (!result.rows[0]) {
+      throw new Error("School year not found.");
+    }
+
+    return result.rows[0].id;
+  }
+
+  return (await ensureCurrentSchoolYear()).id;
+}
 
 function validateZeroAttendanceInput(input: ZeroAttendanceFineInput) {
   const studentId = String(input.studentId ?? "").trim();
@@ -113,6 +184,7 @@ function validateZeroAttendanceInput(input: ZeroAttendanceFineInput) {
   }
 
   return {
+    schoolYearId: cleanOptionalText(input.schoolYearId),
     studentId,
     name,
     yearLevel: cleanOptionalText(input.yearLevel),
@@ -128,7 +200,7 @@ export async function listPenalties() {
       SELECT *
       FROM penalties
       ORDER BY no_of_absences ASC
-    `
+    `,
   );
 
   return result.rows;
@@ -262,9 +334,14 @@ export async function seedDefaultPenalties() {
   return rows;
 }
 
-export async function listFines(options: { status?: FineStatus; studentId?: string; limit?: number; offset?: number } = {}) {
+export async function listFines(options: { schoolYearId?: string; status?: FineStatus; studentId?: string; limit?: number; offset?: number } = {}) {
   const clauses: string[] = [];
   const params: unknown[] = [];
+
+  if (options.schoolYearId) {
+    params.push(options.schoolYearId);
+    clauses.push(`f.school_year_id = $${params.length}`);
+  }
 
   if (options.status) {
     params.push(options.status);
@@ -301,15 +378,16 @@ export async function listFines(options: { status?: FineStatus; studentId?: stri
   return result.rows;
 }
 
-async function getAttendanceEventCount(input: ReturnType<typeof validateZeroAttendanceInput>) {
+async function getAttendanceEventCount(input: ReturnType<typeof validateZeroAttendanceInput>, schoolYearId: string) {
   const result = await query<{ total: number }>(
     `
       SELECT COUNT(DISTINCT ar.event_id)::INT AS total
       FROM attendance_records ar
       WHERE ar.event_id IS NOT NULL
+        AND ar.school_year_id = $2
         AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1
     `,
-    [buildAcademicScopeKey(input)]
+    [buildAcademicScopeKey(input), schoolYearId]
   );
 
   return Number(result.rows[0]?.total ?? 0);
@@ -336,18 +414,19 @@ async function upsertStudentRecord(input: ReturnType<typeof validateZeroAttendan
   return result.rows[0];
 }
 
-async function upsertZeroAttendanceRecord(input: ReturnType<typeof validateZeroAttendanceInput>, noOfAbsences: number) {
+async function upsertZeroAttendanceRecord(input: ReturnType<typeof validateZeroAttendanceInput>, schoolYearId: string, noOfAbsences: number) {
   const existing = await query<AttendanceRecord>(
     `
       SELECT *
       FROM attendance_records
       WHERE event_id IS NULL
+        AND school_year_id = $3
         AND LOWER(TRIM(student_id)) = LOWER(TRIM($1))
         AND remarks = $2
       ORDER BY created_at DESC
       LIMIT 1
     `,
-    [input.studentId, ZERO_ATTENDANCE_REMARK]
+    [input.studentId, ZERO_ATTENDANCE_REMARK, schoolYearId]
   );
 
   if (existing.rows[0]) {
@@ -359,7 +438,8 @@ async function upsertZeroAttendanceRecord(input: ReturnType<typeof validateZeroA
             college = $4,
             program = $5,
             institution = $6,
-            no_of_absences = $7,
+            school_year_id = $7,
+            no_of_absences = $8,
             updated_at = NOW()
         WHERE id = $1
         RETURNING *
@@ -371,6 +451,7 @@ async function upsertZeroAttendanceRecord(input: ReturnType<typeof validateZeroA
         input.college,
         input.program,
         input.institution,
+        schoolYearId,
         noOfAbsences
       ]
     );
@@ -381,6 +462,7 @@ async function upsertZeroAttendanceRecord(input: ReturnType<typeof validateZeroA
   const result = await query<AttendanceRecord>(
     `
       INSERT INTO attendance_records (
+        school_year_id,
         import_id,
         event_id,
         student_id,
@@ -393,10 +475,11 @@ async function upsertZeroAttendanceRecord(input: ReturnType<typeof validateZeroA
         remarks,
         scanned_at
       )
-      VALUES (NULL, NULL, $1, $2, $3, $4, $5, $6, $7, $8, NULL)
+      VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8, $9, NULL)
       RETURNING *
     `,
     [
+      schoolYearId,
       input.studentId,
       input.name,
       input.yearLevel,
@@ -434,16 +517,18 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
     const result = await query<FineRecord>(
       `
         UPDATE fines
-        SET penalty_id = $2,
-            student_id = $3,
-            name = $4,
-            prescribed_penalty = $5,
+        SET school_year_id = $2,
+            penalty_id = $3,
+            student_id = $4,
+            name = $5,
+            prescribed_penalty = $6,
             updated_at = NOW()
         WHERE id = $1
-        RETURNING ${FINE_RETURNING_COLUMNS_SQL}, $6::INT AS no_of_absences
+        RETURNING ${FINE_RETURNING_COLUMNS_SQL}, $7::INT AS no_of_absences
       `,
       [
         existing.rows[0].id,
+        attendanceRecord.school_year_id,
         penalty?.id ?? null,
         attendanceRecord.student_id,
         attendanceRecord.name,
@@ -458,6 +543,7 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
   const result = await query<FineRecord>(
     `
       INSERT INTO fines (
+        school_year_id,
         attendance_record_id,
         penalty_id,
         student_id,
@@ -465,10 +551,11 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
         prescribed_penalty,
         status
       )
-      VALUES ($1, $2, $3, $4, $5, 'unpaid')
-      RETURNING ${FINE_RETURNING_COLUMNS_SQL}, $6::INT AS no_of_absences
+      VALUES ($1, $2, $3, $4, $5, $6, 'unpaid')
+      RETURNING ${FINE_RETURNING_COLUMNS_SQL}, $7::INT AS no_of_absences
     `,
     [
+      attendanceRecord.school_year_id,
       attendanceRecord.id,
       penalty?.id ?? null,
       attendanceRecord.student_id,
@@ -483,11 +570,12 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
 
 export async function registerZeroAttendanceFine(input: ZeroAttendanceFineInput) {
   const cleanInput = validateZeroAttendanceInput(input);
-  const totalEvents = await getAttendanceEventCount(cleanInput);
+  const schoolYearId = await resolveSchoolYearId(cleanInput.schoolYearId);
+  const totalEvents = await getAttendanceEventCount(cleanInput, schoolYearId);
 
   await upsertStudentRecord(cleanInput);
 
-  const attendanceRecord = await upsertZeroAttendanceRecord(cleanInput, totalEvents);
+  const attendanceRecord = await upsertZeroAttendanceRecord(cleanInput, schoolYearId, totalEvents);
   const penalty = totalEvents > 0 ? await getPenaltyByAbsences(totalEvents) : null;
   const fine = await upsertFineForZeroAttendance(attendanceRecord, penalty);
 
@@ -537,7 +625,7 @@ export async function updateFineStatus(id: string, status: FineStatus) {
   return result.rows[0];
 }
 
-export async function getFineSummary() {
+export async function getFineSummary(schoolYearId?: string) {
   const result = await query<{
     status: FineStatus;
     count: string;
@@ -545,9 +633,11 @@ export async function getFineSummary() {
     `
       SELECT status, COUNT(*)::TEXT AS count
       FROM fines
+      ${schoolYearId ? "WHERE school_year_id = $1" : ""}
       GROUP BY status
       ORDER BY status ASC
-    `
+    `,
+    schoolYearId ? [schoolYearId] : [],
   );
 
   return result.rows.reduce<Record<FineStatus, number>>(

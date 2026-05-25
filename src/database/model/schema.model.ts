@@ -1,6 +1,7 @@
 export const TABLES = {
   users: "users",
   students: "students",
+  schoolYears: "school_years",
   attendanceEvents: "attendance_events",
   attendanceImports: "attendance_imports",
   attendanceRecords: "attendance_records",
@@ -19,6 +20,16 @@ export type AttendanceImportProgressStage =
   | "completed"
   | "cancelled";
 export type FineStatus = "unpaid" | "paid" | "waived";
+
+export type SchoolYearRecord = {
+  id: string;
+  name: string;
+  starts_at: Date | string;
+  ends_at: Date | string;
+  is_active: boolean;
+  created_at: Date;
+  updated_at: Date;
+};
 
 export type UserRecord = {
   id: string;
@@ -44,6 +55,7 @@ export type StudentRecord = {
 
 export type AttendanceEventRecord = {
   id: string;
+  school_year_id: string | null;
   name: string;
   event_start_at: Date | string | null;
   event_end_at: Date | string | null;
@@ -55,6 +67,7 @@ export type AttendanceEventRecord = {
 
 export type AttendanceImportRecord = {
   id: string;
+  school_year_id: string | null;
   event_id: string | null;
   event_name?: string | null;
   file_name: string;
@@ -68,6 +81,7 @@ export type AttendanceImportRecord = {
 
 export type AttendanceRecord = {
   id: string;
+  school_year_id: string | null;
   import_id: string | null;
   event_id: string | null;
   event_name?: string | null;
@@ -94,6 +108,7 @@ export type PenaltyRecord = {
 
 export type FineRecord = {
   id: string;
+  school_year_id: string | null;
   attendance_record_id: string | null;
   penalty_id: string | null;
   student_id: string;
@@ -108,6 +123,7 @@ export type FineRecord = {
 };
 
 export type AttendanceImportInput = {
+  schoolYearId?: string;
   eventId?: string;
   eventName?: string;
   eventStartAt?: string;

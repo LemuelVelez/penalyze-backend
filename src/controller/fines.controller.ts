@@ -35,6 +35,7 @@ function getPenaltyPayload(req: Request) {
 
 function getZeroAttendancePayload(req: Request) {
   return {
+    schoolYearId: String(req.body?.schoolYearId ?? req.body?.school_year_id ?? "").trim(),
     studentId: String(req.body?.studentId ?? req.body?.student_id ?? "").trim(),
     name: String(req.body?.name ?? "").trim(),
     yearLevel: String(req.body?.yearLevel ?? req.body?.year_level ?? "").trim(),
@@ -148,20 +149,22 @@ export async function fines(req: Request, res: Response, next: NextFunction) {
       return;
     }
 
+    const schoolYearId = req.query.schoolYearId ? String(req.query.schoolYearId) : undefined;
     const studentId = req.query.studentId ? String(req.query.studentId) : undefined;
     const limit = toPositiveInt(req.query.limit, 100);
     const offset = toPositiveInt(req.query.offset, 0);
 
-    const rows = await listFines({ status, studentId, limit, offset });
+    const rows = await listFines({ schoolYearId, status, studentId, limit, offset });
     res.json({ data: rows });
   } catch (error) {
     next(error);
   }
 }
 
-export async function summary(_req: Request, res: Response, next: NextFunction) {
+export async function summary(req: Request, res: Response, next: NextFunction) {
   try {
-    const data = await getFineSummary();
+    const schoolYearId = req.query.schoolYearId ? String(req.query.schoolYearId) : undefined;
+    const data = await getFineSummary(schoolYearId);
     res.json({ data });
   } catch (error) {
     next(error);

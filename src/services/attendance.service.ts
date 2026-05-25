@@ -11,6 +11,7 @@ import {
   FineRecord,
   ParsedAttendanceRow,
   SavedAttendanceImportResult,
+  SchoolYearRecord,
 } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
 
@@ -26,6 +27,7 @@ export type UploadedAttendanceFile = {
 type RawImportRow = Record<string, unknown>;
 
 type SaveRowsInput = {
+  schoolYearId?: string;
   eventId?: string;
   eventName?: string;
   eventStartAt?: string;
@@ -50,6 +52,8 @@ export type DeletedAttendanceImportsResult = {
 };
 
 export type AttendanceEventInput = {
+  schoolYearId?: string;
+  school_year_id?: string;
   name?: string;
   eventName?: string;
   eventStartAt?: string;
@@ -204,6 +208,7 @@ function cleanOptionalText(value: unknown) {
 
 const ATTENDANCE_RECORD_SELECT = `
   ar.id,
+  ar.school_year_id,
   ar.import_id,
   ar.event_id,
   ae.name AS event_name,
@@ -676,6 +681,10 @@ function getEventInput(
 
   return {
     id: cleanText((input as SaveRowsInput).eventId),
+    schoolYearId: cleanText(
+      (input as AttendanceEventInput).schoolYearId ??
+        (input as AttendanceEventInput).school_year_id,
+    ),
     name: cleanText(
       (input as AttendanceEventInput).name ||
         (input as AttendanceEventInput).eventName,
@@ -689,10 +698,84 @@ function getEventInput(
   };
 }
 
+
+function getSchoolYearRangeFromDate(value: Date = new Date()) {
+  const year = value.getFullYear();
+  const month = value.getMonth() + 1;
+  const startYear = month >= 6 ? year : year - 1;
+  const endYear = startYear + 1;
+
+  return {
+    name: `${startYear}-${endYear}`,
+    startsAt: `${startYear}-06-01`,
+    endsAt: `${endYear}-05-31`,
+  };
+}
+
+function getFirstValidSchoolYearDate(values: unknown[]) {
+  for (const value of values) {
+    const text = cleanText(value);
+    if (!text) continue;
+
+    const date = new Date(text);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+
+  return new Date();
+}
+
+async function ensureSchoolYearForDate(client: PoolClient, values: unknown[] = []) {
+  const range = getSchoolYearRangeFromDate(getFirstValidSchoolYearDate(values));
+  const result = await client.query<SchoolYearRecord>(
+    `
+      INSERT INTO school_years (name, starts_at, ends_at)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (name)
+      DO UPDATE SET
+        starts_at = EXCLUDED.starts_at,
+        ends_at = EXCLUDED.ends_at,
+        updated_at = NOW()
+      RETURNING *
+    `,
+    [range.name, range.startsAt, range.endsAt],
+  );
+
+  return result.rows[0];
+}
+
+async function resolveSchoolYearId(
+  client: PoolClient,
+  requestedSchoolYearId: unknown,
+  dateValues: unknown[] = [],
+) {
+  const cleanSchoolYearId = cleanText(requestedSchoolYearId);
+
+  if (cleanSchoolYearId) {
+    const result = await client.query<SchoolYearRecord>(
+      `
+        SELECT *
+        FROM school_years
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [cleanSchoolYearId],
+    );
+
+    if (!result.rows[0]) {
+      throw createValidationError("School year not found.", 404);
+    }
+
+    return result.rows[0].id;
+  }
+
+  return (await ensureSchoolYearForDate(client, dateValues)).id;
+}
+
 function getManualAttendanceEventInput(input: RawImportRow) {
   const eventInput = input as Record<string, unknown>;
 
   return {
+    schoolYearId: cleanText(eventInput.schoolYearId ?? eventInput.school_year_id),
     eventId: cleanText(eventInput.eventId ?? eventInput.event_id),
     eventName: cleanText(eventInput.eventName ?? eventInput.event_name),
     eventStartAt: eventInput.eventStartAt ?? eventInput.event_start_at ?? eventInput.eventDate ?? eventInput.event_date,
@@ -735,6 +818,11 @@ async function findOrCreateAttendanceEvent(
   const name = eventInput.name || cleanText(fallbackName);
   if (!name) return null;
 
+  const schoolYearId = await resolveSchoolYearId(client, eventInput.schoolYearId, [
+    eventInput.eventStartAt,
+    eventInput.eventEndAt,
+  ]);
+
   const existingResult = await client.query<AttendanceEventRecord>(
     `
       SELECT
@@ -743,22 +831,24 @@ async function findOrCreateAttendanceEvent(
       FROM attendance_events e
       LEFT JOIN attendance_records ar ON ar.event_id = e.id
       WHERE LOWER(TRIM(e.name)) = LOWER(TRIM($1))
+        AND e.school_year_id = $2
       GROUP BY e.id
       ORDER BY e.created_at DESC
       LIMIT 1
     `,
-    [name],
+    [name, schoolYearId],
   );
 
   if (existingResult.rows[0]) return existingResult.rows[0];
 
   const createdResult = await client.query<AttendanceEventRecord>(
     `
-      INSERT INTO attendance_events (name, event_start_at, event_end_at, description)
-      VALUES ($1, $2, $3, $4)
+      INSERT INTO attendance_events (school_year_id, name, event_start_at, event_end_at, description)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING *, 0::INT AS attendees_count
     `,
     [
+      schoolYearId,
       name,
       eventInput.eventStartAt,
       eventInput.eventEndAt,
@@ -798,11 +888,13 @@ async function insertAttendanceRecord(
   client: PoolClient,
   importId: string | null,
   eventId: string | null,
+  schoolYearId: string | null,
   row: ParsedAttendanceRow,
 ) {
   const result = await client.query<AttendanceRecord>(
     `
       INSERT INTO attendance_records (
+        school_year_id,
         import_id,
         event_id,
         student_id,
@@ -815,10 +907,11 @@ async function insertAttendanceRecord(
         scanned_at,
         remarks
       )
-      VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), $9, $10::TIMESTAMPTZ, NULLIF($11, ''))
+      VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''), $10, $11::TIMESTAMPTZ, NULLIF($12, ''))
       RETURNING *
     `,
     [
+      schoolYearId,
       importId,
       eventId,
       row.studentId,
@@ -851,6 +944,7 @@ function validateAttendanceInput(input: RawImportRow) {
 
 const FINE_RETURNING_COLUMNS_SQL = `
   id,
+  school_year_id,
   attendance_record_id,
   penalty_id,
   student_id,
@@ -902,16 +996,18 @@ async function syncFineForAttendanceRecord(
       `
         UPDATE fines
         SET
-          penalty_id = $2,
-          student_id = $3,
-          name = $4,
-          prescribed_penalty = $5,
+          school_year_id = $2,
+          penalty_id = $3,
+          student_id = $4,
+          name = $5,
+          prescribed_penalty = $6,
           updated_at = NOW()
         WHERE id = $1
-        RETURNING ${FINE_RETURNING_COLUMNS_SQL}, $6::INT AS no_of_absences
+        RETURNING ${FINE_RETURNING_COLUMNS_SQL}, $7::INT AS no_of_absences
       `,
       [
         existingFine.id,
+        record.school_year_id,
         penalty?.id ?? null,
         record.student_id,
         record.name,
@@ -926,6 +1022,7 @@ async function syncFineForAttendanceRecord(
   const fineResult = await client.query<FineRecord>(
     `
       INSERT INTO fines (
+        school_year_id,
         attendance_record_id,
         penalty_id,
         student_id,
@@ -933,10 +1030,11 @@ async function syncFineForAttendanceRecord(
         prescribed_penalty,
         status
       )
-      VALUES ($1, $2, $3, $4, $5, 'unpaid')
-      RETURNING ${FINE_RETURNING_COLUMNS_SQL}, $6::INT AS no_of_absences
+      VALUES ($1, $2, $3, $4, $5, $6, 'unpaid')
+      RETURNING ${FINE_RETURNING_COLUMNS_SQL}, $7::INT AS no_of_absences
     `,
     [
+      record.school_year_id,
       record.id,
       penalty?.id ?? null,
       record.student_id,
@@ -958,6 +1056,7 @@ async function insertFineIfNeeded(
 
 type AttendanceRecordWithAbsenceScope = AttendanceRecord & {
   attendance_college_scope_key: string | null;
+  attendance_school_year_id: string | null;
 };
 
 function getAttendanceRecordScopeColumnSql(recordAlias: string, columnName: string) {
@@ -1144,7 +1243,7 @@ async function syncAbsencesForAttendanceCollegeScopes(
   return syncAbsencesForStudents(client, studentIds);
 }
 
-async function syncAbsencesForAttendanceRecordIds(
+export async function syncAbsencesForAttendanceRecordIds(
   client: PoolClient,
   recordIds: string[],
 ) {
@@ -1179,6 +1278,7 @@ async function syncAbsencesForStudents(
       WITH college_event_scope AS (
         SELECT DISTINCT
           ar.event_id,
+          ar.school_year_id,
           ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key
         FROM attendance_records ar
         WHERE ar.event_id IS NOT NULL
@@ -1186,6 +1286,7 @@ async function syncAbsencesForStudents(
       student_scope AS (
         SELECT DISTINCT
           LOWER(TRIM(ar.student_id)) AS student_key,
+          ar.school_year_id,
           ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key
         FROM attendance_records ar
         WHERE ar.event_id IS NOT NULL
@@ -1195,28 +1296,34 @@ async function syncAbsencesForStudents(
         SELECT
           ss.student_key,
           ss.college_key,
+          ss.school_year_id,
           GREATEST(
             COUNT(DISTINCT ces.event_id)::INT -
               COUNT(DISTINCT attended.event_id)::INT,
             0
           ) AS no_of_absences
         FROM student_scope ss
-        LEFT JOIN college_event_scope ces ON ces.college_key = ss.college_key
+        LEFT JOIN college_event_scope ces
+          ON ces.college_key = ss.college_key
+         AND ces.school_year_id IS NOT DISTINCT FROM ss.school_year_id
         LEFT JOIN attendance_records attended
           ON LOWER(TRIM(attended.student_id)) = ss.student_key
           AND attended.event_id = ces.event_id
+          AND attended.school_year_id IS NOT DISTINCT FROM ss.school_year_id
           AND ${ATTENDANCE_ATTENDED_RECORD_COLLEGE_SCOPE_SQL} = ss.college_key
-        GROUP BY ss.student_key, ss.college_key
+        GROUP BY ss.student_key, ss.college_key, ss.school_year_id
       ),
       target_records AS (
         SELECT
           ar.id,
           sa.college_key,
-          sa.no_of_absences
+          sa.no_of_absences,
+          sa.school_year_id
         FROM attendance_records ar
         JOIN student_absences sa
           ON LOWER(TRIM(ar.student_id)) = sa.student_key
          AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = sa.college_key
+         AND ar.school_year_id IS NOT DISTINCT FROM sa.school_year_id
         WHERE ar.event_id IS NOT NULL
         ORDER BY ar.id
         FOR UPDATE OF ar
@@ -1229,7 +1336,7 @@ async function syncAbsencesForStudents(
           END
       FROM target_records target
       WHERE ar.id = target.id
-      RETURNING ar.*, target.college_key AS attendance_college_scope_key
+      RETURNING ar.*, target.college_key AS attendance_college_scope_key, target.school_year_id AS attendance_school_year_id
     `,
     [uniqueStudentIds],
   );
@@ -1263,6 +1370,7 @@ async function syncAbsencesForStudents(
     const scopeKey = [
       cleanText(record.student_id).toLowerCase(),
       cleanText(record.attendance_college_scope_key),
+      cleanText(record.attendance_school_year_id),
     ].join(":");
     const scopeRecords = recordsByStudentScope.get(scopeKey) ?? [];
 
@@ -1453,6 +1561,7 @@ export async function saveAttendanceRows(
             `
               UPDATE attendance_imports
               SET
+                school_year_id = COALESCE(school_year_id, $6),
                 event_id = COALESCE(event_id, $2),
                 rows_total = rows_total + $3,
                 rows_valid = rows_valid + $4,
@@ -1467,17 +1576,19 @@ export async function saveAttendanceRows(
               preview.rowsTotal,
               preview.rowsValid,
               preview.rowsInvalid,
+              defaultEvent?.school_year_id ?? await resolveSchoolYearId(client, input.schoolYearId, [input.eventStartAt, input.eventEndAt]),
             ],
           )
         ).rows[0]
       : (
           await client.query<AttendanceImportRecord>(
             `
-              INSERT INTO attendance_imports (event_id, file_name, file_type, rows_total, rows_valid, rows_invalid, status)
-              VALUES ($1, $2, $3, $4, $5, $6, 'saved')
+              INSERT INTO attendance_imports (school_year_id, event_id, file_name, file_type, rows_total, rows_valid, rows_invalid, status)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, 'saved')
               RETURNING *
             `,
             [
+              defaultEvent?.school_year_id ?? await resolveSchoolYearId(client, input.schoolYearId, [input.eventStartAt, input.eventEndAt]),
               defaultEvent?.id ?? null,
               preview.fileName,
               preview.fileType,
@@ -1533,6 +1644,7 @@ export async function saveAttendanceRows(
         client,
         importId,
         event.id,
+        event.school_year_id ?? importRecord.school_year_id,
         row,
       );
       savedRecordIds.push(record.id);
@@ -1650,6 +1762,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       client,
       null,
       event?.id ?? null,
+      event?.school_year_id ?? await resolveSchoolYearId(client, (input as Record<string, unknown>).schoolYearId ?? (input as Record<string, unknown>).school_year_id, [row.scannedAt]),
       row,
     );
 
@@ -1728,22 +1841,24 @@ export async function updateAttendanceRecords(
       `
         UPDATE attendance_records
         SET
-          event_id = $2,
-          student_id = $3,
-          name = $4,
-          year_level = NULLIF($5, ''),
-          college = NULLIF($6, ''),
-          program = NULLIF($7, ''),
-          institution = NULLIF($8, ''),
-          no_of_absences = $9,
-          scanned_at = $10::TIMESTAMPTZ,
-          remarks = NULLIF($11, ''),
+          school_year_id = $2,
+          event_id = $3,
+          student_id = $4,
+          name = $5,
+          year_level = NULLIF($6, ''),
+          college = NULLIF($7, ''),
+          program = NULLIF($8, ''),
+          institution = NULLIF($9, ''),
+          no_of_absences = $10,
+          scanned_at = $11::TIMESTAMPTZ,
+          remarks = NULLIF($12, ''),
           updated_at = NOW()
         WHERE id = ANY($1::uuid[])
         RETURNING *
       `,
       [
         uniqueIds,
+        event?.school_year_id ?? await resolveSchoolYearId(client, (input as Record<string, unknown>).schoolYearId ?? (input as Record<string, unknown>).school_year_id, [row.scannedAt]),
         event?.id ?? null,
         row.studentId,
         row.name,
@@ -1839,22 +1954,24 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
       `
         UPDATE attendance_records
         SET
-          event_id = $2,
-          student_id = $3,
-          name = $4,
-          year_level = NULLIF($5, ''),
-          college = NULLIF($6, ''),
-          program = NULLIF($7, ''),
-          institution = NULLIF($8, ''),
-          no_of_absences = $9,
-          scanned_at = $10::TIMESTAMPTZ,
-          remarks = NULLIF($11, ''),
+          school_year_id = $2,
+          event_id = $3,
+          student_id = $4,
+          name = $5,
+          year_level = NULLIF($6, ''),
+          college = NULLIF($7, ''),
+          program = NULLIF($8, ''),
+          institution = NULLIF($9, ''),
+          no_of_absences = $10,
+          scanned_at = $11::TIMESTAMPTZ,
+          remarks = NULLIF($12, ''),
           updated_at = NOW()
         WHERE id = $1
         RETURNING *
       `,
       [
         id,
+        event?.school_year_id ?? existingRecord.school_year_id ?? await resolveSchoolYearId(client, (input as Record<string, unknown>).schoolYearId ?? (input as Record<string, unknown>).school_year_id, [row.scannedAt]),
         event?.id ?? null,
         row.studentId,
         row.name,
@@ -1997,7 +2114,7 @@ export async function deleteAttendanceImports(): Promise<DeletedAttendanceImport
   });
 }
 
-export async function listAttendanceEvents(limit = 100, offset = 0) {
+export async function listAttendanceEvents(limit = 100, offset = 0, schoolYearId?: string) {
   const result = await query<AttendanceEventRecord>(
     `
       SELECT
@@ -2005,11 +2122,12 @@ export async function listAttendanceEvents(limit = 100, offset = 0) {
         COUNT(DISTINCT ar.student_id)::INT AS attendees_count
       FROM attendance_events e
       LEFT JOIN attendance_records ar ON ar.event_id = e.id
+      ${schoolYearId ? "WHERE e.school_year_id = $3" : ""}
       GROUP BY e.id
       ORDER BY COALESCE(e.event_start_at, e.event_end_at, e.created_at) DESC, e.created_at DESC
       LIMIT $1 OFFSET $2
     `,
-    [limit, offset],
+    schoolYearId ? [limit, offset, schoolYearId] : [limit, offset],
   );
 
   return result.rows;
@@ -2025,11 +2143,12 @@ export async function createAttendanceEvent(input: AttendanceEventInput) {
   return withTransaction(async (client) => {
     const result = await client.query<AttendanceEventRecord>(
       `
-        INSERT INTO attendance_events (name, event_start_at, event_end_at, description)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO attendance_events (school_year_id, name, event_start_at, event_end_at, description)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING *, 0::INT AS attendees_count
       `,
       [
+        await resolveSchoolYearId(client, eventInput.schoolYearId, [eventInput.eventStartAt, eventInput.eventEndAt]),
         eventInput.name,
         eventInput.eventStartAt,
         eventInput.eventEndAt,
@@ -2059,12 +2178,13 @@ export async function updateAttendanceEvent(
     const result = await client.query<AttendanceEventRecord>(
       `
         UPDATE attendance_events
-        SET name = $2, event_start_at = $3, event_end_at = $4, description = $5, updated_at = NOW()
+        SET school_year_id = $2, name = $3, event_start_at = $4, event_end_at = $5, description = $6, updated_at = NOW()
         WHERE id = $1
         RETURNING *
       `,
       [
         id,
+        eventInput.schoolYearId ? await resolveSchoolYearId(client, eventInput.schoolYearId, [eventInput.eventStartAt, eventInput.eventEndAt]) : existing.school_year_id,
         eventInput.name,
         eventInput.eventStartAt,
         eventInput.eventEndAt,
@@ -2118,6 +2238,7 @@ export async function listAttendanceRecords(
   studentId?: string,
   eventId?: string,
   college?: string,
+  schoolYearId?: string,
 ) {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -2137,6 +2258,11 @@ export async function listAttendanceRecords(
     clauses.push(
       `LOWER(TRIM(COALESCE(NULLIF(TRIM(s.college), ''), ar.college, ''))) = LOWER(TRIM($${params.length}))`,
     );
+  }
+
+  if (schoolYearId) {
+    params.push(schoolYearId);
+    clauses.push(`ar.school_year_id = $${params.length}`);
   }
 
   params.push(limit);
@@ -2161,16 +2287,17 @@ export async function listAttendanceRecords(
   return result.rows;
 }
 
-export async function listAttendanceImports(limit = 50, offset = 0) {
+export async function listAttendanceImports(limit = 50, offset = 0, schoolYearId?: string) {
   const result = await query<AttendanceImportRecord>(
     `
       SELECT ai.*, ae.name AS event_name
       FROM attendance_imports ai
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+      ${schoolYearId ? "WHERE ai.school_year_id = $3" : ""}
       ORDER BY ai.created_at DESC
       LIMIT $1 OFFSET $2
     `,
-    [limit, offset],
+    schoolYearId ? [limit, offset, schoolYearId] : [limit, offset],
   );
 
   return result.rows;
