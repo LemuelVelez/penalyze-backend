@@ -992,6 +992,8 @@ const ATTENDANCE_ZERO_RECORD_COLLEGE_SCOPE_SQL =
   getAttendanceRecordScopeColumnSql("ar", "college");
 const ATTENDANCE_ZERO_EVENT_COLLEGE_SCOPE_SQL =
   getAttendanceRecordScopeColumnSql("event_record", "college");
+const ATTENDANCE_ZERO_ATTENDED_COLLEGE_SCOPE_SQL =
+  getAttendanceRecordScopeColumnSql("attended", "college");
 const ATTENDANCE_ABSENCE_SYNC_LOCK_SQL =
   "SELECT pg_advisory_xact_lock(hashtext('penalyze.attendance_absence_sync')::bigint)";
 
@@ -1181,27 +1183,42 @@ async function syncManualZeroAttendanceAbsencesForCollegeScopes(
 
   const updatedResult = await client.query<AttendanceRecord>(
     `
-      WITH college_event_totals AS (
-        SELECT
-          ${ATTENDANCE_ZERO_EVENT_COLLEGE_SCOPE_SQL} AS college_key,
-          COUNT(DISTINCT event_record.event_id)::INT AS total_events
+      WITH college_events AS (
+        SELECT DISTINCT
+          event_record.event_id,
+          ${ATTENDANCE_ZERO_EVENT_COLLEGE_SCOPE_SQL} AS college_key
         FROM attendance_records event_record
         WHERE event_record.event_id IS NOT NULL
           AND ${ATTENDANCE_ZERO_EVENT_COLLEGE_SCOPE_SQL} = ANY($1::TEXT[])
-        GROUP BY ${ATTENDANCE_ZERO_EVENT_COLLEGE_SCOPE_SQL}
       ),
-      target_records AS (
+      target_zero_records AS (
         SELECT
           ar.id,
-          COALESCE(cet.total_events, 0)::INT AS no_of_absences
+          LOWER(TRIM(ar.student_id)) AS student_key,
+          ${ATTENDANCE_ZERO_RECORD_COLLEGE_SCOPE_SQL} AS college_key
         FROM attendance_records ar
-        LEFT JOIN college_event_totals cet
-          ON cet.college_key = ${ATTENDANCE_ZERO_RECORD_COLLEGE_SCOPE_SQL}
         WHERE ar.event_id IS NULL
           AND LOWER(COALESCE(ar.remarks, '')) LIKE '%zero attendance%'
           AND ${ATTENDANCE_ZERO_RECORD_COLLEGE_SCOPE_SQL} = ANY($1::TEXT[])
         ORDER BY ar.id
         FOR UPDATE OF ar
+      ),
+      target_records AS (
+        SELECT
+          tzr.id,
+          GREATEST(
+            COUNT(DISTINCT ce.event_id)::INT -
+              COUNT(DISTINCT attended.event_id)::INT,
+            0
+          ) AS no_of_absences
+        FROM target_zero_records tzr
+        LEFT JOIN college_events ce
+          ON ce.college_key = tzr.college_key
+        LEFT JOIN attendance_records attended
+          ON LOWER(TRIM(attended.student_id)) = tzr.student_key
+          AND attended.event_id = ce.event_id
+          AND ${ATTENDANCE_ZERO_ATTENDED_COLLEGE_SCOPE_SQL} = tzr.college_key
+        GROUP BY tzr.id
       )
       UPDATE attendance_records ar
       SET no_of_absences = target.no_of_absences,
@@ -1782,8 +1799,12 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       const synced = await syncAbsencesForAttendanceRecordIds(client, [
         record.id,
       ]);
+      const refreshedRecordIds = Array.from(
+        new Set([record.id, ...synced.records.map((item) => item.id)]),
+      );
+      const records = await listRecordsByIds(client, refreshedRecordIds);
       const updatedRecord =
-        (await listRecordsByIds(client, [record.id]))[0] ?? record;
+        records.find((item) => item.id === record.id) ?? record;
       const fine =
         synced.fines.find((item) => item.attendance_record_id === record.id) ??
         null;
@@ -1791,6 +1812,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       return {
         event,
         record: updatedRecord,
+        records,
         fine,
       };
     }
@@ -1799,8 +1821,12 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       const synced = await syncManualZeroAttendanceAbsencesForRecordIds(client, [
         record.id,
       ]);
+      const refreshedRecordIds = Array.from(
+        new Set([record.id, ...synced.records.map((item) => item.id)]),
+      );
+      const records = await listRecordsByIds(client, refreshedRecordIds);
       const updatedRecord =
-        (await listRecordsByIds(client, [record.id]))[0] ?? record;
+        records.find((item) => item.id === record.id) ?? record;
       const fine =
         synced.fines.find((item) => item.attendance_record_id === record.id) ??
         null;
@@ -1808,6 +1834,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       return {
         event,
         record: updatedRecord,
+        records,
         fine,
       };
     }
@@ -1817,6 +1844,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
     return {
       event,
       record,
+      records: [record],
       fine,
     };
   });
