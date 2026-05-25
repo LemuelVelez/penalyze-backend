@@ -893,19 +893,18 @@ async function syncFineForAttendanceRecord(
           penalty_id = $2,
           student_id = $3,
           name = $4,
-          no_of_absences = $5,
-          prescribed_penalty = $6,
+          prescribed_penalty = $5,
           updated_at = NOW()
         WHERE id = $1
-        RETURNING *
+        RETURNING *, $6::INT AS no_of_absences
       `,
       [
         existingFine.id,
         penalty?.id ?? null,
         record.student_id,
         record.name,
-        record.no_of_absences,
         penaltyText,
+        record.no_of_absences,
       ],
     );
 
@@ -919,20 +918,19 @@ async function syncFineForAttendanceRecord(
         penalty_id,
         student_id,
         name,
-        no_of_absences,
         prescribed_penalty,
         status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, 'unpaid')
-      RETURNING *
+      VALUES ($1, $2, $3, $4, $5, 'unpaid')
+      RETURNING *, $6::INT AS no_of_absences
     `,
     [
       record.id,
       penalty?.id ?? null,
       record.student_id,
       record.name,
-      record.no_of_absences,
       penaltyText,
+      record.no_of_absences,
     ],
   );
 

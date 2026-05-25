@@ -258,6 +258,7 @@ export async function listFines(options: { status?: FineStatus; studentId?: stri
     `
       SELECT
         f.*,
+        COALESCE(ar.no_of_absences, 0)::INT AS no_of_absences,
         ar.event_id AS attendance_event_id,
         ar.remarks AS attendance_remarks
       FROM fines f
@@ -408,19 +409,18 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
         SET penalty_id = $2,
             student_id = $3,
             name = $4,
-            no_of_absences = $5,
-            prescribed_penalty = $6,
+            prescribed_penalty = $5,
             updated_at = NOW()
         WHERE id = $1
-        RETURNING *
+        RETURNING *, $6::INT AS no_of_absences
       `,
       [
         existing.rows[0].id,
         penalty?.id ?? null,
         attendanceRecord.student_id,
         attendanceRecord.name,
-        noOfAbsences,
-        prescribedPenalty
+        prescribedPenalty,
+        noOfAbsences
       ]
     );
 
@@ -434,20 +434,19 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
         penalty_id,
         student_id,
         name,
-        no_of_absences,
         prescribed_penalty,
         status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, 'unpaid')
-      RETURNING *
+      VALUES ($1, $2, $3, $4, $5, 'unpaid')
+      RETURNING *, $6::INT AS no_of_absences
     `,
     [
       attendanceRecord.id,
       penalty?.id ?? null,
       attendanceRecord.student_id,
       attendanceRecord.name,
-      noOfAbsences,
-      prescribedPenalty
+      prescribedPenalty,
+      noOfAbsences
     ]
   );
 
@@ -494,6 +493,7 @@ export async function updateFineStatus(id: string, status: FineStatus) {
       )
       SELECT
         updated.*,
+        COALESCE(ar.no_of_absences, 0)::INT AS no_of_absences,
         ar.event_id AS attendance_event_id,
         ar.remarks AS attendance_remarks
       FROM updated
