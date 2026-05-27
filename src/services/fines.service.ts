@@ -393,11 +393,20 @@ export async function listFines(options: { schoolYearId?: string; status?: FineS
         ${getFineTableColumnsSql("f")},
         COALESCE(ar.no_of_absences, 0)::INT AS no_of_absences,
         ar.event_id AS attendance_event_id,
+        ae.name AS attendance_event_name,
+        ae.event_order AS attendance_event_order,
+        ae.event_start_at AS attendance_event_start_at,
+        ae.event_end_at AS attendance_event_end_at,
         ar.remarks AS attendance_remarks
       FROM fines f
       LEFT JOIN attendance_records ar ON ar.id = f.attendance_record_id
+      LEFT JOIN attendance_events ae ON ae.id = ar.event_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY f.created_at DESC, f.updated_at DESC
+      ORDER BY
+        ae.event_order ASC NULLS LAST,
+        COALESCE(ae.event_start_at, ae.event_end_at, f.created_at) ASC,
+        f.student_id ASC,
+        f.created_at ASC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
     params
@@ -730,10 +739,42 @@ export async function listPenaltyResults(options: ListPenaltyResultsOptions = {}
 
   const result = await query<PenaltyResultRecord>(
     `
-      SELECT *
+      SELECT
+        pr.*,
+        COALESCE(cr.college, mar.college) AS college,
+        COALESCE(cr.program, mar.program) AS program,
+        COALESCE(manual_event.event_order, calculation_event.event_order) AS event_order,
+        COALESCE(manual_event.event_start_at, calculation_event.event_start_at) AS event_start_at,
+        COALESCE(manual_event.event_end_at, calculation_event.event_end_at) AS event_end_at
       FROM penalty_results pr
+      LEFT JOIN calculation_results cr
+        ON pr.source_table = 'calculation_results'
+        AND cr.id = pr.source_record_id
+      LEFT JOIN manual_attendance_records mar
+        ON pr.source_table = 'manual_attendance_records'
+        AND mar.id = pr.source_record_id
+      LEFT JOIN attendance_events manual_event ON manual_event.id = mar.event_id
+      LEFT JOIN LATERAL (
+        SELECT
+          MIN(ae.event_order) AS event_order,
+          MIN(ae.event_start_at) AS event_start_at,
+          MIN(ae.event_end_at) AS event_end_at,
+          MIN(COALESCE(ae.event_start_at, ae.event_end_at, ai.created_at)) AS event_sort_at
+        FROM attendance_imports ai
+        LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+        WHERE ai.id = ANY(COALESCE(cr.import_ids, ARRAY[]::uuid[]))
+      ) calculation_event ON TRUE
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY pr.updated_at DESC, pr.created_at DESC
+      ORDER BY
+        COALESCE(manual_event.event_order, calculation_event.event_order) ASC NULLS LAST,
+        COALESCE(
+          manual_event.event_start_at,
+          manual_event.event_end_at,
+          calculation_event.event_sort_at,
+          pr.updated_at,
+          pr.created_at
+        ) ASC,
+        pr.student_id ASC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
     params,

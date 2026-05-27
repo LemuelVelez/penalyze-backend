@@ -218,6 +218,9 @@ const ATTENDANCE_RECORD_SELECT = `
   ar.import_id,
   ar.event_id,
   ae.name AS event_name,
+  ae.event_order,
+  ae.event_start_at,
+  ae.event_end_at,
   COALESCE(NULLIF(TRIM(s.student_id), ''), ar.student_id) AS student_id,
   COALESCE(NULLIF(TRIM(s.name), ''), ar.name) AS name,
   COALESCE(NULLIF(TRIM(s.year_level), ''), ar.year_level) AS year_level,
@@ -1604,7 +1607,12 @@ async function listRecordsByIds(client: PoolClient, ids: string[]) {
 async function getAttendanceImportById(client: PoolClient, importId: string) {
   const result = await client.query<AttendanceImportRecord>(
     `
-      SELECT ai.*, ae.name AS event_name
+      SELECT
+        ai.*,
+        ae.name AS event_name,
+        ae.event_order,
+        ae.event_start_at,
+        ae.event_end_at
       FROM attendance_imports ai
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id
       WHERE ai.id = $1
@@ -1946,6 +1954,9 @@ function getManualRecordSelectSql() {
     mar.school_year_id,
     mar.event_id,
     ae.name AS event_name,
+    ae.event_order,
+    ae.event_start_at,
+    ae.event_end_at,
     mar.attendance_type,
     mar.student_id,
     mar.name,
@@ -1968,6 +1979,9 @@ function manualRecordToAttendanceRecord(record: ManualAttendanceRecord): Attenda
     import_id: null,
     event_id: record.event_id,
     event_name: record.event_name ?? null,
+    event_order: record.event_order ?? null,
+    event_start_at: record.event_start_at ?? null,
+    event_end_at: record.event_end_at ?? null,
     student_id: record.student_id,
     name: record.name,
     year_level: record.year_level,
@@ -2589,7 +2603,12 @@ export async function deleteAttendanceImports(): Promise<DeletedAttendanceImport
   return withTransaction(async (client) => {
     const importsResult = await client.query<AttendanceImportRecord>(
       `
-        SELECT ai.*, ae.name AS event_name
+        SELECT
+          ai.*,
+          ae.name AS event_name,
+          ae.event_order,
+          ae.event_start_at,
+          ae.event_end_at
         FROM attendance_imports ai
         LEFT JOIN attendance_events ae ON ae.id = ai.event_id
         ORDER BY ai.created_at DESC
@@ -2849,7 +2868,11 @@ export async function listAttendanceRecords(
       LEFT JOIN attendance_events ae ON ae.id = ar.event_id
       LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY COALESCE(ar.scanned_at, ar.created_at) DESC, ar.created_at DESC
+      ORDER BY
+        ae.event_order ASC NULLS LAST,
+        COALESCE(ae.event_start_at, ae.event_end_at, ar.scanned_at, ar.created_at) ASC,
+        COALESCE(ar.scanned_at, ar.created_at) ASC,
+        ar.created_at ASC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
     params,
@@ -2861,11 +2884,19 @@ export async function listAttendanceRecords(
 export async function listAttendanceImports(limit = 50, offset = 0, schoolYearId?: string) {
   const result = await query<AttendanceImportRecord>(
     `
-      SELECT ai.*, ae.name AS event_name
+      SELECT
+        ai.*,
+        ae.name AS event_name,
+        ae.event_order,
+        ae.event_start_at,
+        ae.event_end_at
       FROM attendance_imports ai
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id
       ${schoolYearId ? "WHERE ai.school_year_id = $3" : ""}
-      ORDER BY ai.created_at DESC
+      ORDER BY
+        ae.event_order ASC NULLS LAST,
+        COALESCE(ae.event_start_at, ae.event_end_at, ai.created_at) ASC,
+        ai.created_at ASC
       LIMIT $1 OFFSET $2
     `,
     schoolYearId ? [limit, offset, schoolYearId] : [limit, offset],
@@ -2877,7 +2908,12 @@ export async function listAttendanceImports(limit = 50, offset = 0, schoolYearId
 export async function getAttendanceImport(importId: string) {
   const importResult = await query<AttendanceImportRecord>(
     `
-      SELECT ai.*, ae.name AS event_name
+      SELECT
+        ai.*,
+        ae.name AS event_name,
+        ae.event_order,
+        ae.event_start_at,
+        ae.event_end_at
       FROM attendance_imports ai
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id
       WHERE ai.id = $1
@@ -2895,7 +2931,11 @@ export async function getAttendanceImport(importId: string) {
       LEFT JOIN attendance_events ae ON ae.id = ar.event_id
       LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
       WHERE ar.import_id = $1
-      ORDER BY ar.created_at ASC
+      ORDER BY
+        ae.event_order ASC NULLS LAST,
+        COALESCE(ae.event_start_at, ae.event_end_at, ar.scanned_at, ar.created_at) ASC,
+        COALESCE(ar.scanned_at, ar.created_at) ASC,
+        ar.created_at ASC
     `,
     [importId],
   );
@@ -3197,10 +3237,29 @@ export async function listCalculationResults(
 
   const result = await query<CalculationResultRecord>(
     `
-      SELECT *
+      SELECT
+        cr.*,
+        event_scope.event_order,
+        event_scope.event_start_at,
+        event_scope.event_end_at
       FROM calculation_results cr
+      LEFT JOIN LATERAL (
+        SELECT
+          MIN(ae.event_order) AS event_order,
+          MIN(ae.event_start_at) AS event_start_at,
+          MIN(ae.event_end_at) AS event_end_at,
+          MIN(COALESCE(ae.event_start_at, ae.event_end_at, ai.created_at)) AS event_sort_at
+        FROM attendance_imports ai
+        LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+        WHERE ai.id = ANY(cr.import_ids)
+      ) event_scope ON TRUE
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY cr.calculated_at DESC, cr.updated_at DESC, cr.student_id ASC
+      ORDER BY
+        event_scope.event_order ASC NULLS LAST,
+        event_scope.event_sort_at ASC NULLS LAST,
+        cr.calculated_at DESC,
+        cr.updated_at DESC,
+        cr.student_id ASC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
     params,
@@ -3433,10 +3492,21 @@ export async function listAttendanceFinalResults(
 
   const result = await query<AttendanceFinalResultRecord>(
     `
-      SELECT *
+      SELECT
+        afr.*,
+        ai.event_id,
+        ae.name AS event_name,
+        ae.event_order,
+        ae.event_start_at,
+        ae.event_end_at
       FROM attendance_final_results afr
+      LEFT JOIN attendance_imports ai ON ai.id = afr.import_id
+      LEFT JOIN attendance_events ae ON ae.id = ai.event_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY afr.updated_at DESC, afr.created_at DESC
+      ORDER BY
+        ae.event_order ASC NULLS LAST,
+        COALESCE(ae.event_start_at, ae.event_end_at, afr.latest_scanned_at, afr.created_at) ASC,
+        afr.student_id ASC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
     params,
@@ -3483,7 +3553,11 @@ export async function listManualAttendanceRecords(
       FROM manual_attendance_records mar
       LEFT JOIN attendance_events ae ON ae.id = mar.event_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY COALESCE(mar.scanned_at, mar.created_at) DESC, mar.created_at DESC
+      ORDER BY
+        ae.event_order ASC NULLS LAST,
+        COALESCE(ae.event_start_at, ae.event_end_at, mar.scanned_at, mar.created_at) ASC,
+        COALESCE(mar.scanned_at, mar.created_at) ASC,
+        mar.created_at ASC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
     params,

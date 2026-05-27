@@ -75,6 +75,9 @@ export type AttendanceImportRecord = {
   school_year_id: string | null;
   event_id: string | null;
   event_name?: string | null;
+  event_order?: number | null;
+  event_start_at?: Date | string | null;
+  event_end_at?: Date | string | null;
   file_name: string;
   file_type: string;
   rows_total: number;
@@ -90,6 +93,9 @@ export type AttendanceRecord = {
   import_id: string | null;
   event_id: string | null;
   event_name?: string | null;
+  event_order?: number | null;
+  event_start_at?: Date | string | null;
+  event_end_at?: Date | string | null;
   student_id: string;
   name: string;
   year_level: string | null;
@@ -110,6 +116,9 @@ export type ManualAttendanceRecord = {
   school_year_id: string | null;
   event_id: string | null;
   event_name?: string | null;
+  event_order?: number | null;
+  event_start_at?: Date | string | null;
+  event_end_at?: Date | string | null;
   attendance_type: ManualAttendanceType;
   student_id: string;
   name: string;
@@ -128,6 +137,11 @@ export type AttendanceFinalResultRecord = {
   id: string;
   school_year_id: string | null;
   import_id: string | null;
+  event_id?: string | null;
+  event_name?: string | null;
+  event_order?: number | null;
+  event_start_at?: Date | string | null;
+  event_end_at?: Date | string | null;
   student_id: string;
   name: string;
   year_level: string | null;
@@ -164,6 +178,9 @@ export type CalculationResultRecord = {
   source_record_count: number;
   latest_scanned_at: Date | string | null;
   source_updated_at: Date | string | null;
+  event_order?: number | null;
+  event_start_at?: Date | string | null;
+  event_end_at?: Date | string | null;
   calculated_at: Date | string;
   created_at: Date;
   updated_at: Date;
@@ -188,6 +205,10 @@ export type FineRecord = {
   prescribed_penalty: string;
   status: FineStatus;
   attendance_event_id?: string | null;
+  attendance_event_name?: string | null;
+  attendance_event_order?: number | null;
+  attendance_event_start_at?: Date | string | null;
+  attendance_event_end_at?: Date | string | null;
   attendance_remarks?: string | null;
   created_at: Date;
   updated_at: Date;
@@ -204,6 +225,11 @@ export type PenaltyResultRecord = {
   status: FineStatus;
   source_table: string | null;
   source_record_id: string | null;
+  college?: string | null;
+  program?: string | null;
+  event_order?: number | null;
+  event_start_at?: Date | string | null;
+  event_end_at?: Date | string | null;
   created_at: Date;
   updated_at: Date;
 };
