@@ -741,12 +741,15 @@ export async function listPenaltyResults(options: ListPenaltyResultsOptions = {}
     `
       SELECT
         pr.*,
-        COALESCE(cr.college, mar.college) AS college,
-        COALESCE(cr.program, mar.program) AS program,
+        COALESCE(afr.college, cr.college, mar.college) AS college,
+        COALESCE(afr.program, cr.program, mar.program) AS program,
         COALESCE(manual_event.event_order, calculation_event.event_order) AS event_order,
-        COALESCE(manual_event.event_start_at, calculation_event.event_start_at) AS event_start_at,
-        COALESCE(manual_event.event_end_at, calculation_event.event_end_at) AS event_end_at
+        COALESCE(manual_event.event_start_at, calculation_event.event_start_at, afr.latest_scanned_at) AS event_start_at,
+        COALESCE(manual_event.event_end_at, calculation_event.event_end_at, afr.latest_scanned_at) AS event_end_at
       FROM penalty_results pr
+      LEFT JOIN attendance_final_results afr
+        ON pr.source_table = 'attendance_final_results'
+        AND afr.id = pr.source_record_id
       LEFT JOIN calculation_results cr
         ON pr.source_table = 'calculation_results'
         AND cr.id = pr.source_record_id
@@ -788,25 +791,29 @@ export async function refreshPenaltyResults(options: {
   importIds?: string[];
 } = {}) {
   const schoolYearId = cleanOptionalText(options.schoolYearId);
-  const importIds = normalizeImportIds(options.importIds ?? []);
-  const calculationScopeKey = getCalculationScopeKey(importIds) || null;
 
   const result = await query<PenaltyResultRecord>(
     `
       WITH totals AS (
         SELECT
-          school_year_id,
-          student_id,
-          name,
-          total_absences::INT AS no_of_absences,
-          penalty_id,
-          COALESCE(prescribed_penalty, 'No prescribed penalty configured.') AS prescribed_penalty,
-          'calculation_results'::TEXT AS source_table,
-          id AS source_record_id
-        FROM calculation_results
-        WHERE ($1::uuid IS NULL OR school_year_id = $1::uuid)
-          AND ($2::TEXT IS NULL OR calculation_scope_key = $2::TEXT)
-          AND total_absences > 0
+          afr.school_year_id,
+          afr.student_id,
+          afr.name,
+          afr.total_absences::INT AS no_of_absences,
+          penalty.id AS penalty_id,
+          COALESCE(penalty.prescribed_penalty, 'No prescribed penalty configured.') AS prescribed_penalty,
+          'attendance_final_results'::TEXT AS source_table,
+          afr.id AS source_record_id
+        FROM attendance_final_results afr
+        LEFT JOIN LATERAL (
+          SELECT id, prescribed_penalty
+          FROM penalties
+          WHERE no_of_absences <= afr.total_absences
+          ORDER BY no_of_absences DESC
+          LIMIT 1
+        ) penalty ON afr.total_absences > 0
+        WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
+          AND afr.total_absences > 0
       )
       INSERT INTO penalty_results (
         school_year_id,
@@ -841,24 +848,23 @@ export async function refreshPenaltyResults(options: {
         updated_at = NOW()
       RETURNING *
     `,
-    [schoolYearId, calculationScopeKey],
+    [schoolYearId],
   );
 
   await query(
     `
       DELETE FROM penalty_results pr
       WHERE ($1::uuid IS NULL OR pr.school_year_id = $1::uuid)
-        AND pr.source_table = 'calculation_results'
+        AND pr.source_table = 'attendance_final_results'
         AND NOT EXISTS (
           SELECT 1
-          FROM calculation_results cr
-          WHERE cr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
-            AND LOWER(TRIM(cr.student_id)) = LOWER(TRIM(pr.student_id))
-            AND cr.total_absences > 0
-            AND ($2::TEXT IS NULL OR cr.calculation_scope_key = $2::TEXT)
+          FROM attendance_final_results afr
+          WHERE afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
+            AND LOWER(TRIM(afr.student_id)) = LOWER(TRIM(pr.student_id))
+            AND afr.total_absences > 0
         )
     `,
-    [schoolYearId, calculationScopeKey],
+    [schoolYearId],
   );
 
   return result.rows;
@@ -878,6 +884,68 @@ export async function updatePenaltyResultStatus(id: string, status: FineStatus) 
       RETURNING *
     `,
     [id, status],
+  );
+
+  if (!result.rows[0]) {
+    throw new Error("Penalty result not found.");
+  }
+
+  return result.rows[0];
+}
+
+export async function updatePenaltyResult(
+  id: string,
+  input: {
+    studentId?: string;
+    name?: string;
+    noOfAbsences?: number;
+    prescribedPenalty?: string;
+    status?: FineStatus;
+  },
+) {
+  const studentId = cleanOptionalText(input.studentId);
+  const name = cleanOptionalText(input.name);
+  const noOfAbsences = Number(input.noOfAbsences ?? 0);
+  const prescribedPenalty = cleanOptionalText(input.prescribedPenalty);
+  const status = input.status;
+
+  if (!Number.isInteger(noOfAbsences) || noOfAbsences < 0) {
+    throw new Error("No. of absences must be a whole number.");
+  }
+
+  if (status && !["unpaid", "paid", "waived"].includes(status)) {
+    throw new Error("Invalid penalty result status.");
+  }
+
+  if (!prescribedPenalty && noOfAbsences > 0) {
+    throw new Error("Prescribed penalty is required.");
+  }
+
+  const matchedPenalty =
+    noOfAbsences > 0 ? await getPenaltyByAbsences(noOfAbsences) : null;
+
+  const result = await query<PenaltyResultRecord>(
+    `
+      UPDATE penalty_results
+      SET student_id = COALESCE($2, student_id),
+          name = COALESCE($3, name),
+          no_of_absences = $4,
+          penalty_id = $5,
+          prescribed_penalty = COALESCE($6, prescribed_penalty),
+          status = COALESCE($7, status),
+          updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `,
+    [
+      id,
+      studentId,
+      name,
+      noOfAbsences,
+      matchedPenalty?.id ?? null,
+      prescribedPenalty ?? matchedPenalty?.prescribed_penalty ?? null,
+      status ?? null,
+    ],
   );
 
   if (!result.rows[0]) {

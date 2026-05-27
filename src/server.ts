@@ -38,6 +38,7 @@ import {
   seedPenalties,
   summary,
   updatePenalty,
+  updatePenaltyResultRow,
   updatePenaltyResultRowStatus,
   updateStatus
 } from "./controller/fines.controller";
@@ -161,6 +162,8 @@ app.get("/api/fines", fines);
 app.get("/api/fines/summary", summary);
 app.get("/api/fines/penalty-results", penaltyResults);
 app.post("/api/fines/penalty-results/refresh", refreshPenaltyResultRows);
+app.put("/api/fines/penalty-results/:id", updatePenaltyResultRow);
+app.patch("/api/fines/penalty-results/:id", updatePenaltyResultRow);
 app.patch("/api/fines/penalty-results/:id/status", updatePenaltyResultRowStatus);
 app.post("/api/fines/zero-attendance", registerZeroAttendance);
 app.patch("/api/fines/:id/status", updateStatus);

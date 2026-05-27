@@ -554,16 +554,16 @@ function parseLegacyDocFallback(file: UploadedAttendanceFile) {
 async function parseFileToRawRows(file: UploadedAttendanceFile) {
   const extension = ensureSupportedFile(file.originalname);
 
-  if (extension === ".xlsx" || extension === ".xls") {
+  if (
+    extension === ".xlsx" ||
+    extension === ".xls" ||
+    extension === ".xlsm" ||
+    extension === ".xlsb" ||
+    extension === ".xltx" ||
+    extension === ".xltm" ||
+    extension === ".ods"
+  ) {
     return parseExcelFile(file);
-  }
-
-  if (extension === ".docx") {
-    return parseDocxFile(file);
-  }
-
-  if (extension === ".doc") {
-    return parseLegacyDocFallback(file);
   }
 
   return textToRows(file.buffer.toString("utf8"));
@@ -1655,7 +1655,7 @@ export async function previewAttendanceFile(
   file: UploadedAttendanceFile,
 ): Promise<AttendancePreviewResult> {
   if (!file?.buffer?.length) {
-    throw new Error("Please upload a valid Excel, text, or document file.");
+    throw new Error("Please upload a valid Excel, CSV, or TXT file.");
   }
 
   const extension = getFileExtension(file.originalname);
@@ -2096,10 +2096,12 @@ async function upsertPenaltyResultForManualRecord(
     await client.query(
       `
         DELETE FROM penalty_results
-        WHERE school_year_id = $1
+        WHERE school_year_id IS NOT DISTINCT FROM $1
           AND LOWER(TRIM(student_id)) = LOWER(TRIM($2))
+          AND source_table = 'manual_attendance_records'
+          AND source_record_id = $3
       `,
-      [record.school_year_id, record.student_id],
+      [record.school_year_id, record.student_id, record.id],
     );
     return null;
   }
@@ -2159,10 +2161,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
           (input as Record<string, unknown>).school_year_id,
         [row.scannedAt],
       ));
-    const noOfAbsences =
-      attendanceType === "zero_attendance"
-        ? await countCollegeEventsForManualRecord(client, row, schoolYearId)
-        : Math.max(0, Number(row.noOfAbsences ?? 0));
+    const noOfAbsences = Math.max(0, Number(row.noOfAbsences ?? 0));
 
     await upsertStudent(client, {
       ...row,
@@ -2559,24 +2558,52 @@ export async function deleteAttendanceRecord(id: string) {
     );
     const record = existingResult.rows[0];
 
-    if (!record) {
+    if (record) {
+      const collegeScopeKeys = record.event_id
+        ? await getAttendanceRecordCollegeScopeKeys(client, [record.id])
+        : [];
+
+      await client.query("DELETE FROM fines WHERE attendance_record_id = $1", [
+        id,
+      ]);
+      await client.query("DELETE FROM attendance_records WHERE id = $1", [id]);
+
+      if (record.event_id) {
+        await syncAbsencesForAttendanceCollegeScopes(client, collegeScopeKeys);
+      }
+
+      return record;
+    }
+
+    const manualResult = await client.query<ManualAttendanceRecord>(
+      `
+        SELECT ${getManualRecordSelectSql()}
+        FROM manual_attendance_records mar
+        LEFT JOIN attendance_events ae ON ae.id = mar.event_id
+        WHERE mar.id = $1
+        LIMIT 1
+      `,
+      [id],
+    );
+    const manualRecord = manualResult.rows[0];
+
+    if (!manualRecord) {
       throw createValidationError("Attendance record not found.", 404);
     }
 
-    const collegeScopeKeys = record.event_id
-      ? await getAttendanceRecordCollegeScopeKeys(client, [record.id])
-      : [];
-
-    await client.query("DELETE FROM fines WHERE attendance_record_id = $1", [
+    await client.query(
+      `
+        DELETE FROM penalty_results
+        WHERE source_table = 'manual_attendance_records'
+          AND source_record_id = $1
+      `,
+      [id],
+    );
+    await client.query("DELETE FROM manual_attendance_records WHERE id = $1", [
       id,
     ]);
-    await client.query("DELETE FROM attendance_records WHERE id = $1", [id]);
 
-    if (record.event_id) {
-      await syncAbsencesForAttendanceCollegeScopes(client, collegeScopeKeys);
-    }
-
-    return record;
+    return manualRecordToAttendanceRecord(manualRecord);
   });
 }
 
@@ -3283,37 +3310,71 @@ async function refreshAttendanceFinalResultsWithClient(
   client: PoolClient,
   options: Pick<AttendanceFinalResultsFilter, "schoolYearId" | "importId"> = {},
 ) {
-  const clauses: string[] = ["ar.import_id IS NOT NULL"];
-  const params: unknown[] = [];
-
-  if (options.schoolYearId) {
-    params.push(options.schoolYearId);
-    clauses.push(`ar.school_year_id = $${params.length}`);
-  }
-
-  if (options.importId) {
-    params.push(options.importId);
-    clauses.push(`ar.import_id = $${params.length}`);
-  }
-
-  const whereSql = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const schoolYearId = cleanText(options.schoolYearId) || null;
 
   await client.query(
     `
       DELETE FROM attendance_final_results afr
-      WHERE EXISTS (
-        SELECT 1
-        FROM attendance_records ar
-        ${whereSql}
-          AND ar.school_year_id IS NOT DISTINCT FROM afr.school_year_id
-          AND ar.import_id IS NOT DISTINCT FROM afr.import_id
-      )
+      WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
     `,
-    params,
+    [schoolYearId],
   );
 
   const result = await client.query<AttendanceFinalResultRecord>(
     `
+      WITH source_records AS (
+        SELECT
+          ar.school_year_id,
+          ar.student_id,
+          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(ar.name), ''), ar.student_id) AS name,
+          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(ar.year_level), '')) AS year_level,
+          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), '')) AS college,
+          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), '')) AS program,
+          COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
+          COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), ar.import_id::TEXT) AS event_key,
+          GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
+          COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
+          ar.updated_at
+        FROM attendance_records ar
+        LEFT JOIN attendance_events ae ON ae.id = ar.event_id
+        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+        WHERE ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+
+        UNION ALL
+
+        SELECT
+          mar.school_year_id,
+          mar.student_id,
+          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id) AS name,
+          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(mar.year_level), '')) AS year_level,
+          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')) AS college,
+          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), '')) AS program,
+          COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(mar.institution), '')) AS institution,
+          COALESCE(mar.event_id::TEXT, NULLIF(TRIM(ae.name), '')) AS event_key,
+          GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
+          COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
+          mar.updated_at
+        FROM manual_attendance_records mar
+        LEFT JOIN attendance_events ae ON ae.id = mar.event_id
+        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
+        WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+      ), merged AS (
+        SELECT
+          school_year_id,
+          LOWER(TRIM(student_id)) AS normalized_student_id,
+          MAX(student_id) AS student_id,
+          COALESCE(NULLIF(MAX(name), ''), MAX(student_id)) AS name,
+          COALESCE(NULLIF(MAX(year_level), ''), '') AS year_level,
+          COALESCE(NULLIF(MAX(college), ''), '') AS college,
+          COALESCE(NULLIF(MAX(program), ''), '') AS program,
+          COALESCE(NULLIF(MAX(institution), ''), '') AS institution,
+          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS attended_events,
+          GREATEST(0, MAX(no_of_absences))::INT AS total_absences,
+          MAX(scanned_at) AS latest_scanned_at,
+          MAX(updated_at) AS source_updated_at
+        FROM source_records
+        GROUP BY school_year_id, LOWER(TRIM(student_id))
+      )
       INSERT INTO attendance_final_results (
         school_year_id,
         import_id,
@@ -3330,43 +3391,26 @@ async function refreshAttendanceFinalResultsWithClient(
         source_updated_at
       )
       SELECT
-        ar.school_year_id,
-        ar.import_id,
-        ar.student_id,
-        COALESCE(NULLIF(MAX(s.name), ''), NULLIF(MAX(ar.name), ''), ar.student_id) AS name,
-        COALESCE(NULLIF(MAX(s.year_level), ''), NULLIF(MAX(ar.year_level), '')) AS year_level,
-        COALESCE(NULLIF(MAX(s.college), ''), NULLIF(MAX(ar.college), '')) AS college,
-        COALESCE(NULLIF(MAX(s.program), ''), NULLIF(MAX(ar.program), '')) AS program,
-        COALESCE(NULLIF(MAX(s.institution), ''), NULLIF(MAX(ar.institution), '')) AS institution,
-        COUNT(DISTINCT COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), ar.id::TEXT))::INT AS attended_events,
-        GREATEST(0, MAX(COALESCE(ar.no_of_absences, 0)))::INT AS total_absences,
+        school_year_id,
+        NULL::uuid AS import_id,
+        student_id,
+        name,
+        NULLIF(year_level, ''),
+        NULLIF(college, ''),
+        NULLIF(program, ''),
+        NULLIF(institution, ''),
+        attended_events,
+        total_absences,
         CASE
-          WHEN GREATEST(0, MAX(COALESCE(ar.no_of_absences, 0)))::INT <= 0 THEN 'perfect_attendance'
+          WHEN total_absences <= 0 THEN 'perfect_attendance'
           ELSE 'with_absences'
         END AS attendance_status,
-        MAX(COALESCE(ar.scanned_at, ar.created_at)) AS latest_scanned_at,
-        MAX(ar.updated_at) AS source_updated_at
-      FROM attendance_records ar
-      LEFT JOIN attendance_events ae ON ae.id = ar.event_id
-      LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
-      ${whereSql}
-      GROUP BY ar.school_year_id, ar.import_id, ar.student_id
-      ON CONFLICT (school_year_id, import_id, (LOWER(TRIM(student_id))))
-      DO UPDATE SET
-        name = EXCLUDED.name,
-        year_level = EXCLUDED.year_level,
-        college = EXCLUDED.college,
-        program = EXCLUDED.program,
-        institution = EXCLUDED.institution,
-        attended_events = EXCLUDED.attended_events,
-        total_absences = EXCLUDED.total_absences,
-        attendance_status = EXCLUDED.attendance_status,
-        latest_scanned_at = EXCLUDED.latest_scanned_at,
-        source_updated_at = EXCLUDED.source_updated_at,
-        updated_at = NOW()
+        latest_scanned_at,
+        source_updated_at
+      FROM merged
       RETURNING *
     `,
-    params,
+    [schoolYearId],
   );
 
   return result.rows;
@@ -3375,24 +3419,30 @@ async function refreshAttendanceFinalResultsWithClient(
 async function refreshPenaltyResultsForSchoolYearWithClient(
   client: PoolClient,
   schoolYearId?: string,
-  calculationScopeKey?: string,
+  _calculationScopeKey?: string,
 ) {
   const result = await client.query<PenaltyResultRecord>(
     `
       WITH totals AS (
         SELECT
-          school_year_id,
-          student_id,
-          name,
-          total_absences::INT AS no_of_absences,
-          penalty_id,
-          COALESCE(prescribed_penalty, 'No prescribed penalty configured.') AS prescribed_penalty,
-          'calculation_results'::TEXT AS source_table,
-          id AS source_record_id
-        FROM calculation_results
-        WHERE ($1::uuid IS NULL OR school_year_id = $1::uuid)
-          AND ($2::TEXT IS NULL OR calculation_scope_key = $2::TEXT)
-          AND total_absences > 0
+          afr.school_year_id,
+          afr.student_id,
+          afr.name,
+          afr.total_absences::INT AS no_of_absences,
+          penalty.id AS penalty_id,
+          COALESCE(penalty.prescribed_penalty, 'No prescribed penalty configured.') AS prescribed_penalty,
+          'attendance_final_results'::TEXT AS source_table,
+          afr.id AS source_record_id
+        FROM attendance_final_results afr
+        LEFT JOIN LATERAL (
+          SELECT id, prescribed_penalty
+          FROM penalties
+          WHERE no_of_absences <= afr.total_absences
+          ORDER BY no_of_absences DESC
+          LIMIT 1
+        ) penalty ON afr.total_absences > 0
+        WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
+          AND afr.total_absences > 0
       )
       INSERT INTO penalty_results (
         school_year_id,
@@ -3427,24 +3477,23 @@ async function refreshPenaltyResultsForSchoolYearWithClient(
         updated_at = NOW()
       RETURNING *
     `,
-    [schoolYearId ?? null, calculationScopeKey ?? null],
+    [schoolYearId ?? null],
   );
 
   await client.query(
     `
       DELETE FROM penalty_results pr
       WHERE ($1::uuid IS NULL OR pr.school_year_id = $1::uuid)
-        AND pr.source_table = 'calculation_results'
+        AND pr.source_table = 'attendance_final_results'
         AND NOT EXISTS (
           SELECT 1
-          FROM calculation_results cr
-          WHERE cr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
-            AND LOWER(TRIM(cr.student_id)) = LOWER(TRIM(pr.student_id))
-            AND cr.total_absences > 0
-            AND ($2::TEXT IS NULL OR cr.calculation_scope_key = $2::TEXT)
+          FROM attendance_final_results afr
+          WHERE afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
+            AND LOWER(TRIM(afr.student_id)) = LOWER(TRIM(pr.student_id))
+            AND afr.total_absences > 0
         )
     `,
-    [schoolYearId ?? null, calculationScopeKey ?? null],
+    [schoolYearId ?? null],
   );
 
   return result.rows;

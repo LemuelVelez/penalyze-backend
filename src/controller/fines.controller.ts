@@ -13,6 +13,7 @@ import {
   seedDefaultPenalties,
   updateFineStatus,
   updatePenalty as updatePenaltyRecord,
+  updatePenaltyResult,
   updatePenaltyResultStatus,
   upsertPenalty
 } from "../services/fines.service";
@@ -53,6 +54,17 @@ function getPenaltyPayload(req: Request) {
     prescribedPenalty: String(req.body?.prescribedPenalty ?? req.body?.prescribed_penalty ?? "").trim()
   };
 }
+
+function getPenaltyResultPayload(req: Request) {
+  return {
+    studentId: String(req.body?.studentId ?? req.body?.student_id ?? "").trim(),
+    name: String(req.body?.name ?? "").trim(),
+    noOfAbsences: Number(req.body?.noOfAbsences ?? req.body?.no_of_absences ?? 0),
+    prescribedPenalty: String(req.body?.prescribedPenalty ?? req.body?.prescribed_penalty ?? "").trim(),
+    status: parseFineStatus(req.body?.status),
+  };
+}
+
 
 function getZeroAttendancePayload(req: Request) {
   return {
@@ -211,6 +223,7 @@ export async function refreshPenaltyResultRows(req: Request, res: Response, next
   }
 }
 
+
 export async function updatePenaltyResultRowStatus(req: Request, res: Response, next: NextFunction) {
   try {
     const id = getRouteParam(req, "id");
@@ -228,6 +241,22 @@ export async function updatePenaltyResultRowStatus(req: Request, res: Response, 
 
     const row = await updatePenaltyResultStatus(id, status);
     res.json({ message: "Penalty result status updated.", data: row });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function updatePenaltyResultRow(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "Penalty result ID is required." });
+      return;
+    }
+
+    const row = await updatePenaltyResult(id, getPenaltyResultPayload(req));
+    res.json({ message: "Penalty result updated.", data: row });
   } catch (error) {
     next(error);
   }

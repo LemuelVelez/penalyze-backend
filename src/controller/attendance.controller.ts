@@ -33,6 +33,11 @@ const MAX_FILE_SIZE = Number(
 const ALLOWED_MIME_TYPES = new Set([
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "application/vnd.ms-excel",
+  "application/vnd.ms-excel.sheet.macroEnabled.12",
+  "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+  "application/vnd.ms-excel.template.macroEnabled.12",
+  "application/vnd.oasis.opendocument.spreadsheet",
   "text/plain",
   "text/csv",
   "application/csv",
@@ -55,7 +60,7 @@ export const attendanceUpload = multer({
 
     callback(
       new Error(
-        "Unsupported file. Please upload Excel, TXT/CSV, DOC, or DOCX.",
+        "Unsupported file. Please upload Excel, CSV, or TXT.",
       ),
     );
   },
