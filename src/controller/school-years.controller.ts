@@ -4,9 +4,11 @@ import {
   activateSchoolYear,
   assignCurrentRecordsToSchoolYear,
   createSchoolYear,
+  deleteSchoolYear,
   deleteSchoolYearRecords,
   listSchoolYears,
   transferSchoolYearRecords,
+  updateSchoolYear,
 } from "../services/school-years.service";
 
 function getRouteParam(req: Request, key: string) {
@@ -39,6 +41,45 @@ export async function save(req: Request, res: Response, next: NextFunction) {
     });
 
     res.status(201).json({ message: "School year saved successfully.", data: row });
+  } catch (error) {
+    next(error);
+  }
+}
+
+
+export async function update(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "School year ID is required." });
+      return;
+    }
+
+    const row = await updateSchoolYear(id, {
+      name: req.body?.name,
+      startsAt: req.body?.startsAt ?? req.body?.starts_at,
+      endsAt: req.body?.endsAt ?? req.body?.ends_at,
+      isActive: Boolean(req.body?.isActive ?? req.body?.is_active),
+    });
+
+    res.json({ message: "School year updated successfully.", data: row });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function remove(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "School year ID is required." });
+      return;
+    }
+
+    const data = await deleteSchoolYear(id);
+    res.json({ message: "School year deleted successfully.", data });
   } catch (error) {
     next(error);
   }
@@ -99,7 +140,10 @@ export async function transfer(req: Request, res: Response, next: NextFunction) 
       eventIds: toStringArray(req.body?.eventIds ?? req.body?.event_ids),
       importIds: toStringArray(req.body?.importIds ?? req.body?.import_ids),
       attendanceRecordIds: toStringArray(req.body?.attendanceRecordIds ?? req.body?.attendance_record_ids),
+      finalResultIds: toStringArray(req.body?.finalResultIds ?? req.body?.final_result_ids),
+      manualRecordIds: toStringArray(req.body?.manualRecordIds ?? req.body?.manual_record_ids),
       fineIds: toStringArray(req.body?.fineIds ?? req.body?.fine_ids),
+      penaltyResultIds: toStringArray(req.body?.penaltyResultIds ?? req.body?.penalty_result_ids),
     });
 
     res.json({ message: "Records transferred successfully.", data });

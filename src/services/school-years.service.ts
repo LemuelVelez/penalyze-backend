@@ -16,7 +16,10 @@ export type TransferSchoolYearRecordsInput = {
   eventIds?: string[];
   importIds?: string[];
   attendanceRecordIds?: string[];
+  finalResultIds?: string[];
+  manualRecordIds?: string[];
   fineIds?: string[];
+  penaltyResultIds?: string[];
 };
 
 export type TransferSchoolYearRecordsResult = {
@@ -259,15 +262,113 @@ export async function activateSchoolYear(id: string) {
   });
 }
 
+
+export async function updateSchoolYear(id: string, input: SchoolYearInput) {
+  const cleanInput = parseSchoolYearInput(input);
+
+  return withTransaction(async (client) => {
+    await getSchoolYearById(client, id);
+
+    if (cleanInput.isActive) {
+      await client.query("UPDATE school_years SET is_active = FALSE WHERE is_active = TRUE AND id <> $1", [id]);
+    }
+
+    const result = await client.query<SchoolYearRecord>(
+      `
+        UPDATE school_years
+        SET name = $2,
+            starts_at = $3,
+            ends_at = $4,
+            is_active = $5,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING *
+      `,
+      [id, cleanInput.name, cleanInput.startsAt, cleanInput.endsAt, cleanInput.isActive],
+    );
+
+    return result.rows[0];
+  });
+}
+
+async function deleteSchoolYearLinkedRecords(
+  client: PoolClient,
+  schoolYear: SchoolYearRecord,
+): Promise<SchoolYearRecordActionResult> {
+  const penaltyResultDelete = await client.query(
+    "DELETE FROM penalty_results WHERE school_year_id = $1",
+    [schoolYear.id],
+  );
+  const finalResultDelete = await client.query(
+    "DELETE FROM attendance_final_results WHERE school_year_id = $1",
+    [schoolYear.id],
+  );
+  const manualRecordDelete = await client.query(
+    "DELETE FROM manual_attendance_records WHERE school_year_id = $1",
+    [schoolYear.id],
+  );
+  const fineDelete = await client.query(
+    "DELETE FROM fines WHERE school_year_id = $1",
+    [schoolYear.id],
+  );
+  const recordDelete = await client.query(
+    "DELETE FROM attendance_records WHERE school_year_id = $1",
+    [schoolYear.id],
+  );
+  const importDelete = await client.query(
+    "DELETE FROM attendance_imports WHERE school_year_id = $1",
+    [schoolYear.id],
+  );
+  const eventDelete = await client.query(
+    "DELETE FROM attendance_events WHERE school_year_id = $1",
+    [schoolYear.id],
+  );
+
+  return {
+    schoolYear,
+    penaltyResultsDeleted: Number(penaltyResultDelete.rowCount ?? 0),
+    finalResultsDeleted: Number(finalResultDelete.rowCount ?? 0),
+    manualRecordsDeleted: Number(manualRecordDelete.rowCount ?? 0),
+    finesDeleted: Number(fineDelete.rowCount ?? 0),
+    attendanceRecordsDeleted: Number(recordDelete.rowCount ?? 0),
+    importsDeleted: Number(importDelete.rowCount ?? 0),
+    eventsDeleted: Number(eventDelete.rowCount ?? 0),
+  };
+}
+
+export async function deleteSchoolYear(
+  schoolYearId: string,
+): Promise<SchoolYearRecordActionResult> {
+  return withTransaction(async (client) => {
+    const schoolYear = await getSchoolYearById(client, schoolYearId);
+    const result = await deleteSchoolYearLinkedRecords(client, schoolYear);
+
+    await client.query("DELETE FROM school_years WHERE id = $1", [schoolYear.id]);
+
+    return result;
+  });
+}
+
 export async function transferSchoolYearRecords(
   input: TransferSchoolYearRecordsInput,
 ): Promise<TransferSchoolYearRecordsResult> {
   const eventIds = uniqueCleanIds(input.eventIds);
   const importIds = uniqueCleanIds(input.importIds);
   const attendanceRecordIds = uniqueCleanIds(input.attendanceRecordIds);
+  const finalResultIds = uniqueCleanIds(input.finalResultIds);
+  const manualRecordIds = uniqueCleanIds(input.manualRecordIds);
   const fineIds = uniqueCleanIds(input.fineIds);
+  const penaltyResultIds = uniqueCleanIds(input.penaltyResultIds);
 
-  if (!eventIds.length && !importIds.length && !attendanceRecordIds.length && !fineIds.length) {
+  if (
+    !eventIds.length &&
+    !importIds.length &&
+    !attendanceRecordIds.length &&
+    !finalResultIds.length &&
+    !manualRecordIds.length &&
+    !fineIds.length &&
+    !penaltyResultIds.length
+  ) {
     throw createValidationError("Please select at least one record to transfer.");
   }
 
@@ -292,7 +393,7 @@ export async function transferSchoolYearRecords(
           `
             UPDATE attendance_imports
             SET school_year_id = $3
-            WHERE ($1::uuid[] = '{}'::uuid[] OR id = ANY($1::uuid[]))
+            WHERE ($1::uuid[] <> '{}'::uuid[] AND id = ANY($1::uuid[]))
                OR ($2::uuid[] <> '{}'::uuid[] AND event_id = ANY($2::uuid[]))
           `,
           [importIds, eventIds, targetSchoolYear.id],
@@ -338,34 +439,34 @@ export async function transferSchoolYearRecords(
     const finalResultUpdate = await client.query(
       `
         UPDATE attendance_final_results
-        SET school_year_id = $2,
+        SET school_year_id = $3,
             updated_at = NOW()
-        WHERE $1::uuid[] <> '{}'::uuid[]
-          AND import_id = ANY($1::uuid[])
+        WHERE ($1::uuid[] <> '{}'::uuid[] AND id = ANY($1::uuid[]))
+           OR ($2::uuid[] <> '{}'::uuid[] AND import_id = ANY($2::uuid[]))
       `,
-      [importIds, targetSchoolYear.id],
+      [finalResultIds, importIds, targetSchoolYear.id],
     );
 
     const manualRecordUpdate = await client.query(
       `
         UPDATE manual_attendance_records
-        SET school_year_id = $2,
+        SET school_year_id = $3,
             updated_at = NOW()
-        WHERE $1::uuid[] <> '{}'::uuid[]
-          AND event_id = ANY($1::uuid[])
+        WHERE ($1::uuid[] <> '{}'::uuid[] AND id = ANY($1::uuid[]))
+           OR ($2::uuid[] <> '{}'::uuid[] AND event_id = ANY($2::uuid[]))
       `,
-      [eventIds, targetSchoolYear.id],
+      [manualRecordIds, eventIds, targetSchoolYear.id],
     );
 
     const penaltyResultUpdate = await client.query(
       `
         UPDATE penalty_results
-        SET school_year_id = $2,
+        SET school_year_id = $3,
             updated_at = NOW()
-        WHERE $1::uuid[] <> '{}'::uuid[]
-          AND source_record_id = ANY($1::uuid[])
+        WHERE ($1::uuid[] <> '{}'::uuid[] AND id = ANY($1::uuid[]))
+           OR ($2::uuid[] <> '{}'::uuid[] AND source_record_id = ANY($2::uuid[]))
       `,
-      [fineIds, targetSchoolYear.id],
+      [penaltyResultIds, fineIds, targetSchoolYear.id],
     );
 
     if (affectedRecordIds.size) {
@@ -480,44 +581,6 @@ export async function deleteSchoolYearRecords(
   return withTransaction(async (client) => {
     const schoolYear = await getSchoolYearById(client, schoolYearId);
 
-    const penaltyResultDelete = await client.query(
-      "DELETE FROM penalty_results WHERE school_year_id = $1",
-      [schoolYear.id],
-    );
-    const finalResultDelete = await client.query(
-      "DELETE FROM attendance_final_results WHERE school_year_id = $1",
-      [schoolYear.id],
-    );
-    const manualRecordDelete = await client.query(
-      "DELETE FROM manual_attendance_records WHERE school_year_id = $1",
-      [schoolYear.id],
-    );
-    const fineDelete = await client.query(
-      "DELETE FROM fines WHERE school_year_id = $1",
-      [schoolYear.id],
-    );
-    const recordDelete = await client.query(
-      "DELETE FROM attendance_records WHERE school_year_id = $1",
-      [schoolYear.id],
-    );
-    const importDelete = await client.query(
-      "DELETE FROM attendance_imports WHERE school_year_id = $1",
-      [schoolYear.id],
-    );
-    const eventDelete = await client.query(
-      "DELETE FROM attendance_events WHERE school_year_id = $1",
-      [schoolYear.id],
-    );
-
-    return {
-      schoolYear,
-      penaltyResultsDeleted: Number(penaltyResultDelete.rowCount ?? 0),
-      finalResultsDeleted: Number(finalResultDelete.rowCount ?? 0),
-      manualRecordsDeleted: Number(manualRecordDelete.rowCount ?? 0),
-      finesDeleted: Number(fineDelete.rowCount ?? 0),
-      attendanceRecordsDeleted: Number(recordDelete.rowCount ?? 0),
-      importsDeleted: Number(importDelete.rowCount ?? 0),
-      eventsDeleted: Number(eventDelete.rowCount ?? 0),
-    };
+    return deleteSchoolYearLinkedRecords(client, schoolYear);
   });
 }

@@ -752,7 +752,7 @@ export async function refreshPenaltyResults(options: { schoolYearId?: string } =
           name,
           SUM(no_of_absences)::INT AS no_of_absences,
           'manual_attendance_records'::TEXT AS source_table,
-          MAX(id)::UUID AS source_record_id
+          MAX(id::TEXT)::UUID AS source_record_id
         FROM manual_attendance_records
         ${whereSql}
         GROUP BY school_year_id, student_id, name
@@ -763,7 +763,7 @@ export async function refreshPenaltyResults(options: { schoolYearId?: string } =
           MAX(name) AS name,
           SUM(no_of_absences)::INT AS no_of_absences,
           MAX(source_table) AS source_table,
-          MAX(source_record_id) AS source_record_id
+          MAX(source_record_id::TEXT)::UUID AS source_record_id
         FROM source_absences
         GROUP BY school_year_id, student_id
         HAVING SUM(no_of_absences)::INT > 0

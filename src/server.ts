@@ -44,8 +44,10 @@ import {
   assignCurrent as assignCurrentSchoolYearRecords,
   deleteRecords as deleteSchoolYearRecords,
   index as schoolYears,
+  remove as deleteSchoolYear,
   save as saveSchoolYear,
-  transfer as transferSchoolYearRecords
+  transfer as transferSchoolYearRecords,
+  update as updateSchoolYear
 } from "./controller/school-years.controller";
 import { query } from "./lib/db";
 
@@ -124,6 +126,9 @@ app.patch("/api/school-years/transfer", transferSchoolYearRecords);
 app.patch("/api/school-years/:id/assign-current", assignCurrentSchoolYearRecords);
 app.delete("/api/school-years/:id/records", deleteSchoolYearRecords);
 app.patch("/api/school-years/:id/activate", activateSchoolYear);
+app.patch("/api/school-years/:id", updateSchoolYear);
+app.put("/api/school-years/:id", updateSchoolYear);
+app.delete("/api/school-years/:id", deleteSchoolYear);
 
 app.get("/api/attendance/events", attendanceEvents);
 app.post("/api/attendance/events", saveAttendanceEvent);
