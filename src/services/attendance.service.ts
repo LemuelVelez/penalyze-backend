@@ -55,6 +55,16 @@ export type DeletedAttendanceImportsResult = {
   deletedImports: AttendanceImportRecord[];
 };
 
+export type DeletedAttendanceFinalResultsResult = {
+  deletedCount: number;
+  deletedRecords: AttendanceFinalResultRecord[];
+};
+
+export type DeletedManualAttendanceRecordsResult = {
+  deletedCount: number;
+  deletedRecords: ManualAttendanceRecord[];
+};
+
 export type AttendanceEventInput = {
   schoolYearId?: string;
   school_year_id?: string;
@@ -1628,8 +1638,61 @@ async function deleteAttendanceImportRecords(
   client: PoolClient,
   importIds: string[],
 ) {
-  const uniqueImportIds = Array.from(new Set(importIds.filter(Boolean)));
+  const uniqueImportIds = uniqueCleanTextValues(importIds);
   if (!uniqueImportIds.length) return;
+
+  const finalResultIdsResult = await client.query<{ id: string }>(
+    `
+      SELECT id
+      FROM attendance_final_results
+      WHERE import_id = ANY($1::uuid[])
+    `,
+    [uniqueImportIds],
+  );
+  const finalResultIds = finalResultIdsResult.rows.map((row) => row.id);
+
+  const calculationResultIdsResult = await client.query<{ id: string }>(
+    `
+      SELECT id
+      FROM calculation_results
+      WHERE import_ids && $1::uuid[]
+    `,
+    [uniqueImportIds],
+  );
+  const calculationResultIds = calculationResultIdsResult.rows.map((row) => row.id);
+
+  if (finalResultIds.length || calculationResultIds.length) {
+    await client.query(
+      `
+        DELETE FROM penalty_results
+        WHERE (
+            source_table = 'attendance_final_results'
+            AND source_record_id::TEXT = ANY($1::TEXT[])
+          )
+          OR (
+            source_table = 'calculation_results'
+            AND source_record_id::TEXT = ANY($2::TEXT[])
+          )
+      `,
+      [finalResultIds, calculationResultIds],
+    );
+  }
+
+  await client.query(
+    `
+      DELETE FROM attendance_final_results
+      WHERE import_id = ANY($1::uuid[])
+    `,
+    [uniqueImportIds],
+  );
+
+  await client.query(
+    `
+      DELETE FROM calculation_results
+      WHERE import_ids && $1::uuid[]
+    `,
+    [uniqueImportIds],
+  );
 
   await client.query(
     `
@@ -2626,8 +2689,19 @@ export async function deleteAttendanceImport(importId: string) {
   });
 }
 
-export async function deleteAttendanceImports(): Promise<DeletedAttendanceImportsResult> {
+export async function deleteAttendanceImportsByIds(
+  importIds: string[],
+): Promise<DeletedAttendanceImportsResult> {
   return withTransaction(async (client) => {
+    const uniqueImportIds = uniqueCleanTextValues(importIds);
+
+    if (!uniqueImportIds.length) {
+      return {
+        deletedCount: 0,
+        deletedImports: [],
+      };
+    }
+
     const importsResult = await client.query<AttendanceImportRecord>(
       `
         SELECT
@@ -2638,8 +2712,56 @@ export async function deleteAttendanceImports(): Promise<DeletedAttendanceImport
           ae.event_end_at
         FROM attendance_imports ai
         LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+        WHERE ai.id = ANY($1::uuid[])
         ORDER BY ai.created_at DESC
       `,
+      [uniqueImportIds],
+    );
+
+    const deletedImports = importsResult.rows;
+    const idsToDelete = deletedImports.map((record) => record.id);
+
+    if (!idsToDelete.length) {
+      return {
+        deletedCount: 0,
+        deletedImports: [],
+      };
+    }
+
+    const collegeScopeKeys = await getAttendanceImportCollegeScopeKeys(
+      client,
+      idsToDelete,
+    );
+
+    await deleteAttendanceImportRecords(client, idsToDelete);
+    await syncAbsencesForAttendanceCollegeScopes(client, collegeScopeKeys);
+
+    return {
+      deletedCount: deletedImports.length,
+      deletedImports,
+    };
+  });
+}
+
+export async function deleteAttendanceImports(
+  schoolYearId?: string,
+): Promise<DeletedAttendanceImportsResult> {
+  return withTransaction(async (client) => {
+    const scopedSchoolYearId = cleanOptionalText(schoolYearId);
+    const importsResult = await client.query<AttendanceImportRecord>(
+      `
+        SELECT
+          ai.*,
+          ae.name AS event_name,
+          ae.event_order,
+          ae.event_start_at,
+          ae.event_end_at
+        FROM attendance_imports ai
+        LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+        ${scopedSchoolYearId ? "WHERE ai.school_year_id = $1" : ""}
+        ORDER BY ai.created_at DESC
+      `,
+      scopedSchoolYearId ? [scopedSchoolYearId] : [],
     );
 
     const deletedImports = importsResult.rows;
@@ -3615,4 +3737,143 @@ export async function listManualAttendanceRecords(
   );
 
   return result.rows;
+}
+
+export async function deleteAttendanceFinalResultsByIds(
+  ids: string[],
+): Promise<DeletedAttendanceFinalResultsResult> {
+  return withTransaction(async (client) => {
+    const uniqueIds = uniqueCleanTextValues(ids);
+
+    if (!uniqueIds.length) {
+      return {
+        deletedCount: 0,
+        deletedRecords: [],
+      };
+    }
+
+    const result = await client.query<AttendanceFinalResultRecord>(
+      `
+        SELECT
+          afr.*,
+          ai.event_id,
+          ae.name AS event_name,
+          ae.event_order,
+          ae.event_start_at,
+          ae.event_end_at
+        FROM attendance_final_results afr
+        LEFT JOIN attendance_imports ai ON ai.id = afr.import_id
+        LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+        WHERE afr.id = ANY($1::uuid[])
+        ORDER BY afr.created_at DESC
+      `,
+      [uniqueIds],
+    );
+    const records = result.rows;
+    const recordIds = records.map((record) => record.id);
+
+    if (!recordIds.length) {
+      return {
+        deletedCount: 0,
+        deletedRecords: [],
+      };
+    }
+
+    await client.query(
+      `
+        DELETE FROM penalty_results
+        WHERE source_table = 'attendance_final_results'
+          AND source_record_id::TEXT = ANY($1::TEXT[])
+      `,
+      [recordIds],
+    );
+
+    await client.query(
+      "DELETE FROM attendance_final_results WHERE id = ANY($1::uuid[])",
+      [recordIds],
+    );
+
+    return {
+      deletedCount: records.length,
+      deletedRecords: records,
+    };
+  });
+}
+
+export async function deleteAttendanceFinalResultsBySchoolYear(
+  schoolYearId: string,
+): Promise<DeletedAttendanceFinalResultsResult> {
+  const records = await listAttendanceFinalResults({
+    schoolYearId,
+    limit: 100000,
+    offset: 0,
+  });
+
+  return deleteAttendanceFinalResultsByIds(records.map((record) => record.id));
+}
+
+export async function deleteManualAttendanceRecordsByIds(
+  ids: string[],
+): Promise<DeletedManualAttendanceRecordsResult> {
+  return withTransaction(async (client) => {
+    const uniqueIds = uniqueCleanTextValues(ids);
+
+    if (!uniqueIds.length) {
+      return {
+        deletedCount: 0,
+        deletedRecords: [],
+      };
+    }
+
+    const result = await client.query<ManualAttendanceRecord>(
+      `
+        SELECT ${getManualRecordSelectSql()}
+        FROM manual_attendance_records mar
+        LEFT JOIN attendance_events ae ON ae.id = mar.event_id
+        WHERE mar.id = ANY($1::uuid[])
+        ORDER BY mar.created_at DESC
+      `,
+      [uniqueIds],
+    );
+    const records = result.rows;
+    const recordIds = records.map((record) => record.id);
+
+    if (!recordIds.length) {
+      return {
+        deletedCount: 0,
+        deletedRecords: [],
+      };
+    }
+
+    await client.query(
+      `
+        DELETE FROM penalty_results
+        WHERE source_table = 'manual_attendance_records'
+          AND source_record_id::TEXT = ANY($1::TEXT[])
+      `,
+      [recordIds],
+    );
+
+    await client.query(
+      "DELETE FROM manual_attendance_records WHERE id = ANY($1::uuid[])",
+      [recordIds],
+    );
+
+    return {
+      deletedCount: records.length,
+      deletedRecords: records,
+    };
+  });
+}
+
+export async function deleteManualAttendanceRecordsBySchoolYear(
+  schoolYearId: string,
+): Promise<DeletedManualAttendanceRecordsResult> {
+  const records = await listManualAttendanceRecords({
+    schoolYearId,
+    limit: 100000,
+    offset: 0,
+  });
+
+  return deleteManualAttendanceRecordsByIds(records.map((record) => record.id));
 }

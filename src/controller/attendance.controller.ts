@@ -4,9 +4,14 @@ import multer from "multer";
 import {
   createAttendanceEvent,
   deleteAttendanceEvent,
+  deleteAttendanceFinalResultsByIds,
+  deleteAttendanceFinalResultsBySchoolYear,
   deleteAttendanceImport,
   deleteAttendanceImports,
+  deleteAttendanceImportsByIds,
   deleteAttendanceRecord,
+  deleteManualAttendanceRecordsByIds,
+  deleteManualAttendanceRecordsBySchoolYear,
   getAttendanceImport,
   listAttendanceEvents,
   listAttendanceFinalResults,
@@ -76,13 +81,35 @@ function getRouteParam(req: Request, key: string) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function getBodyRecordIds(req: Request) {
-  const value = req.body?.recordIds ?? req.body?.ids;
-  if (!Array.isArray(value)) return [];
+function parseRecordIds(value: unknown) {
+  const values = Array.isArray(value) ? value : [value];
 
-  return value
-    .map((id) => String(id ?? "").trim())
-    .filter(Boolean);
+  return Array.from(
+    new Set(
+      values
+        .flatMap((item) => String(item ?? "").split(","))
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function getBodyRecordIds(req: Request) {
+  return parseRecordIds(req.body?.recordIds ?? req.body?.ids);
+}
+
+function getRequestRecordIds(req: Request) {
+  return parseRecordIds(
+    req.body?.recordIds ??
+      req.body?.ids ??
+      req.query.recordIds ??
+      req.query.ids,
+  );
+}
+
+function getRequestSchoolYearId(req: Request) {
+  return String(req.body?.schoolYearId ?? req.body?.school_year_id ?? req.query.schoolYearId ?? "")
+    .trim();
 }
 
 function parseImportIds(value: unknown) {
@@ -601,15 +628,138 @@ export async function deleteImport(
 }
 
 export async function deleteImports(
-  _req: Request,
+  req: Request,
   res: Response,
   next: NextFunction,
 ) {
   try {
-    const result = await deleteAttendanceImports();
+    const importIds = getRequestRecordIds(req);
+    const schoolYearId = getRequestSchoolYearId(req);
+    const result = importIds.length
+      ? await deleteAttendanceImportsByIds(importIds)
+      : await deleteAttendanceImports(schoolYearId || undefined);
+
     res.json({
       message: "Attendance imports deleted successfully.",
       data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteFinalResult(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "Final attendance result ID is required." });
+      return;
+    }
+
+    const result = await deleteAttendanceFinalResultsByIds([id]);
+    const record = result.deletedRecords[0];
+
+    if (!record) {
+      res.status(404).json({ message: "Final attendance result not found." });
+      return;
+    }
+
+    res.json({
+      message: "Final attendance result deleted successfully.",
+      data: record,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteFinalResults(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const ids = getRequestRecordIds(req);
+    const schoolYearId = getRequestSchoolYearId(req);
+
+    if (!ids.length && !schoolYearId) {
+      res.status(400).json({
+        message: "Final attendance result IDs or school year ID are required.",
+      });
+      return;
+    }
+
+    const result = ids.length
+      ? await deleteAttendanceFinalResultsByIds(ids)
+      : await deleteAttendanceFinalResultsBySchoolYear(schoolYearId);
+
+    res.json({
+      message: "Final attendance results deleted successfully.",
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteManualRecords(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const ids = getRequestRecordIds(req);
+    const schoolYearId = getRequestSchoolYearId(req);
+
+    if (!ids.length && !schoolYearId) {
+      res.status(400).json({
+        message: "Manual attendance record IDs or school year ID are required.",
+      });
+      return;
+    }
+
+    const result = ids.length
+      ? await deleteManualAttendanceRecordsByIds(ids)
+      : await deleteManualAttendanceRecordsBySchoolYear(schoolYearId);
+
+    res.json({
+      message: "Manual attendance records deleted successfully.",
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteManualRecord(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "Manual attendance record ID is required." });
+      return;
+    }
+
+    const result = await deleteManualAttendanceRecordsByIds([id]);
+    const record = result.deletedRecords[0];
+
+    if (!record) {
+      res.status(404).json({ message: "Manual attendance record not found." });
+      return;
+    }
+
+    res.json({
+      message: "Manual attendance record deleted successfully.",
+      data: record,
     });
   } catch (error) {
     next(error);

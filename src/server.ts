@@ -6,8 +6,12 @@ import {
   attendanceUpload,
   calculationResults as attendanceCalculationResults,
   deleteEvent as deleteAttendanceEvent,
+  deleteFinalResult as deleteAttendanceFinalResult,
+  deleteFinalResults as deleteAttendanceFinalResults,
   deleteImport as deleteAttendanceImport,
   deleteImports as deleteAttendanceImports,
+  deleteManualRecord as deleteAttendanceManualRecord,
+  deleteManualRecords as deleteAttendanceManualRecords,
   deleteRecord as deleteAttendanceRecord,
   events as attendanceEvents,
   finalResults as attendanceFinalResults,
@@ -28,6 +32,8 @@ import {
 } from "./controller/attendance.controller";
 import {
   deletePenalty,
+  deletePenaltyResultRow,
+  deletePenaltyResultRows,
   fines,
   matchPenalty,
   penalties,
@@ -139,10 +145,14 @@ app.put("/api/attendance/events/:eventId", updateAttendanceEvent);
 app.patch("/api/attendance/events/:eventId", updateAttendanceEvent);
 app.delete("/api/attendance/events/:eventId", deleteAttendanceEvent);
 app.get("/api/attendance/final-results", attendanceFinalResults);
+app.delete("/api/attendance/final-results", deleteAttendanceFinalResults);
+app.delete("/api/attendance/final-results/:id", deleteAttendanceFinalResult);
 app.post("/api/attendance/final-results/refresh", refreshAttendanceFinalResults);
 app.get("/api/attendance/calculation-results", attendanceCalculationResults);
 app.post("/api/attendance/calculation-results/refresh", refreshAttendanceCalculationResults);
 app.get("/api/attendance/manual-records", attendanceManualRecords);
+app.delete("/api/attendance/manual-records", deleteAttendanceManualRecords);
+app.delete("/api/attendance/manual-records/:id", deleteAttendanceManualRecord);
 app.get("/api/attendance", attendanceIndex);
 app.get("/api/attendance/imports", attendanceImports);
 app.delete("/api/attendance/imports", deleteAttendanceImports);
@@ -161,6 +171,8 @@ app.delete("/api/attendance/:id", deleteAttendanceRecord);
 app.get("/api/fines", fines);
 app.get("/api/fines/summary", summary);
 app.get("/api/fines/penalty-results", penaltyResults);
+app.delete("/api/fines/penalty-results", deletePenaltyResultRows);
+app.delete("/api/fines/penalty-results/:id", deletePenaltyResultRow);
 app.post("/api/fines/penalty-results/refresh", refreshPenaltyResultRows);
 app.put("/api/fines/penalty-results/:id", updatePenaltyResultRow);
 app.patch("/api/fines/penalty-results/:id", updatePenaltyResultRow);

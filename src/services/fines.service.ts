@@ -12,6 +12,11 @@ import { query } from "../lib/db";
 
 export const ZERO_ATTENDANCE_REMARK = "Zero attendance registration from landing page.";
 
+export type DeletedPenaltyResultsResult = {
+  deletedCount: number;
+  deletedRecords: PenaltyResultRecord[];
+};
+
 type ZeroAttendanceFineInput = {
   schoolYearId?: string | null;
   studentId: string;
@@ -38,6 +43,12 @@ function validatePenaltyInput(noOfAbsences: number, prescribedPenalty: string) {
 function cleanOptionalText(value: unknown) {
   const cleanValue = String(value ?? "").trim();
   return cleanValue || null;
+}
+
+function uniqueCleanTextValues(values: Array<string | null | undefined>) {
+  return Array.from(
+    new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean)),
+  );
 }
 
 function normalizeAcademicScopeValue(value: unknown) {
@@ -953,4 +964,58 @@ export async function updatePenaltyResult(
   }
 
   return result.rows[0];
+}
+
+export async function deletePenaltyResultsByIds(
+  ids: string[],
+): Promise<DeletedPenaltyResultsResult> {
+  const uniqueIds = uniqueCleanTextValues(ids);
+
+  if (!uniqueIds.length) {
+    return {
+      deletedCount: 0,
+      deletedRecords: [],
+    };
+  }
+
+  const result = await query<PenaltyResultRecord>(
+    `
+      DELETE FROM penalty_results
+      WHERE id = ANY($1::uuid[])
+      RETURNING *
+    `,
+    [uniqueIds],
+  );
+
+  return {
+    deletedCount: result.rows.length,
+    deletedRecords: result.rows,
+  };
+}
+
+export async function deletePenaltyResultsBySchoolYear(
+  schoolYearId: string,
+): Promise<DeletedPenaltyResultsResult> {
+  const scopedSchoolYearId = cleanOptionalText(schoolYearId);
+
+  if (!scopedSchoolYearId) {
+    return {
+      deletedCount: 0,
+      deletedRecords: [],
+    };
+  }
+
+  const result = await query<PenaltyResultRecord>(
+    `
+      DELETE FROM penalty_results
+      WHERE school_year_id = $1
+      RETURNING *
+    `,
+    [scopedSchoolYearId],
+  );
+
+  return {
+    deletedCount: result.rows.length,
+    deletedRecords: result.rows,
+  };
 }

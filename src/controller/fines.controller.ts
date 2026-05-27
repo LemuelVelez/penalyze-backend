@@ -3,6 +3,8 @@ import { NextFunction, Request, Response } from "express";
 import { FineStatus } from "../database/model/schema.model";
 import {
   deletePenalty as deletePenaltyRecord,
+  deletePenaltyResultsByIds,
+  deletePenaltyResultsBySchoolYear,
   getFineSummary,
   getPenaltyByAbsences,
   listFines,
@@ -46,6 +48,33 @@ function parseImportIds(value: unknown) {
         .filter(Boolean),
     ),
   );
+}
+
+function parseRecordIds(value: unknown) {
+  const values = Array.isArray(value) ? value : [value];
+
+  return Array.from(
+    new Set(
+      values
+        .flatMap((item) => String(item ?? "").split(","))
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function getRequestRecordIds(req: Request) {
+  return parseRecordIds(
+    req.body?.recordIds ??
+      req.body?.ids ??
+      req.query.recordIds ??
+      req.query.ids,
+  );
+}
+
+function getRequestSchoolYearId(req: Request) {
+  return String(req.body?.schoolYearId ?? req.body?.school_year_id ?? req.query.schoolYearId ?? "")
+    .trim();
 }
 
 function getPenaltyPayload(req: Request) {
@@ -257,6 +286,51 @@ export async function updatePenaltyResultRow(req: Request, res: Response, next: 
 
     const row = await updatePenaltyResult(id, getPenaltyResultPayload(req));
     res.json({ message: "Penalty result updated.", data: row });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deletePenaltyResultRow(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "Penalty result ID is required." });
+      return;
+    }
+
+    const result = await deletePenaltyResultsByIds([id]);
+    const row = result.deletedRecords[0];
+
+    if (!row) {
+      res.status(404).json({ message: "Penalty result not found." });
+      return;
+    }
+
+    res.json({ message: "Penalty result deleted.", data: row });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deletePenaltyResultRows(req: Request, res: Response, next: NextFunction) {
+  try {
+    const ids = getRequestRecordIds(req);
+    const schoolYearId = getRequestSchoolYearId(req);
+
+    if (!ids.length && !schoolYearId) {
+      res.status(400).json({
+        message: "Penalty result IDs or school year ID are required.",
+      });
+      return;
+    }
+
+    const result = ids.length
+      ? await deletePenaltyResultsByIds(ids)
+      : await deletePenaltyResultsBySchoolYear(schoolYearId);
+
+    res.json({ message: "Penalty results deleted.", data: result });
   } catch (error) {
     next(error);
   }
