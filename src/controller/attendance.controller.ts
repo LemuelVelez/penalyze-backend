@@ -30,26 +30,53 @@ import {
   updateAttendanceRecords as updateAttendanceRecordsService,
   UploadedAttendanceFile,
 } from "../services/attendance.service";
-import { AttendanceImportProgress } from "../database/model/schema.model";
+import {
+  ACCEPTED_ATTENDANCE_EXTENSIONS,
+  AttendanceImportProgress,
+} from "../database/model/schema.model";
 
 const MAX_FILE_SIZE = Number(
   process.env.ATTENDANCE_UPLOAD_MAX_BYTES ?? 10 * 1024 * 1024,
 );
-const ALLOWED_MIME_TYPES = new Set([
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  "application/vnd.ms-excel",
-  "application/vnd.ms-excel.sheet.macroEnabled.12",
-  "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
-  "application/vnd.ms-excel.template.macroEnabled.12",
-  "application/vnd.oasis.opendocument.spreadsheet",
-  "text/plain",
-  "text/csv",
-  "application/csv",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/msword",
-  "application/octet-stream",
-]);
+const ALLOWED_MIME_TYPES = new Set(
+  [
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-excel.sheet.macroEnabled.12",
+    "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+    "application/vnd.ms-excel.template.macroEnabled.12",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "text/plain",
+    "text/csv",
+    "application/csv",
+    "application/octet-stream",
+  ].map((type) => type.toLowerCase()),
+);
+
+function getUploadFileExtension(fileName: string) {
+  const extension = String(fileName ?? "")
+    .trim()
+    .toLowerCase()
+    .match(/\.[a-z0-9]+$/)?.[0];
+
+  return extension ?? "";
+}
+
+function isSupportedAttendanceUpload(
+  file: Pick<UploadedAttendanceFile, "originalname" | "mimetype">,
+) {
+  const extension = getUploadFileExtension(file.originalname);
+  const mimeType = String(file.mimetype ?? "")
+    .trim()
+    .toLowerCase();
+
+  return (
+    ACCEPTED_ATTENDANCE_EXTENSIONS.includes(extension as any) ||
+    !mimeType ||
+    ALLOWED_MIME_TYPES.has(mimeType)
+  );
+}
 
 export const attendanceUpload = multer({
   storage: multer.memoryStorage(),
@@ -58,16 +85,12 @@ export const attendanceUpload = multer({
     files: 1,
   },
   fileFilter: (_req, file, callback) => {
-    if (!file.mimetype || ALLOWED_MIME_TYPES.has(file.mimetype)) {
+    if (isSupportedAttendanceUpload(file)) {
       callback(null, true);
       return;
     }
 
-    callback(
-      new Error(
-        "Unsupported file. Please upload Excel, CSV, or TXT.",
-      ),
-    );
+    callback(new Error("Unsupported file. Please upload Excel, CSV, or TXT."));
   },
 });
 
