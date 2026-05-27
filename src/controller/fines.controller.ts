@@ -34,6 +34,19 @@ function getRouteParam(req: Request, key: string) {
   return Array.isArray(value) ? value[0] : value;
 }
 
+function parseImportIds(value: unknown) {
+  const values = Array.isArray(value) ? value : [value];
+
+  return Array.from(
+    new Set(
+      values
+        .flatMap((item) => String(item ?? "").split(","))
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
 function getPenaltyPayload(req: Request) {
   return {
     noOfAbsences: Number(req.body?.noOfAbsences ?? req.body?.no_of_absences),
@@ -189,6 +202,7 @@ export async function refreshPenaltyResultRows(req: Request, res: Response, next
   try {
     const rows = await refreshPenaltyResults({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+      importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
     });
 
     res.json({ message: "Penalty results refreshed.", data: rows });

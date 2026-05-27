@@ -6,6 +6,7 @@ export const TABLES = {
   attendanceImports: "attendance_imports",
   attendanceRecords: "attendance_records",
   attendanceFinalResults: "attendance_final_results",
+  calculationResults: "calculation_results",
   manualAttendanceRecords: "manual_attendance_records",
   penalties: "penalties",
   penaltyResults: "penalty_results",
@@ -64,6 +65,7 @@ export type AttendanceEventRecord = {
   event_end_at: Date | string | null;
   description: string | null;
   attendees_count: number;
+  event_order: number;
   created_at: Date;
   updated_at: Date;
 };
@@ -137,6 +139,32 @@ export type AttendanceFinalResultRecord = {
   attendance_status: string;
   latest_scanned_at: Date | string | null;
   source_updated_at: Date | string | null;
+  created_at: Date;
+  updated_at: Date;
+};
+
+export type CalculationResultRecord = {
+  id: string;
+  school_year_id: string | null;
+  calculation_scope_key: string;
+  import_ids: string[];
+  student_id: string;
+  name: string;
+  year_level: string | null;
+  college: string | null;
+  program: string | null;
+  institution: string | null;
+  attended_events: number;
+  imported_absences: number;
+  manual_absences: number;
+  total_absences: number;
+  attendance_status: string;
+  penalty_id: string | null;
+  prescribed_penalty: string | null;
+  source_record_count: number;
+  latest_scanned_at: Date | string | null;
+  source_updated_at: Date | string | null;
+  calculated_at: Date | string;
   created_at: Date;
   updated_at: Date;
 };

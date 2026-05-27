@@ -10,11 +10,13 @@ import {
   getAttendanceImport,
   listAttendanceEvents,
   listAttendanceFinalResults,
+  listCalculationResults,
   listAttendanceImports,
   listAttendanceRecords,
   listManualAttendanceRecords,
   previewAttendanceFile,
   refreshAttendanceFinalResults,
+  refreshCalculationResults,
   saveAttendanceFile,
   saveAttendanceRows,
   saveManualAttendanceRecord,
@@ -76,6 +78,19 @@ function getBodyRecordIds(req: Request) {
   return value
     .map((id) => String(id ?? "").trim())
     .filter(Boolean);
+}
+
+function parseImportIds(value: unknown) {
+  const values = Array.isArray(value) ? value : [value];
+
+  return Array.from(
+    new Set(
+      values
+        .flatMap((item) => String(item ?? "").split(","))
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  );
 }
 
 function getUploadedFile(req: Request) {
@@ -488,6 +503,38 @@ export async function refreshFinalResults(req: Request, res: Response, next: Nex
     });
 
     res.json({ message: "Final attendance results refreshed.", data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function calculationResults(req: Request, res: Response, next: NextFunction) {
+  try {
+    const limit = toPositiveInt(req.query.limit, 100);
+    const offset = toPositiveInt(req.query.offset, 0);
+    const records = await listCalculationResults({
+      schoolYearId: req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined,
+      importIds: parseImportIds(req.query.importIds),
+      studentId: req.query.studentId ? String(req.query.studentId).trim() : undefined,
+      college: req.query.college ? String(req.query.college).trim() : undefined,
+      limit,
+      offset,
+    });
+
+    res.json({ data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function refreshCalculationResultRows(req: Request, res: Response, next: NextFunction) {
+  try {
+    const records = await refreshCalculationResults({
+      schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+      importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
+    });
+
+    res.json({ message: "Calculation results refreshed.", data: records });
   } catch (error) {
     next(error);
   }

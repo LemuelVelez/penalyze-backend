@@ -686,6 +686,23 @@ type ListPenaltyResultsOptions = {
   offset?: number;
 };
 
+function normalizeImportIds(value: unknown) {
+  const values = Array.isArray(value) ? value : [value];
+
+  return Array.from(
+    new Set(
+      values
+        .flatMap((item) => String(item ?? "").split(","))
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  ).sort((left, right) => left.localeCompare(right));
+}
+
+function getCalculationScopeKey(importIds: string[]) {
+  return importIds.length ? importIds.join(":") : "";
+}
+
 export async function listPenaltyResults(options: ListPenaltyResultsOptions = {}) {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -725,61 +742,30 @@ export async function listPenaltyResults(options: ListPenaltyResultsOptions = {}
   return result.rows;
 }
 
-export async function refreshPenaltyResults(options: { schoolYearId?: string } = {}) {
+export async function refreshPenaltyResults(options: {
+  schoolYearId?: string;
+  importIds?: string[];
+} = {}) {
   const schoolYearId = cleanOptionalText(options.schoolYearId);
-  const whereSql = schoolYearId ? "WHERE school_year_id = $1" : "";
-  const params = schoolYearId ? [schoolYearId] : [];
+  const importIds = normalizeImportIds(options.importIds ?? []);
+  const calculationScopeKey = getCalculationScopeKey(importIds) || null;
 
   const result = await query<PenaltyResultRecord>(
     `
-      WITH source_absences AS (
+      WITH totals AS (
         SELECT
           school_year_id,
           student_id,
           name,
-          SUM(total_absences)::INT AS no_of_absences,
-          'attendance_final_results'::TEXT AS source_table,
-          NULL::UUID AS source_record_id
-        FROM attendance_final_results
-        ${whereSql}
-        GROUP BY school_year_id, student_id, name
-
-        UNION ALL
-
-        SELECT
-          school_year_id,
-          student_id,
-          name,
-          SUM(no_of_absences)::INT AS no_of_absences,
-          'manual_attendance_records'::TEXT AS source_table,
-          MAX(id::TEXT)::UUID AS source_record_id
-        FROM manual_attendance_records
-        ${whereSql}
-        GROUP BY school_year_id, student_id, name
-      ), totals AS (
-        SELECT
-          school_year_id,
-          student_id,
-          MAX(name) AS name,
-          SUM(no_of_absences)::INT AS no_of_absences,
-          MAX(source_table) AS source_table,
-          MAX(source_record_id::TEXT)::UUID AS source_record_id
-        FROM source_absences
-        GROUP BY school_year_id, student_id
-        HAVING SUM(no_of_absences)::INT > 0
-      ), matched AS (
-        SELECT
-          totals.*,
-          penalty.id AS penalty_id,
-          COALESCE(penalty.prescribed_penalty, 'No prescribed penalty configured.') AS prescribed_penalty
-        FROM totals
-        LEFT JOIN LATERAL (
-          SELECT id, prescribed_penalty
-          FROM penalties
-          WHERE no_of_absences <= totals.no_of_absences
-          ORDER BY no_of_absences DESC
-          LIMIT 1
-        ) penalty ON TRUE
+          total_absences::INT AS no_of_absences,
+          penalty_id,
+          COALESCE(prescribed_penalty, 'No prescribed penalty configured.') AS prescribed_penalty,
+          'calculation_results'::TEXT AS source_table,
+          id AS source_record_id
+        FROM calculation_results
+        WHERE ($1::uuid IS NULL OR school_year_id = $1::uuid)
+          AND ($2::TEXT IS NULL OR calculation_scope_key = $2::TEXT)
+          AND total_absences > 0
       )
       INSERT INTO penalty_results (
         school_year_id,
@@ -802,7 +788,7 @@ export async function refreshPenaltyResults(options: { schoolYearId?: string } =
         'unpaid',
         source_table,
         source_record_id
-      FROM matched
+      FROM totals
       ON CONFLICT (school_year_id, (LOWER(TRIM(student_id))))
       DO UPDATE SET
         name = EXCLUDED.name,
@@ -814,30 +800,24 @@ export async function refreshPenaltyResults(options: { schoolYearId?: string } =
         updated_at = NOW()
       RETURNING *
     `,
-    params,
+    [schoolYearId, calculationScopeKey],
   );
 
   await query(
     `
       DELETE FROM penalty_results pr
       WHERE ($1::uuid IS NULL OR pr.school_year_id = $1::uuid)
+        AND pr.source_table = 'calculation_results'
         AND NOT EXISTS (
           SELECT 1
-          FROM (
-            SELECT school_year_id, student_id, SUM(total_absences)::INT AS no_of_absences
-            FROM attendance_final_results
-            GROUP BY school_year_id, student_id
-            UNION ALL
-            SELECT school_year_id, student_id, SUM(no_of_absences)::INT AS no_of_absences
-            FROM manual_attendance_records
-            GROUP BY school_year_id, student_id
-          ) source
-          WHERE source.school_year_id IS NOT DISTINCT FROM pr.school_year_id
-            AND LOWER(TRIM(source.student_id)) = LOWER(TRIM(pr.student_id))
-            AND source.no_of_absences > 0
+          FROM calculation_results cr
+          WHERE cr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
+            AND LOWER(TRIM(cr.student_id)) = LOWER(TRIM(pr.student_id))
+            AND cr.total_absences > 0
+            AND ($2::TEXT IS NULL OR cr.calculation_scope_key = $2::TEXT)
         )
     `,
-    [schoolYearId ?? null],
+    [schoolYearId, calculationScopeKey],
   );
 
   return result.rows;
