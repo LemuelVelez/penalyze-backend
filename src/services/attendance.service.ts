@@ -3003,11 +3003,12 @@ async function refreshCalculationResultsWithClient(
           COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), '')) AS college,
           COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), '')) AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
-          COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ar.event_name), ''), ar.id::TEXT) AS event_key,
+          COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), ar.id::TEXT) AS event_key,
           GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
           ar.updated_at
         FROM attendance_records ar
+        LEFT JOIN attendance_events ae ON ae.id = ar.event_id
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
         WHERE ar.import_id IS NOT NULL
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
@@ -3337,7 +3338,7 @@ async function refreshAttendanceFinalResultsWithClient(
         COALESCE(NULLIF(MAX(s.college), ''), NULLIF(MAX(ar.college), '')) AS college,
         COALESCE(NULLIF(MAX(s.program), ''), NULLIF(MAX(ar.program), '')) AS program,
         COALESCE(NULLIF(MAX(s.institution), ''), NULLIF(MAX(ar.institution), '')) AS institution,
-        COUNT(DISTINCT COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ar.event_name), ''), ar.id::TEXT))::INT AS attended_events,
+        COUNT(DISTINCT COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), ar.id::TEXT))::INT AS attended_events,
         GREATEST(0, MAX(COALESCE(ar.no_of_absences, 0)))::INT AS total_absences,
         CASE
           WHEN GREATEST(0, MAX(COALESCE(ar.no_of_absences, 0)))::INT <= 0 THEN 'perfect_attendance'
@@ -3346,6 +3347,7 @@ async function refreshAttendanceFinalResultsWithClient(
         MAX(COALESCE(ar.scanned_at, ar.created_at)) AS latest_scanned_at,
         MAX(ar.updated_at) AS source_updated_at
       FROM attendance_records ar
+      LEFT JOIN attendance_events ae ON ae.id = ar.event_id
       LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
       ${whereSql}
       GROUP BY ar.school_year_id, ar.import_id, ar.student_id
