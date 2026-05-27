@@ -2184,6 +2184,103 @@ export async function updateAttendanceRecords(
   });
 }
 
+async function updateManualAttendanceRecord(
+  client: PoolClient,
+  id: string,
+  input: RawImportRow,
+) {
+  const row = validateAttendanceInput(input);
+  const existingResult = await client.query<ManualAttendanceRecord>(
+    `
+      SELECT ${getManualRecordSelectSql()}
+      FROM manual_attendance_records mar
+      LEFT JOIN attendance_events ae ON ae.id = mar.event_id
+      WHERE mar.id = $1
+      LIMIT 1
+    `,
+    [id],
+  );
+  const existingRecord = existingResult.rows[0];
+
+  if (!existingRecord) {
+    throw createValidationError("Attendance record not found.", 404);
+  }
+
+  const attendanceType = existingRecord.attendance_type;
+  const event = await getManualAttendanceEvent(client, input, attendanceType);
+  const schoolYearId =
+    event?.school_year_id ??
+    (await resolveSchoolYearId(
+      client,
+      (input as Record<string, unknown>).schoolYearId ??
+        (input as Record<string, unknown>).school_year_id ??
+        existingRecord.school_year_id,
+      [row.scannedAt, existingRecord.scanned_at],
+    ));
+  const noOfAbsences = Math.max(0, Number(row.noOfAbsences ?? existingRecord.no_of_absences ?? 0));
+
+  await upsertStudent(client, {
+    ...row,
+    noOfAbsences,
+  });
+
+  const updatedResult = await client.query<ManualAttendanceRecord>(
+    `
+      UPDATE manual_attendance_records
+      SET
+        school_year_id = $2,
+        event_id = $3,
+        student_id = $4,
+        name = $5,
+        year_level = NULLIF($6, ''),
+        college = NULLIF($7, ''),
+        program = NULLIF($8, ''),
+        institution = NULLIF($9, ''),
+        no_of_absences = $10,
+        remarks = NULLIF($11, ''),
+        scanned_at = $12::TIMESTAMPTZ,
+        updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `,
+    [
+      id,
+      schoolYearId,
+      event?.id ?? existingRecord.event_id ?? null,
+      row.studentId,
+      row.name,
+      row.yearLevel ?? "",
+      row.college ?? "",
+      row.program ?? "",
+      row.institution ?? "",
+      noOfAbsences,
+      row.remarks ?? "",
+      row.scannedAt ?? existingRecord.scanned_at ?? null,
+    ],
+  );
+  const manualRecord = updatedResult.rows[0];
+  const penaltyResult = await upsertPenaltyResultForManualRecord(client, manualRecord);
+
+  return {
+    event,
+    manualRecord: {
+      ...manualRecord,
+      event_name: event?.name ?? existingRecord.event_name ?? null,
+    },
+    record: manualRecordToAttendanceRecord({
+      ...manualRecord,
+      event_name: event?.name ?? existingRecord.event_name ?? null,
+    }),
+    records: [
+      manualRecordToAttendanceRecord({
+        ...manualRecord,
+        event_name: event?.name ?? existingRecord.event_name ?? null,
+      }),
+    ],
+    fine: penaltyResult ? penaltyResultToFine(penaltyResult) : null,
+  };
+}
+
 export async function updateAttendanceRecord(id: string, input: RawImportRow) {
   const row = validateAttendanceInput(input);
 
@@ -2195,7 +2292,7 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
     const existingRecord = existingResult.rows[0];
 
     if (!existingRecord) {
-      throw createValidationError("Attendance record not found.", 404);
+      return updateManualAttendanceRecord(client, id, input);
     }
 
     const existingCollegeScopeKeys = existingRecord.event_id
