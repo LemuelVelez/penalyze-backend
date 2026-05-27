@@ -2986,9 +2986,9 @@ async function refreshCalculationResultsWithClient(
     `
       DELETE FROM calculation_results
       WHERE ($1::uuid IS NULL OR school_year_id = $1::uuid)
-        AND calculation_scope_key = $3
+        AND calculation_scope_key = $2::TEXT
     `,
-    [schoolYearId, importIds, calculationScopeKey],
+    [schoolYearId, calculationScopeKey],
   );
 
   const result = await client.query<CalculationResultRecord>(
