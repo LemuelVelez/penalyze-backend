@@ -68,6 +68,8 @@ export type AttendanceEventInput = {
   event_date?: string;
   description?: string;
   eventDescription?: string;
+  eventOrder?: string | number;
+  event_order?: string | number;
 };
 
 export type UpdatedAttendanceRecordsResult = {
@@ -656,6 +658,22 @@ function normalizeOptionalTimestamp(value: unknown, label = "Date and time") {
   return { value: date.toISOString(), error: "" };
 }
 
+function normalizeOptionalPositiveInteger(value: unknown, label = "Order") {
+  const text = cleanText(value);
+  if (!text) return { value: null as number | null, error: "" };
+
+  const parsedValue = Number(text);
+  if (!Number.isInteger(parsedValue) || parsedValue < 1) {
+    return {
+      value: null as number | null,
+      error: `${label} must be a positive whole number.`,
+    };
+  }
+
+  return { value: parsedValue, error: "" };
+}
+
+
 function getEventInput(
   input: AttendanceEventInput | SaveRowsInput | RawImportRow,
 ) {
@@ -671,9 +689,15 @@ function getEventInput(
       (input as AttendanceEventInput).event_end_at,
     "Event end at",
   );
+  const eventOrder = normalizeOptionalPositiveInteger(
+    (input as AttendanceEventInput).eventOrder ??
+      (input as AttendanceEventInput).event_order,
+    "Event order",
+  );
 
   if (eventStartAt.error) throw createValidationError(eventStartAt.error);
   if (eventEndAt.error) throw createValidationError(eventEndAt.error);
+  if (eventOrder.error) throw createValidationError(eventOrder.error);
   if (
     eventStartAt.value &&
     eventEndAt.value &&
@@ -699,6 +723,7 @@ function getEventInput(
       (input as AttendanceEventInput).description ??
         (input as AttendanceEventInput).eventDescription,
     ),
+    eventOrder: eventOrder.value,
   };
 }
 
@@ -790,6 +815,83 @@ async function getNextAttendanceEventOrder(
 
   return Number(result.rows[0]?.next_order ?? 1);
 }
+
+async function getAttendanceEventCount(
+  client: PoolClient,
+  schoolYearId: string | null,
+) {
+  const result = await client.query<{ total: string | number }>(
+    `
+      SELECT COUNT(*) AS total
+      FROM attendance_events
+      WHERE school_year_id IS NOT DISTINCT FROM $1
+    `,
+    [schoolYearId],
+  );
+
+  return Number(result.rows[0]?.total ?? 0);
+}
+
+async function shiftAttendanceEventOrderForInsert(
+  client: PoolClient,
+  schoolYearId: string | null,
+  eventOrder: number,
+) {
+  await client.query(
+    `
+      UPDATE attendance_events
+      SET event_order = COALESCE(event_order, 0) + 1,
+          updated_at = NOW()
+      WHERE school_year_id IS NOT DISTINCT FROM $1
+        AND event_order >= $2
+    `,
+    [schoolYearId, eventOrder],
+  );
+}
+
+async function moveAttendanceEventOrder(
+  client: PoolClient,
+  props: {
+    eventId: string;
+    schoolYearId: string | null;
+    currentOrder: number | null;
+    nextOrder: number;
+  },
+) {
+  const currentOrder = Number(props.currentOrder ?? 0);
+
+  if (currentOrder > 0 && props.nextOrder < currentOrder) {
+    await client.query(
+      `
+        UPDATE attendance_events
+        SET event_order = COALESCE(event_order, 0) + 1,
+            updated_at = NOW()
+        WHERE school_year_id IS NOT DISTINCT FROM $1
+          AND id <> $2
+          AND event_order >= $3
+          AND event_order < $4
+      `,
+      [props.schoolYearId, props.eventId, props.nextOrder, currentOrder],
+    );
+    return;
+  }
+
+  if (currentOrder > 0 && props.nextOrder > currentOrder) {
+    await client.query(
+      `
+        UPDATE attendance_events
+        SET event_order = GREATEST(1, COALESCE(event_order, 1) - 1),
+            updated_at = NOW()
+        WHERE school_year_id IS NOT DISTINCT FROM $1
+          AND id <> $2
+          AND event_order > $3
+          AND event_order <= $4
+      `,
+      [props.schoolYearId, props.eventId, currentOrder, props.nextOrder],
+    );
+  }
+}
+
 
 async function resequenceAttendanceEvents(
   client: PoolClient,
@@ -2550,6 +2652,14 @@ export async function createAttendanceEvent(input: AttendanceEventInput) {
       eventInput.eventStartAt,
       eventInput.eventEndAt,
     ]);
+    const eventCount = await getAttendanceEventCount(client, schoolYearId);
+    const eventOrder = eventInput.eventOrder
+      ? Math.min(eventInput.eventOrder, eventCount + 1)
+      : eventCount + 1;
+
+    if (eventInput.eventOrder) {
+      await shiftAttendanceEventOrderForInsert(client, schoolYearId, eventOrder);
+    }
 
     const result = await client.query<AttendanceEventRecord>(
       `
@@ -2570,11 +2680,13 @@ export async function createAttendanceEvent(input: AttendanceEventInput) {
         eventInput.eventStartAt,
         eventInput.eventEndAt,
         eventInput.description,
-        await getNextAttendanceEventOrder(client, schoolYearId),
+        eventOrder,
       ],
     );
 
-    return result.rows[0];
+    await resequenceAttendanceEvents(client, schoolYearId);
+
+    return (await getAttendanceEventById(client, result.rows[0].id)) ?? result.rows[0];
   });
 }
 
@@ -2599,8 +2711,25 @@ export async function updateAttendanceEvent(
           eventInput.eventEndAt,
         ])
       : existing.school_year_id;
-    const schoolYearChanged =
-      nextSchoolYearId !== null && nextSchoolYearId !== existing.school_year_id;
+    const schoolYearChanged = nextSchoolYearId !== existing.school_year_id;
+    const eventCount = await getAttendanceEventCount(client, nextSchoolYearId);
+    const currentOrder = Number(existing.event_order || 0) || null;
+    const maxOrder = schoolYearChanged ? eventCount + 1 : Math.max(1, eventCount);
+    const requestedOrder = eventInput.eventOrder
+      ? Math.min(eventInput.eventOrder, maxOrder)
+      : null;
+    const nextOrder = requestedOrder ?? (schoolYearChanged ? eventCount + 1 : currentOrder ?? eventCount + 1);
+
+    if (schoolYearChanged) {
+      await shiftAttendanceEventOrderForInsert(client, nextSchoolYearId, nextOrder);
+    } else if (requestedOrder && requestedOrder !== currentOrder) {
+      await moveAttendanceEventOrder(client, {
+        eventId: id,
+        schoolYearId: nextSchoolYearId,
+        currentOrder,
+        nextOrder: requestedOrder,
+      });
+    }
 
     const result = await client.query<AttendanceEventRecord>(
       `
@@ -2623,15 +2752,15 @@ export async function updateAttendanceEvent(
         eventInput.eventStartAt,
         eventInput.eventEndAt,
         eventInput.description,
-        schoolYearChanged
-          ? await getNextAttendanceEventOrder(client, nextSchoolYearId)
-          : existing.event_order,
+        nextOrder,
       ],
     );
 
     if (schoolYearChanged) {
       await resequenceAttendanceEvents(client, existing.school_year_id);
     }
+
+    await resequenceAttendanceEvents(client, nextSchoolYearId);
 
     return (
       (await getAttendanceEventById(client, result.rows[0].id)) ??

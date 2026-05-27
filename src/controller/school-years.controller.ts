@@ -22,9 +22,15 @@ function toStringArray(value: unknown) {
   return cleanValue ? [cleanValue] : [];
 }
 
-export async function index(_req: Request, res: Response, next: NextFunction) {
+function toBoolean(value: unknown) {
+  if (typeof value === "boolean") return value;
+  const cleanValue = String(value ?? "").trim().toLowerCase();
+  return cleanValue === "true" || cleanValue === "1" || cleanValue === "yes" || cleanValue === "on";
+}
+
+export async function index(req: Request, res: Response, next: NextFunction) {
   try {
-    const rows = await listSchoolYears();
+    const rows = await listSchoolYears(toBoolean(req.query.activeOnly ?? req.query.active_only));
     res.json({ data: rows });
   } catch (error) {
     next(error);
@@ -37,7 +43,7 @@ export async function save(req: Request, res: Response, next: NextFunction) {
       name: req.body?.name,
       startsAt: req.body?.startsAt ?? req.body?.starts_at,
       endsAt: req.body?.endsAt ?? req.body?.ends_at,
-      isActive: Boolean(req.body?.isActive ?? req.body?.is_active),
+      isActive: toBoolean(req.body?.isActive ?? req.body?.is_active),
     });
 
     res.status(201).json({ message: "School year saved successfully.", data: row });
@@ -60,7 +66,7 @@ export async function update(req: Request, res: Response, next: NextFunction) {
       name: req.body?.name,
       startsAt: req.body?.startsAt ?? req.body?.starts_at,
       endsAt: req.body?.endsAt ?? req.body?.ends_at,
-      isActive: Boolean(req.body?.isActive ?? req.body?.is_active),
+      isActive: toBoolean(req.body?.isActive ?? req.body?.is_active),
     });
 
     res.json({ message: "School year updated successfully.", data: row });

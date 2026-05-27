@@ -144,6 +144,23 @@ export async function ensureSchoolYearForDate(
   return result.rows[0];
 }
 
+async function setActiveSchoolYear(client: PoolClient, id: string) {
+  await client.query("UPDATE school_years SET is_active = FALSE WHERE is_active = TRUE AND id <> $1", [id]);
+
+  const result = await client.query<SchoolYearRecord>(
+    `
+      UPDATE school_years
+      SET is_active = TRUE,
+          updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `,
+    [id],
+  );
+
+  return result.rows[0];
+}
+
 export async function getActiveOrCurrentSchoolYear(client?: PoolClient) {
   if (client) {
     const activeResult = await client.query<SchoolYearRecord>(
@@ -158,7 +175,8 @@ export async function getActiveOrCurrentSchoolYear(client?: PoolClient) {
 
     if (activeResult.rows[0]) return activeResult.rows[0];
 
-    return ensureSchoolYearForDate(client);
+    const currentSchoolYear = await ensureSchoolYearForDate(client);
+    return setActiveSchoolYear(client, currentSchoolYear.id);
   }
 
   const activeResult = await query<SchoolYearRecord>(
@@ -173,22 +191,31 @@ export async function getActiveOrCurrentSchoolYear(client?: PoolClient) {
 
   if (activeResult.rows[0]) return activeResult.rows[0];
 
-  return withTransaction((transactionClient) =>
-    ensureSchoolYearForDate(transactionClient),
-  );
+  return withTransaction(async (transactionClient) => {
+    const currentSchoolYear = await ensureSchoolYearForDate(transactionClient);
+    return setActiveSchoolYear(transactionClient, currentSchoolYear.id);
+  });
 }
 
-export async function listSchoolYears() {
+export async function listSchoolYears(activeOnly = false) {
   const result = await query<SchoolYearRecord>(
     `
       SELECT *
       FROM school_years
+      ${activeOnly ? "WHERE is_active = TRUE" : ""}
       ORDER BY starts_at DESC, name DESC
     `,
   );
 
-  if (!result.rows.length) {
+  if (!result.rows.length && !activeOnly) {
     return withTransaction(async (client) => [await ensureSchoolYearForDate(client)]);
+  }
+
+  if (!result.rows.length && activeOnly) {
+    return withTransaction(async (client) => {
+      const schoolYear = await getActiveOrCurrentSchoolYear(client);
+      return [schoolYear];
+    });
   }
 
   return result.rows;
