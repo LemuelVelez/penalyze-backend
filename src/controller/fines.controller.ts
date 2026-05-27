@@ -7,14 +7,22 @@ import {
   getPenaltyByAbsences,
   listFines,
   listPenalties,
+  listPenaltyResults,
+  refreshPenaltyResults,
   registerZeroAttendanceFine as registerZeroAttendanceFineRecord,
   seedDefaultPenalties,
   updateFineStatus,
   updatePenalty as updatePenaltyRecord,
+  updatePenaltyResultStatus,
   upsertPenalty
 } from "../services/fines.service";
 
 const fineStatuses: FineStatus[] = ["unpaid", "paid", "waived"];
+
+function parseFineStatus(value: unknown) {
+  const status = String(value ?? "").trim() as FineStatus;
+  return fineStatuses.includes(status) ? status : undefined;
+}
 
 function toPositiveInt(value: unknown, fallback: number) {
   const parsed = Number(value);
@@ -156,6 +164,56 @@ export async function fines(req: Request, res: Response, next: NextFunction) {
 
     const rows = await listFines({ schoolYearId, status, studentId, limit, offset });
     res.json({ data: rows });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function penaltyResults(req: Request, res: Response, next: NextFunction) {
+  try {
+    const rows = await listPenaltyResults({
+      schoolYearId: req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined,
+      status: parseFineStatus(req.query.status),
+      studentId: req.query.studentId ? String(req.query.studentId).trim() : undefined,
+      limit: toPositiveInt(req.query.limit, 100),
+      offset: toPositiveInt(req.query.offset, 0),
+    });
+
+    res.json({ data: rows });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function refreshPenaltyResultRows(req: Request, res: Response, next: NextFunction) {
+  try {
+    const rows = await refreshPenaltyResults({
+      schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+    });
+
+    res.json({ message: "Penalty results refreshed.", data: rows });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function updatePenaltyResultRowStatus(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+    const status = parseFineStatus(req.body?.status);
+
+    if (!id) {
+      res.status(400).json({ message: "Penalty result ID is required." });
+      return;
+    }
+
+    if (!status) {
+      res.status(400).json({ message: "Valid status is required." });
+      return;
+    }
+
+    const row = await updatePenaltyResultStatus(id, status);
+    res.json({ message: "Penalty result status updated.", data: row });
   } catch (error) {
     next(error);
   }

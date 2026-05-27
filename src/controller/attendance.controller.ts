@@ -9,9 +9,12 @@ import {
   deleteAttendanceRecord,
   getAttendanceImport,
   listAttendanceEvents,
+  listAttendanceFinalResults,
   listAttendanceImports,
   listAttendanceRecords,
+  listManualAttendanceRecords,
   previewAttendanceFile,
+  refreshAttendanceFinalResults,
   saveAttendanceFile,
   saveAttendanceRows,
   saveManualAttendanceRecord,
@@ -123,7 +126,8 @@ export async function events(req: Request, res: Response, next: NextFunction) {
   try {
     const limit = toPositiveInt(req.query.limit, 100);
     const offset = toPositiveInt(req.query.offset, 0);
-    const records = await listAttendanceEvents(limit, offset);
+    const schoolYearId = req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined;
+    const records = await listAttendanceEvents(limit, offset, schoolYearId);
 
     res.json({ data: records });
   } catch (error) {
@@ -439,13 +443,68 @@ export async function index(req: Request, res: Response, next: NextFunction) {
     const college = req.query.college
       ? String(req.query.college).trim()
       : undefined;
+    const schoolYearId = req.query.schoolYearId
+      ? String(req.query.schoolYearId).trim()
+      : undefined;
     const records = await listAttendanceRecords(
       limit,
       offset,
       studentId,
       eventId,
       college,
+      schoolYearId,
     );
+
+    res.json({ data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function finalResults(req: Request, res: Response, next: NextFunction) {
+  try {
+    const limit = toPositiveInt(req.query.limit, 100);
+    const offset = toPositiveInt(req.query.offset, 0);
+    const records = await listAttendanceFinalResults({
+      schoolYearId: req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined,
+      importId: req.query.importId ? String(req.query.importId).trim() : undefined,
+      studentId: req.query.studentId ? String(req.query.studentId).trim() : undefined,
+      college: req.query.college ? String(req.query.college).trim() : undefined,
+      limit,
+      offset,
+    });
+
+    res.json({ data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function refreshFinalResults(req: Request, res: Response, next: NextFunction) {
+  try {
+    const records = await refreshAttendanceFinalResults({
+      schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+      importId: req.body?.importId ?? req.body?.import_id,
+    });
+
+    res.json({ message: "Final attendance results refreshed.", data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function manualRecords(req: Request, res: Response, next: NextFunction) {
+  try {
+    const limit = toPositiveInt(req.query.limit, 100);
+    const offset = toPositiveInt(req.query.offset, 0);
+    const records = await listManualAttendanceRecords({
+      schoolYearId: req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined,
+      eventId: req.query.eventId ? String(req.query.eventId).trim() : undefined,
+      studentId: req.query.studentId ? String(req.query.studentId).trim() : undefined,
+      college: req.query.college ? String(req.query.college).trim() : undefined,
+      limit,
+      offset,
+    });
 
     res.json({ data: records });
   } catch (error) {
@@ -457,7 +516,8 @@ export async function imports(req: Request, res: Response, next: NextFunction) {
   try {
     const limit = toPositiveInt(req.query.limit, 50);
     const offset = toPositiveInt(req.query.offset, 0);
-    const records = await listAttendanceImports(limit, offset);
+    const schoolYearId = req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined;
+    const records = await listAttendanceImports(limit, offset, schoolYearId);
 
     res.json({ data: records });
   } catch (error) {

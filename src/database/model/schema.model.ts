@@ -5,7 +5,10 @@ export const TABLES = {
   attendanceEvents: "attendance_events",
   attendanceImports: "attendance_imports",
   attendanceRecords: "attendance_records",
+  attendanceFinalResults: "attendance_final_results",
+  manualAttendanceRecords: "manual_attendance_records",
   penalties: "penalties",
+  penaltyResults: "penalty_results",
   fines: "fines",
 } as const;
 
@@ -98,6 +101,46 @@ export type AttendanceRecord = {
   updated_at: Date;
 };
 
+export type ManualAttendanceType = "manual" | "zero_attendance";
+
+export type ManualAttendanceRecord = {
+  id: string;
+  school_year_id: string | null;
+  event_id: string | null;
+  event_name?: string | null;
+  attendance_type: ManualAttendanceType;
+  student_id: string;
+  name: string;
+  year_level: string | null;
+  college: string | null;
+  program: string | null;
+  institution: string | null;
+  no_of_absences: number;
+  remarks: string | null;
+  scanned_at: Date | string | null;
+  created_at: Date;
+  updated_at: Date;
+};
+
+export type AttendanceFinalResultRecord = {
+  id: string;
+  school_year_id: string | null;
+  import_id: string | null;
+  student_id: string;
+  name: string;
+  year_level: string | null;
+  college: string | null;
+  program: string | null;
+  institution: string | null;
+  attended_events: number;
+  total_absences: number;
+  attendance_status: string;
+  latest_scanned_at: Date | string | null;
+  source_updated_at: Date | string | null;
+  created_at: Date;
+  updated_at: Date;
+};
+
 export type PenaltyRecord = {
   id: string;
   no_of_absences: number;
@@ -122,6 +165,21 @@ export type FineRecord = {
   updated_at: Date;
 };
 
+export type PenaltyResultRecord = {
+  id: string;
+  school_year_id: string | null;
+  student_id: string;
+  name: string;
+  no_of_absences: number;
+  penalty_id: string | null;
+  prescribed_penalty: string;
+  status: FineStatus;
+  source_table: string | null;
+  source_record_id: string | null;
+  created_at: Date;
+  updated_at: Date;
+};
+
 export type AttendanceImportInput = {
   schoolYearId?: string;
   eventId?: string;
@@ -137,6 +195,7 @@ export type AttendanceImportInput = {
   institution?: string;
   noOfAbsences?: number;
   remarks?: string;
+  attendanceType?: ManualAttendanceType;
 };
 
 export type ParsedAttendanceRow = AttendanceImportInput & {

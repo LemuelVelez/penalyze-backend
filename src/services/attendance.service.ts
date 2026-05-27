@@ -4,12 +4,15 @@ import { PoolClient } from "pg";
 import {
   ACCEPTED_ATTENDANCE_EXTENSIONS,
   AttendanceEventRecord,
+  AttendanceFinalResultRecord,
   AttendanceImportProgress,
   AttendanceImportRecord,
   AttendancePreviewResult,
   AttendanceRecord,
   FineRecord,
+  ManualAttendanceRecord,
   ParsedAttendanceRow,
+  PenaltyResultRecord,
   SavedAttendanceImportResult,
   SchoolYearRecord,
 } from "../database/model/schema.model";
@@ -1681,6 +1684,16 @@ export async function saveAttendanceRows(
     );
     const savedRecords = await listRecordsByIds(client, savedRecordIds);
 
+    await refreshAttendanceFinalResultsWithClient(client, {
+      schoolYearId: importRecord.school_year_id ?? undefined,
+      importId,
+    });
+
+    await refreshPenaltyResultsForSchoolYearWithClient(
+      client,
+      importRecord.school_year_id ?? undefined,
+    );
+
     await emitAttendanceImportProgress(input.onProgress, {
       stage: "syncing",
       percent: 96,
@@ -1751,50 +1764,291 @@ export async function saveAttendanceFile(
   });
 }
 
+function getManualAttendanceType(input: RawImportRow) {
+  const value = cleanText(
+    (input as Record<string, unknown>).attendanceType ??
+      (input as Record<string, unknown>).attendance_type,
+  );
+
+  if (value === "zero_attendance") return "zero_attendance";
+
+  if (
+    !cleanText((input as Record<string, unknown>).eventId ?? (input as Record<string, unknown>).event_id) &&
+    cleanText((input as Record<string, unknown>).remarks)
+      .toLowerCase()
+      .includes("zero attendance")
+  ) {
+    return "zero_attendance";
+  }
+
+  return "manual";
+}
+
+function getManualRecordSelectSql() {
+  return `
+    mar.id,
+    mar.school_year_id,
+    mar.event_id,
+    ae.name AS event_name,
+    mar.attendance_type,
+    mar.student_id,
+    mar.name,
+    mar.year_level,
+    mar.college,
+    mar.program,
+    mar.institution,
+    mar.no_of_absences,
+    mar.remarks,
+    mar.scanned_at,
+    mar.created_at,
+    mar.updated_at
+  `;
+}
+
+function manualRecordToAttendanceRecord(record: ManualAttendanceRecord): AttendanceRecord {
+  return {
+    id: record.id,
+    school_year_id: record.school_year_id,
+    import_id: null,
+    event_id: record.event_id,
+    event_name: record.event_name ?? null,
+    student_id: record.student_id,
+    name: record.name,
+    year_level: record.year_level,
+    college: record.college,
+    program: record.program,
+    institution: record.institution,
+    no_of_absences: record.no_of_absences,
+    remarks: record.remarks,
+    scanned_at: record.scanned_at,
+    created_at: record.created_at as Date,
+    updated_at: record.updated_at as Date,
+  };
+}
+
+async function getManualAttendanceEvent(
+  client: PoolClient,
+  input: RawImportRow,
+  attendanceType: "manual" | "zero_attendance",
+) {
+  if (attendanceType === "zero_attendance") return null;
+
+  const eventId = cleanText(
+    (input as Record<string, unknown>).eventId ??
+      (input as Record<string, unknown>).event_id,
+  );
+
+  if (eventId) {
+    const event = await getAttendanceEventById(client, eventId);
+    if (!event) throw createValidationError("Attendance event not found.", 404);
+    return event;
+  }
+
+  throw createValidationError("Please select an existing attendance event for manual attendance.");
+}
+
+async function countCollegeEventsForManualRecord(
+  client: PoolClient,
+  row: ParsedAttendanceRow,
+  schoolYearId: string,
+) {
+  const scopedCount = await client.query<{ total: number }>(
+    `
+      SELECT COUNT(DISTINCT ae.id)::INT AS total
+      FROM attendance_events ae
+      WHERE ae.school_year_id = $1
+        AND EXISTS (
+          SELECT 1
+          FROM attendance_records ar
+          WHERE ar.event_id = ae.id
+            AND LOWER(TRIM(COALESCE(ar.college, ''))) = LOWER(TRIM(COALESCE($2, '')))
+            AND LOWER(TRIM(COALESCE(ar.program, ''))) = LOWER(TRIM(COALESCE($3, ar.program, '')))
+        )
+    `,
+    [schoolYearId, row.college ?? "", row.program ?? ""],
+  );
+
+  const total = Number(scopedCount.rows[0]?.total ?? 0);
+  if (total > 0) return total;
+
+  const fallbackCount = await client.query<{ total: number }>(
+    `
+      SELECT COUNT(*)::INT AS total
+      FROM attendance_events
+      WHERE school_year_id = $1
+    `,
+    [schoolYearId],
+  );
+
+  return Number(fallbackCount.rows[0]?.total ?? 0);
+}
+
+async function getPenaltyForAbsenceCount(client: PoolClient, noOfAbsences: number) {
+  const result = await client.query<{ id: string; prescribed_penalty: string }>(
+    `
+      SELECT id, prescribed_penalty
+      FROM penalties
+      WHERE no_of_absences <= $1
+      ORDER BY no_of_absences DESC
+      LIMIT 1
+    `,
+    [noOfAbsences],
+  );
+
+  return result.rows[0] ?? null;
+}
+
+function penaltyResultToFine(record: PenaltyResultRecord): FineRecord {
+  return {
+    id: record.id,
+    school_year_id: record.school_year_id,
+    attendance_record_id: null,
+    penalty_id: record.penalty_id,
+    student_id: record.student_id,
+    name: record.name,
+    no_of_absences: record.no_of_absences,
+    prescribed_penalty: record.prescribed_penalty,
+    status: record.status,
+    attendance_event_id: null,
+    attendance_remarks: record.source_table === "manual_attendance_records" ? "Manual attendance result" : "Final attendance result",
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+  };
+}
+
+async function upsertPenaltyResultForManualRecord(
+  client: PoolClient,
+  record: ManualAttendanceRecord,
+) {
+  const noOfAbsences = Number(record.no_of_absences || 0);
+
+  if (noOfAbsences <= 0) {
+    await client.query(
+      `
+        DELETE FROM penalty_results
+        WHERE school_year_id = $1
+          AND LOWER(TRIM(student_id)) = LOWER(TRIM($2))
+      `,
+      [record.school_year_id, record.student_id],
+    );
+    return null;
+  }
+
+  const penalty = await getPenaltyForAbsenceCount(client, noOfAbsences);
+  const prescribedPenalty = penalty?.prescribed_penalty ?? "No prescribed penalty configured.";
+  const result = await client.query<PenaltyResultRecord>(
+    `
+      INSERT INTO penalty_results (
+        school_year_id,
+        student_id,
+        name,
+        no_of_absences,
+        penalty_id,
+        prescribed_penalty,
+        status,
+        source_table,
+        source_record_id
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, 'unpaid', 'manual_attendance_records', $7)
+      ON CONFLICT (school_year_id, (LOWER(TRIM(student_id))))
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        no_of_absences = EXCLUDED.no_of_absences,
+        penalty_id = EXCLUDED.penalty_id,
+        prescribed_penalty = EXCLUDED.prescribed_penalty,
+        source_table = EXCLUDED.source_table,
+        source_record_id = EXCLUDED.source_record_id,
+        updated_at = NOW()
+      RETURNING *
+    `,
+    [
+      record.school_year_id,
+      record.student_id,
+      record.name,
+      noOfAbsences,
+      penalty?.id ?? null,
+      prescribedPenalty,
+      record.id,
+    ],
+  );
+
+  return result.rows[0];
+}
+
 export async function saveManualAttendanceRecord(input: RawImportRow) {
   const row = validateAttendanceInput(input);
+  const attendanceType = getManualAttendanceType(input);
 
   return withTransaction(async (client) => {
-    const event = await findOrCreateAttendanceEvent(client, getManualAttendanceEventInput(input));
+    const event = await getManualAttendanceEvent(client, input, attendanceType);
+    const schoolYearId =
+      event?.school_year_id ??
+      (await resolveSchoolYearId(
+        client,
+        (input as Record<string, unknown>).schoolYearId ??
+          (input as Record<string, unknown>).school_year_id,
+        [row.scannedAt],
+      ));
+    const noOfAbsences =
+      attendanceType === "zero_attendance"
+        ? await countCollegeEventsForManualRecord(client, row, schoolYearId)
+        : Math.max(0, Number(row.noOfAbsences ?? 0));
 
-    await upsertStudent(client, row);
-    const record = await insertAttendanceRecord(
-      client,
-      null,
-      event?.id ?? null,
-      event?.school_year_id ?? await resolveSchoolYearId(client, (input as Record<string, unknown>).schoolYearId ?? (input as Record<string, unknown>).school_year_id, [row.scannedAt]),
-      row,
+    await upsertStudent(client, {
+      ...row,
+      noOfAbsences,
+    });
+
+    const result = await client.query<ManualAttendanceRecord>(
+      `
+        INSERT INTO manual_attendance_records (
+          school_year_id,
+          event_id,
+          attendance_type,
+          student_id,
+          name,
+          year_level,
+          college,
+          program,
+          institution,
+          no_of_absences,
+          remarks,
+          scanned_at
+        )
+        VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''), $10, NULLIF($11, ''), $12::TIMESTAMPTZ)
+        RETURNING *
+      `,
+      [
+        schoolYearId,
+        event?.id ?? null,
+        attendanceType,
+        row.studentId,
+        row.name,
+        row.yearLevel ?? "",
+        row.college ?? "",
+        row.program ?? "",
+        row.institution ?? "",
+        noOfAbsences,
+        row.remarks ?? "",
+        row.scannedAt ?? null,
+      ],
     );
-
-    if (event) {
-      const synced = await syncAbsencesForAttendanceRecordIds(client, [
-        record.id,
-      ]);
-      const refreshedRecordIds = Array.from(
-        new Set([record.id, ...synced.records.map((item) => item.id)]),
-      );
-      const records = await listRecordsByIds(client, refreshedRecordIds);
-      const updatedRecord =
-        records.find((item) => item.id === record.id) ?? record;
-      const fine =
-        synced.fines.find((item) => item.attendance_record_id === record.id) ??
-        null;
-
-      return {
-        event,
-        record: updatedRecord,
-        records,
-        fine,
-      };
-    }
-
-    const fine = await insertFineIfNeeded(client, record);
+    const manualRecord = result.rows[0];
+    const record = manualRecordToAttendanceRecord({
+      ...manualRecord,
+      event_name: event?.name ?? null,
+    });
+    const penaltyResult = await upsertPenaltyResultForManualRecord(client, manualRecord);
 
     return {
       event,
+      manualRecord: {
+        ...manualRecord,
+        event_name: event?.name ?? null,
+      },
       record,
       records: [record],
-      fine,
+      fine: penaltyResult ? penaltyResultToFine(penaltyResult) : null,
     };
   });
 }
@@ -2333,4 +2587,330 @@ export async function getAttendanceImport(importId: string) {
     import: importResult.rows[0],
     records: recordsResult.rows,
   };
+}
+
+
+type AttendanceFinalResultsFilter = {
+  schoolYearId?: string;
+  importId?: string;
+  studentId?: string;
+  college?: string;
+  limit?: number;
+  offset?: number;
+};
+
+async function refreshAttendanceFinalResultsWithClient(
+  client: PoolClient,
+  options: Pick<AttendanceFinalResultsFilter, "schoolYearId" | "importId"> = {},
+) {
+  const clauses: string[] = ["ar.import_id IS NOT NULL"];
+  const params: unknown[] = [];
+
+  if (options.schoolYearId) {
+    params.push(options.schoolYearId);
+    clauses.push(`ar.school_year_id = $${params.length}`);
+  }
+
+  if (options.importId) {
+    params.push(options.importId);
+    clauses.push(`ar.import_id = $${params.length}`);
+  }
+
+  const whereSql = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+
+  await client.query(
+    `
+      DELETE FROM attendance_final_results afr
+      WHERE EXISTS (
+        SELECT 1
+        FROM attendance_records ar
+        ${whereSql}
+          AND ar.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+          AND ar.import_id IS NOT DISTINCT FROM afr.import_id
+      )
+    `,
+    params,
+  );
+
+  const result = await client.query<AttendanceFinalResultRecord>(
+    `
+      INSERT INTO attendance_final_results (
+        school_year_id,
+        import_id,
+        student_id,
+        name,
+        year_level,
+        college,
+        program,
+        institution,
+        attended_events,
+        total_absences,
+        attendance_status,
+        latest_scanned_at,
+        source_updated_at
+      )
+      SELECT
+        ar.school_year_id,
+        ar.import_id,
+        ar.student_id,
+        COALESCE(NULLIF(MAX(s.name), ''), NULLIF(MAX(ar.name), ''), ar.student_id) AS name,
+        COALESCE(NULLIF(MAX(s.year_level), ''), NULLIF(MAX(ar.year_level), '')) AS year_level,
+        COALESCE(NULLIF(MAX(s.college), ''), NULLIF(MAX(ar.college), '')) AS college,
+        COALESCE(NULLIF(MAX(s.program), ''), NULLIF(MAX(ar.program), '')) AS program,
+        COALESCE(NULLIF(MAX(s.institution), ''), NULLIF(MAX(ar.institution), '')) AS institution,
+        COUNT(DISTINCT COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ar.event_name), ''), ar.id::TEXT))::INT AS attended_events,
+        GREATEST(0, MAX(COALESCE(ar.no_of_absences, 0)))::INT AS total_absences,
+        CASE
+          WHEN GREATEST(0, MAX(COALESCE(ar.no_of_absences, 0)))::INT <= 0 THEN 'perfect_attendance'
+          ELSE 'with_absences'
+        END AS attendance_status,
+        MAX(COALESCE(ar.scanned_at, ar.created_at)) AS latest_scanned_at,
+        MAX(ar.updated_at) AS source_updated_at
+      FROM attendance_records ar
+      LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+      ${whereSql}
+      GROUP BY ar.school_year_id, ar.import_id, ar.student_id
+      ON CONFLICT (school_year_id, import_id, (LOWER(TRIM(student_id))))
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        year_level = EXCLUDED.year_level,
+        college = EXCLUDED.college,
+        program = EXCLUDED.program,
+        institution = EXCLUDED.institution,
+        attended_events = EXCLUDED.attended_events,
+        total_absences = EXCLUDED.total_absences,
+        attendance_status = EXCLUDED.attendance_status,
+        latest_scanned_at = EXCLUDED.latest_scanned_at,
+        source_updated_at = EXCLUDED.source_updated_at,
+        updated_at = NOW()
+      RETURNING *
+    `,
+    params,
+  );
+
+  return result.rows;
+}
+
+async function refreshPenaltyResultsForSchoolYearWithClient(
+  client: PoolClient,
+  schoolYearId?: string,
+) {
+  const clauses = schoolYearId ? ["school_year_id = $1"] : [];
+  const params = schoolYearId ? [schoolYearId] : [];
+  const whereSql = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+
+  const result = await client.query<PenaltyResultRecord>(
+    `
+      WITH source_absences AS (
+        SELECT
+          school_year_id,
+          student_id,
+          name,
+          SUM(total_absences)::INT AS no_of_absences,
+          'attendance_final_results'::TEXT AS source_table,
+          NULL::UUID AS source_record_id
+        FROM attendance_final_results
+        ${whereSql}
+        GROUP BY school_year_id, student_id, name
+
+        UNION ALL
+
+        SELECT
+          school_year_id,
+          student_id,
+          name,
+          SUM(no_of_absences)::INT AS no_of_absences,
+          'manual_attendance_records'::TEXT AS source_table,
+          MAX(id)::UUID AS source_record_id
+        FROM manual_attendance_records
+        ${whereSql}
+        GROUP BY school_year_id, student_id, name
+      ), totals AS (
+        SELECT
+          school_year_id,
+          student_id,
+          MAX(name) AS name,
+          SUM(no_of_absences)::INT AS no_of_absences,
+          MAX(source_table) AS source_table,
+          MAX(source_record_id) AS source_record_id
+        FROM source_absences
+        GROUP BY school_year_id, student_id
+        HAVING SUM(no_of_absences)::INT > 0
+      ), matched AS (
+        SELECT
+          totals.*,
+          penalty.id AS penalty_id,
+          COALESCE(penalty.prescribed_penalty, 'No prescribed penalty configured.') AS prescribed_penalty
+        FROM totals
+        LEFT JOIN LATERAL (
+          SELECT id, prescribed_penalty
+          FROM penalties
+          WHERE no_of_absences <= totals.no_of_absences
+          ORDER BY no_of_absences DESC
+          LIMIT 1
+        ) penalty ON TRUE
+      )
+      INSERT INTO penalty_results (
+        school_year_id,
+        student_id,
+        name,
+        no_of_absences,
+        penalty_id,
+        prescribed_penalty,
+        status,
+        source_table,
+        source_record_id
+      )
+      SELECT
+        school_year_id,
+        student_id,
+        name,
+        no_of_absences,
+        penalty_id,
+        prescribed_penalty,
+        'unpaid',
+        source_table,
+        source_record_id
+      FROM matched
+      ON CONFLICT (school_year_id, (LOWER(TRIM(student_id))))
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        no_of_absences = EXCLUDED.no_of_absences,
+        penalty_id = EXCLUDED.penalty_id,
+        prescribed_penalty = EXCLUDED.prescribed_penalty,
+        source_table = EXCLUDED.source_table,
+        source_record_id = EXCLUDED.source_record_id,
+        updated_at = NOW()
+      RETURNING *
+    `,
+    params,
+  );
+
+  await client.query(
+    `
+      DELETE FROM penalty_results pr
+      WHERE ($1::uuid IS NULL OR pr.school_year_id = $1::uuid)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM (
+            SELECT school_year_id, student_id, SUM(total_absences)::INT AS no_of_absences
+            FROM attendance_final_results
+            GROUP BY school_year_id, student_id
+            UNION ALL
+            SELECT school_year_id, student_id, SUM(no_of_absences)::INT AS no_of_absences
+            FROM manual_attendance_records
+            GROUP BY school_year_id, student_id
+          ) source
+          WHERE source.school_year_id IS NOT DISTINCT FROM pr.school_year_id
+            AND LOWER(TRIM(source.student_id)) = LOWER(TRIM(pr.student_id))
+            AND source.no_of_absences > 0
+        )
+    `,
+    [schoolYearId ?? null],
+  );
+
+  return result.rows;
+}
+
+export async function refreshAttendanceFinalResults(
+  options: Pick<AttendanceFinalResultsFilter, "schoolYearId" | "importId"> = {},
+) {
+  return withTransaction(async (client) => {
+    const rows = await refreshAttendanceFinalResultsWithClient(client, options);
+    await refreshPenaltyResultsForSchoolYearWithClient(client, options.schoolYearId);
+    return rows;
+  });
+}
+
+export async function listAttendanceFinalResults(
+  options: AttendanceFinalResultsFilter = {},
+) {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  if (options.schoolYearId) {
+    params.push(options.schoolYearId);
+    clauses.push(`afr.school_year_id = $${params.length}`);
+  }
+
+  if (options.importId) {
+    params.push(options.importId);
+    clauses.push(`afr.import_id = $${params.length}`);
+  }
+
+  if (options.studentId) {
+    params.push(options.studentId);
+    clauses.push(`LOWER(TRIM(afr.student_id)) = LOWER(TRIM($${params.length}))`);
+  }
+
+  if (options.college) {
+    params.push(options.college);
+    clauses.push(`LOWER(TRIM(COALESCE(afr.college, ''))) = LOWER(TRIM($${params.length}))`);
+  }
+
+  params.push(options.limit ?? 100);
+  const limitPosition = params.length;
+
+  params.push(options.offset ?? 0);
+  const offsetPosition = params.length;
+
+  const result = await query<AttendanceFinalResultRecord>(
+    `
+      SELECT *
+      FROM attendance_final_results afr
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+      ORDER BY afr.updated_at DESC, afr.created_at DESC
+      LIMIT $${limitPosition} OFFSET $${offsetPosition}
+    `,
+    params,
+  );
+
+  return result.rows;
+}
+
+export async function listManualAttendanceRecords(
+  options: AttendanceFinalResultsFilter & { eventId?: string } = {},
+) {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  if (options.schoolYearId) {
+    params.push(options.schoolYearId);
+    clauses.push(`mar.school_year_id = $${params.length}`);
+  }
+
+  if (options.studentId) {
+    params.push(options.studentId);
+    clauses.push(`LOWER(TRIM(mar.student_id)) = LOWER(TRIM($${params.length}))`);
+  }
+
+  if (options.college) {
+    params.push(options.college);
+    clauses.push(`LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($${params.length}))`);
+  }
+
+  if (options.eventId) {
+    params.push(options.eventId);
+    clauses.push(`mar.event_id = $${params.length}`);
+  }
+
+  params.push(options.limit ?? 100);
+  const limitPosition = params.length;
+
+  params.push(options.offset ?? 0);
+  const offsetPosition = params.length;
+
+  const result = await query<ManualAttendanceRecord>(
+    `
+      SELECT ${getManualRecordSelectSql()}
+      FROM manual_attendance_records mar
+      LEFT JOIN attendance_events ae ON ae.id = mar.event_id
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+      ORDER BY COALESCE(mar.scanned_at, mar.created_at) DESC, mar.created_at DESC
+      LIMIT $${limitPosition} OFFSET $${offsetPosition}
+    `,
+    params,
+  );
+
+  return result.rows;
 }

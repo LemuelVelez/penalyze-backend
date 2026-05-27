@@ -25,6 +25,27 @@ export type TransferSchoolYearRecordsResult = {
   importsUpdated: number;
   attendanceRecordsUpdated: number;
   finesUpdated: number;
+  finalResultsUpdated?: number;
+  manualRecordsUpdated?: number;
+  penaltyResultsUpdated?: number;
+};
+
+export type SchoolYearRecordActionResult = {
+  schoolYear: SchoolYearRecord;
+  eventsUpdated?: number;
+  importsUpdated?: number;
+  attendanceRecordsUpdated?: number;
+  finesUpdated?: number;
+  finalResultsUpdated?: number;
+  manualRecordsUpdated?: number;
+  penaltyResultsUpdated?: number;
+  eventsDeleted?: number;
+  importsDeleted?: number;
+  attendanceRecordsDeleted?: number;
+  finesDeleted?: number;
+  finalResultsDeleted?: number;
+  manualRecordsDeleted?: number;
+  penaltyResultsDeleted?: number;
 };
 
 function cleanText(value: unknown) {
@@ -314,6 +335,39 @@ export async function transferSchoolYearRecords(
       [fineIds, Array.from(affectedRecordIds), targetSchoolYear.id],
     );
 
+    const finalResultUpdate = await client.query(
+      `
+        UPDATE attendance_final_results
+        SET school_year_id = $2,
+            updated_at = NOW()
+        WHERE $1::uuid[] <> '{}'::uuid[]
+          AND import_id = ANY($1::uuid[])
+      `,
+      [importIds, targetSchoolYear.id],
+    );
+
+    const manualRecordUpdate = await client.query(
+      `
+        UPDATE manual_attendance_records
+        SET school_year_id = $2,
+            updated_at = NOW()
+        WHERE $1::uuid[] <> '{}'::uuid[]
+          AND event_id = ANY($1::uuid[])
+      `,
+      [eventIds, targetSchoolYear.id],
+    );
+
+    const penaltyResultUpdate = await client.query(
+      `
+        UPDATE penalty_results
+        SET school_year_id = $2,
+            updated_at = NOW()
+        WHERE $1::uuid[] <> '{}'::uuid[]
+          AND source_record_id = ANY($1::uuid[])
+      `,
+      [fineIds, targetSchoolYear.id],
+    );
+
     if (affectedRecordIds.size) {
       await syncAbsencesForAttendanceRecordIds(client, Array.from(affectedRecordIds));
     }
@@ -324,6 +378,146 @@ export async function transferSchoolYearRecords(
       importsUpdated: Number(importUpdate.rowCount ?? 0),
       attendanceRecordsUpdated: Number(recordUpdate.rowCount ?? 0),
       finesUpdated: Number(fineUpdate.rowCount ?? 0),
+      finalResultsUpdated: Number(finalResultUpdate.rowCount ?? 0),
+      manualRecordsUpdated: Number(manualRecordUpdate.rowCount ?? 0),
+      penaltyResultsUpdated: Number(penaltyResultUpdate.rowCount ?? 0),
+    };
+  });
+}
+
+
+export async function assignCurrentRecordsToSchoolYear(
+  schoolYearId: string,
+): Promise<SchoolYearRecordActionResult> {
+  return withTransaction(async (client) => {
+    const schoolYear = await getSchoolYearById(client, schoolYearId);
+
+    const eventUpdate = await client.query(
+      `
+        UPDATE attendance_events
+        SET school_year_id = $1,
+            updated_at = NOW()
+        WHERE school_year_id IS NULL
+      `,
+      [schoolYear.id],
+    );
+
+    const importUpdate = await client.query(
+      `
+        UPDATE attendance_imports
+        SET school_year_id = $1
+        WHERE school_year_id IS NULL
+      `,
+      [schoolYear.id],
+    );
+
+    const recordUpdate = await client.query(
+      `
+        UPDATE attendance_records
+        SET school_year_id = $1,
+            updated_at = NOW()
+        WHERE school_year_id IS NULL
+      `,
+      [schoolYear.id],
+    );
+
+    const fineUpdate = await client.query(
+      `
+        UPDATE fines
+        SET school_year_id = $1,
+            updated_at = NOW()
+        WHERE school_year_id IS NULL
+      `,
+      [schoolYear.id],
+    );
+
+    const finalResultUpdate = await client.query(
+      `
+        UPDATE attendance_final_results
+        SET school_year_id = $1,
+            updated_at = NOW()
+        WHERE school_year_id IS NULL
+      `,
+      [schoolYear.id],
+    );
+
+    const manualRecordUpdate = await client.query(
+      `
+        UPDATE manual_attendance_records
+        SET school_year_id = $1,
+            updated_at = NOW()
+        WHERE school_year_id IS NULL
+      `,
+      [schoolYear.id],
+    );
+
+    const penaltyResultUpdate = await client.query(
+      `
+        UPDATE penalty_results
+        SET school_year_id = $1,
+            updated_at = NOW()
+        WHERE school_year_id IS NULL
+      `,
+      [schoolYear.id],
+    );
+
+    return {
+      schoolYear,
+      eventsUpdated: Number(eventUpdate.rowCount ?? 0),
+      importsUpdated: Number(importUpdate.rowCount ?? 0),
+      attendanceRecordsUpdated: Number(recordUpdate.rowCount ?? 0),
+      finesUpdated: Number(fineUpdate.rowCount ?? 0),
+      finalResultsUpdated: Number(finalResultUpdate.rowCount ?? 0),
+      manualRecordsUpdated: Number(manualRecordUpdate.rowCount ?? 0),
+      penaltyResultsUpdated: Number(penaltyResultUpdate.rowCount ?? 0),
+    };
+  });
+}
+
+export async function deleteSchoolYearRecords(
+  schoolYearId: string,
+): Promise<SchoolYearRecordActionResult> {
+  return withTransaction(async (client) => {
+    const schoolYear = await getSchoolYearById(client, schoolYearId);
+
+    const penaltyResultDelete = await client.query(
+      "DELETE FROM penalty_results WHERE school_year_id = $1",
+      [schoolYear.id],
+    );
+    const finalResultDelete = await client.query(
+      "DELETE FROM attendance_final_results WHERE school_year_id = $1",
+      [schoolYear.id],
+    );
+    const manualRecordDelete = await client.query(
+      "DELETE FROM manual_attendance_records WHERE school_year_id = $1",
+      [schoolYear.id],
+    );
+    const fineDelete = await client.query(
+      "DELETE FROM fines WHERE school_year_id = $1",
+      [schoolYear.id],
+    );
+    const recordDelete = await client.query(
+      "DELETE FROM attendance_records WHERE school_year_id = $1",
+      [schoolYear.id],
+    );
+    const importDelete = await client.query(
+      "DELETE FROM attendance_imports WHERE school_year_id = $1",
+      [schoolYear.id],
+    );
+    const eventDelete = await client.query(
+      "DELETE FROM attendance_events WHERE school_year_id = $1",
+      [schoolYear.id],
+    );
+
+    return {
+      schoolYear,
+      penaltyResultsDeleted: Number(penaltyResultDelete.rowCount ?? 0),
+      finalResultsDeleted: Number(finalResultDelete.rowCount ?? 0),
+      manualRecordsDeleted: Number(manualRecordDelete.rowCount ?? 0),
+      finesDeleted: Number(fineDelete.rowCount ?? 0),
+      attendanceRecordsDeleted: Number(recordDelete.rowCount ?? 0),
+      importsDeleted: Number(importDelete.rowCount ?? 0),
+      eventsDeleted: Number(eventDelete.rowCount ?? 0),
     };
   });
 }

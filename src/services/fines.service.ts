@@ -1,4 +1,12 @@
-import { AttendanceRecord, FineRecord, FineStatus, PenaltyRecord, SchoolYearRecord, StudentRecord } from "../database/model/schema.model";
+import {
+  AttendanceRecord,
+  FineRecord,
+  FineStatus,
+  PenaltyRecord,
+  PenaltyResultRecord,
+  SchoolYearRecord,
+  StudentRecord
+} from "../database/model/schema.model";
 import { DEFAULT_PENALTIES } from "../database/seeder/penalties.seeder";
 import { query } from "../lib/db";
 
@@ -284,6 +292,16 @@ export async function updatePenalty(id: string, noOfAbsences: number, prescribed
     [id, cleanPenalty]
   );
 
+  await query(
+    `
+      UPDATE penalty_results
+      SET prescribed_penalty = $2,
+          updated_at = NOW()
+      WHERE penalty_id = $1
+    `,
+    [id, cleanPenalty]
+  );
+
   return result.rows[0];
 }
 
@@ -305,6 +323,16 @@ export async function deletePenalty(id: string) {
   await query(
     `
       UPDATE fines
+      SET penalty_id = NULL,
+          updated_at = NOW()
+      WHERE penalty_id = $1
+    `,
+    [id]
+  );
+
+  await query(
+    `
+      UPDATE penalty_results
       SET penalty_id = NULL,
           updated_at = NOW()
       WHERE penalty_id = $1
@@ -647,4 +675,193 @@ export async function getFineSummary(schoolYearId?: string) {
     },
     { unpaid: 0, paid: 0, waived: 0 }
   );
+}
+
+
+type ListPenaltyResultsOptions = {
+  schoolYearId?: string;
+  status?: FineStatus;
+  studentId?: string;
+  limit?: number;
+  offset?: number;
+};
+
+export async function listPenaltyResults(options: ListPenaltyResultsOptions = {}) {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+
+  if (options.schoolYearId) {
+    params.push(options.schoolYearId);
+    clauses.push(`pr.school_year_id = $${params.length}`);
+  }
+
+  if (options.status) {
+    params.push(options.status);
+    clauses.push(`pr.status = $${params.length}`);
+  }
+
+  if (options.studentId) {
+    params.push(options.studentId);
+    clauses.push(`LOWER(TRIM(pr.student_id)) = LOWER(TRIM($${params.length}))`);
+  }
+
+  params.push(options.limit ?? 100);
+  const limitPosition = params.length;
+
+  params.push(options.offset ?? 0);
+  const offsetPosition = params.length;
+
+  const result = await query<PenaltyResultRecord>(
+    `
+      SELECT *
+      FROM penalty_results pr
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+      ORDER BY pr.updated_at DESC, pr.created_at DESC
+      LIMIT $${limitPosition} OFFSET $${offsetPosition}
+    `,
+    params,
+  );
+
+  return result.rows;
+}
+
+export async function refreshPenaltyResults(options: { schoolYearId?: string } = {}) {
+  const schoolYearId = cleanOptionalText(options.schoolYearId);
+  const whereSql = schoolYearId ? "WHERE school_year_id = $1" : "";
+  const params = schoolYearId ? [schoolYearId] : [];
+
+  const result = await query<PenaltyResultRecord>(
+    `
+      WITH source_absences AS (
+        SELECT
+          school_year_id,
+          student_id,
+          name,
+          SUM(total_absences)::INT AS no_of_absences,
+          'attendance_final_results'::TEXT AS source_table,
+          NULL::UUID AS source_record_id
+        FROM attendance_final_results
+        ${whereSql}
+        GROUP BY school_year_id, student_id, name
+
+        UNION ALL
+
+        SELECT
+          school_year_id,
+          student_id,
+          name,
+          SUM(no_of_absences)::INT AS no_of_absences,
+          'manual_attendance_records'::TEXT AS source_table,
+          MAX(id)::UUID AS source_record_id
+        FROM manual_attendance_records
+        ${whereSql}
+        GROUP BY school_year_id, student_id, name
+      ), totals AS (
+        SELECT
+          school_year_id,
+          student_id,
+          MAX(name) AS name,
+          SUM(no_of_absences)::INT AS no_of_absences,
+          MAX(source_table) AS source_table,
+          MAX(source_record_id) AS source_record_id
+        FROM source_absences
+        GROUP BY school_year_id, student_id
+        HAVING SUM(no_of_absences)::INT > 0
+      ), matched AS (
+        SELECT
+          totals.*,
+          penalty.id AS penalty_id,
+          COALESCE(penalty.prescribed_penalty, 'No prescribed penalty configured.') AS prescribed_penalty
+        FROM totals
+        LEFT JOIN LATERAL (
+          SELECT id, prescribed_penalty
+          FROM penalties
+          WHERE no_of_absences <= totals.no_of_absences
+          ORDER BY no_of_absences DESC
+          LIMIT 1
+        ) penalty ON TRUE
+      )
+      INSERT INTO penalty_results (
+        school_year_id,
+        student_id,
+        name,
+        no_of_absences,
+        penalty_id,
+        prescribed_penalty,
+        status,
+        source_table,
+        source_record_id
+      )
+      SELECT
+        school_year_id,
+        student_id,
+        name,
+        no_of_absences,
+        penalty_id,
+        prescribed_penalty,
+        'unpaid',
+        source_table,
+        source_record_id
+      FROM matched
+      ON CONFLICT (school_year_id, (LOWER(TRIM(student_id))))
+      DO UPDATE SET
+        name = EXCLUDED.name,
+        no_of_absences = EXCLUDED.no_of_absences,
+        penalty_id = EXCLUDED.penalty_id,
+        prescribed_penalty = EXCLUDED.prescribed_penalty,
+        source_table = EXCLUDED.source_table,
+        source_record_id = EXCLUDED.source_record_id,
+        updated_at = NOW()
+      RETURNING *
+    `,
+    params,
+  );
+
+  await query(
+    `
+      DELETE FROM penalty_results pr
+      WHERE ($1::uuid IS NULL OR pr.school_year_id = $1::uuid)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM (
+            SELECT school_year_id, student_id, SUM(total_absences)::INT AS no_of_absences
+            FROM attendance_final_results
+            GROUP BY school_year_id, student_id
+            UNION ALL
+            SELECT school_year_id, student_id, SUM(no_of_absences)::INT AS no_of_absences
+            FROM manual_attendance_records
+            GROUP BY school_year_id, student_id
+          ) source
+          WHERE source.school_year_id IS NOT DISTINCT FROM pr.school_year_id
+            AND LOWER(TRIM(source.student_id)) = LOWER(TRIM(pr.student_id))
+            AND source.no_of_absences > 0
+        )
+    `,
+    [schoolYearId ?? null],
+  );
+
+  return result.rows;
+}
+
+export async function updatePenaltyResultStatus(id: string, status: FineStatus) {
+  if (!["unpaid", "paid", "waived"].includes(status)) {
+    throw new Error("Invalid penalty result status.");
+  }
+
+  const result = await query<PenaltyResultRecord>(
+    `
+      UPDATE penalty_results
+      SET status = $2,
+          updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `,
+    [id, status],
+  );
+
+  if (!result.rows[0]) {
+    throw new Error("Penalty result not found.");
+  }
+
+  return result.rows[0];
 }

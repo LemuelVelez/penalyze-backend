@@ -9,10 +9,13 @@ import {
   deleteImports as deleteAttendanceImports,
   deleteRecord as deleteAttendanceRecord,
   events as attendanceEvents,
+  finalResults as attendanceFinalResults,
   imports as attendanceImports,
   index as attendanceIndex,
+  manualRecords as attendanceManualRecords,
   manualSave,
   previewImport,
+  refreshFinalResults as refreshAttendanceFinalResults,
   saveEvent as saveAttendanceEvent,
   saveImport,
   saveImportWithProgress,
@@ -26,15 +29,20 @@ import {
   fines,
   matchPenalty,
   penalties,
+  penaltyResults,
+  refreshPenaltyResultRows,
   registerZeroAttendance,
   savePenalty,
   seedPenalties,
   summary,
   updatePenalty,
+  updatePenaltyResultRowStatus,
   updateStatus
 } from "./controller/fines.controller";
 import {
   activate as activateSchoolYear,
+  assignCurrent as assignCurrentSchoolYearRecords,
+  deleteRecords as deleteSchoolYearRecords,
   index as schoolYears,
   save as saveSchoolYear,
   transfer as transferSchoolYearRecords
@@ -113,6 +121,8 @@ app.delete("/api/users/:id", requireAuth, requireAdmin, deleteUser);
 app.get("/api/school-years", schoolYears);
 app.post("/api/school-years", saveSchoolYear);
 app.patch("/api/school-years/transfer", transferSchoolYearRecords);
+app.patch("/api/school-years/:id/assign-current", assignCurrentSchoolYearRecords);
+app.delete("/api/school-years/:id/records", deleteSchoolYearRecords);
 app.patch("/api/school-years/:id/activate", activateSchoolYear);
 
 app.get("/api/attendance/events", attendanceEvents);
@@ -120,6 +130,9 @@ app.post("/api/attendance/events", saveAttendanceEvent);
 app.put("/api/attendance/events/:eventId", updateAttendanceEvent);
 app.patch("/api/attendance/events/:eventId", updateAttendanceEvent);
 app.delete("/api/attendance/events/:eventId", deleteAttendanceEvent);
+app.get("/api/attendance/final-results", attendanceFinalResults);
+app.post("/api/attendance/final-results/refresh", refreshAttendanceFinalResults);
+app.get("/api/attendance/manual-records", attendanceManualRecords);
 app.get("/api/attendance", attendanceIndex);
 app.get("/api/attendance/imports", attendanceImports);
 app.delete("/api/attendance/imports", deleteAttendanceImports);
@@ -137,6 +150,9 @@ app.delete("/api/attendance/:id", deleteAttendanceRecord);
 
 app.get("/api/fines", fines);
 app.get("/api/fines/summary", summary);
+app.get("/api/fines/penalty-results", penaltyResults);
+app.post("/api/fines/penalty-results/refresh", refreshPenaltyResultRows);
+app.patch("/api/fines/penalty-results/:id/status", updatePenaltyResultRowStatus);
 app.post("/api/fines/zero-attendance", registerZeroAttendance);
 app.patch("/api/fines/:id/status", updateStatus);
 app.get("/api/fines/penalties", penalties);

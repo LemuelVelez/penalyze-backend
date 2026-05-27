@@ -2,7 +2,9 @@ import { NextFunction, Request, Response } from "express";
 
 import {
   activateSchoolYear,
+  assignCurrentRecordsToSchoolYear,
   createSchoolYear,
+  deleteSchoolYearRecords,
   listSchoolYears,
   transferSchoolYearRecords,
 } from "../services/school-years.service";
@@ -53,6 +55,38 @@ export async function activate(req: Request, res: Response, next: NextFunction) 
 
     const row = await activateSchoolYear(id);
     res.json({ message: "School year activated successfully.", data: row });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function assignCurrent(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "School year ID is required." });
+      return;
+    }
+
+    const data = await assignCurrentRecordsToSchoolYear(id);
+    res.json({ message: "Current records assigned to school year successfully.", data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteRecords(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "School year ID is required." });
+      return;
+    }
+
+    const data = await deleteSchoolYearRecords(id);
+    res.json({ message: "School-year records deleted successfully.", data });
   } catch (error) {
     next(error);
   }
