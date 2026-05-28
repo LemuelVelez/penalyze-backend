@@ -165,6 +165,10 @@ const HEADER_ALIASES = {
     "date scanned",
     "time scanned",
     "timestamp",
+    "first scan at",
+    "first_scan_at",
+    "last scan at",
+    "last_scan_at",
   ],
   studentId: [
     "studentid",
@@ -213,6 +217,7 @@ function normalizeHeader(value: unknown) {
 function cleanText(value: unknown) {
   return String(value ?? "")
     .replace(/^\uFEFF/, "")
+    .replace(/[\u00A0\u202F]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -332,49 +337,80 @@ function detectDelimiter(line: string) {
     .sort((a, b) => b.score - a.score)[0].delimiter;
 }
 
+function hasAttendanceStudentHeaders(headers: string[]) {
+  return (
+    headers.some((header) => HEADER_ALIASES.studentId.includes(header as any)) &&
+    headers.some((header) => HEADER_ALIASES.name.includes(header as any))
+  );
+}
+
+function parseNamedDelimitedRows(lines: string[]) {
+  const rows: RawImportRow[] = [];
+
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const delimiter = detectDelimiter(lines[lineIndex]);
+    const headerCells = parseDelimitedLine(lines[lineIndex], delimiter);
+    const normalizedHeaders = headerCells.map(normalizeHeader);
+
+    if (!hasAttendanceStudentHeaders(normalizedHeaders)) continue;
+
+    for (let rowIndex = lineIndex + 1; rowIndex < lines.length; rowIndex += 1) {
+      const rowDelimiter = detectDelimiter(lines[rowIndex]);
+      const rowHeaders = parseDelimitedLine(lines[rowIndex], rowDelimiter).map(
+        normalizeHeader,
+      );
+
+      if (hasAttendanceStudentHeaders(rowHeaders)) {
+        lineIndex = rowIndex - 1;
+        break;
+      }
+
+      const cells = parseDelimitedLine(lines[rowIndex], delimiter);
+      const hasValue = cells.some((cell) => cleanText(cell));
+
+      if (!hasValue) continue;
+
+      rows.push(
+        headerCells.reduce<RawImportRow>((row, header, index) => {
+          row[header] = cells[index] ?? "";
+          return row;
+        }, {}),
+      );
+    }
+  }
+
+  return rows;
+}
+
 function textToRows(text: string) {
-  const lines = text
+  const normalizedText = text
+    .replace(/\u00A0|\u202F/g, " ")
     .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
+    .replace(/\r/g, "\n");
+  const lines = normalizedText
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
 
   if (!lines.length) return [];
 
+  const namedRows = parseNamedDelimitedRows(lines);
+  if (namedRows.length) return namedRows;
+
   const delimiter = detectDelimiter(lines[0]);
-  const headerCells = parseDelimitedLine(lines[0], delimiter);
-  const normalizedHeaders = headerCells.map(normalizeHeader);
-  const hasNamedHeaders =
-    normalizedHeaders.some((header) =>
-      HEADER_ALIASES.studentId.includes(header as any),
-    ) &&
-    normalizedHeaders.some((header) =>
-      HEADER_ALIASES.name.includes(header as any),
-    );
 
-  if (!hasNamedHeaders) {
-    return lines.map((line) => {
-      const cells = parseDelimitedLine(line, delimiter);
-      return {
-        studentId: cells[0] ?? "",
-        name: cells[1] ?? "",
-        yearLevel: cells[2] ?? "",
-        college: cells[3] ?? "",
-        program: cells[4] ?? "",
-        institution: cells[5] ?? "",
-        noOfAbsences: cells[6] ?? "",
-        remarks: cells.slice(7).join(" "),
-      };
-    });
-  }
-
-  return lines.slice(1).map((line) => {
+  return lines.map((line) => {
     const cells = parseDelimitedLine(line, delimiter);
-    return headerCells.reduce<RawImportRow>((row, header, index) => {
-      row[header] = cells[index] ?? "";
-      return row;
-    }, {});
+    return {
+      studentId: cells[0] ?? "",
+      name: cells[1] ?? "",
+      yearLevel: cells[2] ?? "",
+      college: cells[3] ?? "",
+      program: cells[4] ?? "",
+      institution: cells[5] ?? "",
+      noOfAbsences: cells[6] ?? "",
+      remarks: cells.slice(7).join(" "),
+    };
   });
 }
 
@@ -532,18 +568,101 @@ function buildPreview(
   };
 }
 
+function getRawImportRowHeaders(rows: RawImportRow[]) {
+  const headers = new Set<string>();
+
+  rows.forEach((row) => {
+    Object.keys(row ?? {}).forEach((key) => {
+      const header = normalizeHeader(key);
+      if (header) headers.add(header);
+    });
+  });
+
+  return Array.from(headers);
+}
+
+function getAttendanceSheetPriority(sheetName: string) {
+  const normalizedName = normalizeHeader(sheetName);
+
+  if (/^raw\s*scans?$/.test(normalizedName)) return 1;
+  if (/^student\s*totals?$/.test(normalizedName)) return 2;
+  if (normalizedName.includes("raw") && normalizedName.includes("scan")) return 1;
+  if (normalizedName.includes("student") && normalizedName.includes("total")) {
+    return 2;
+  }
+
+  return 3;
+}
+
+function scoreAttendanceSheetRows(sheetName: string, rows: RawImportRow[]) {
+  const headers = getRawImportRowHeaders(rows);
+
+  if (!hasAttendanceStudentHeaders(headers)) return 0;
+
+  const hasScannedAt = headers.some((header) =>
+    HEADER_ALIASES.scannedAt.includes(header as any),
+  );
+  const hasEventName = headers.some((header) =>
+    HEADER_ALIASES.eventName.includes(header as any),
+  );
+  const priority = getAttendanceSheetPriority(sheetName);
+  const priorityScore = priority === 1 ? 30000 : priority === 2 ? 20000 : 10000;
+
+  return (
+    priorityScore +
+    (hasScannedAt ? 5000 : 0) +
+    (hasEventName ? 1000 : 0) +
+    rows.length
+  );
+}
+
 async function parseExcelFile(file: UploadedAttendanceFile) {
   const XLSX = loadRequiredModule<any>("xlsx");
   const workbook = XLSX.read(file.buffer, { type: "buffer", cellDates: false });
-  const firstSheetName = workbook.SheetNames?.[0];
+  const sheetNames = workbook.SheetNames ?? [];
 
-  if (!firstSheetName) return [];
+  if (!sheetNames.length) return [];
 
-  const worksheet = workbook.Sheets[firstSheetName];
-  return XLSX.utils.sheet_to_json(worksheet, {
-    defval: "",
-    raw: false,
-  }) as RawImportRow[];
+  const parsedSheets = sheetNames
+    .map((sheetName: string) => {
+      const worksheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(worksheet, {
+        defval: "",
+        raw: false,
+        blankrows: false,
+      }) as RawImportRow[];
+
+      return {
+        sheetName,
+        priority: getAttendanceSheetPriority(sheetName),
+        score: scoreAttendanceSheetRows(sheetName, rows),
+        rows,
+      };
+    })
+    .filter((sheet: { score: number; rows: RawImportRow[] }) =>
+      sheet.score > 0 && sheet.rows.length > 0,
+    )
+    .sort(
+      (
+        left: { priority: number; score: number },
+        right: { priority: number; score: number },
+      ) => left.priority - right.priority || right.score - left.score,
+    );
+
+  if (!parsedSheets.length) {
+    const firstSheetName = sheetNames[0];
+    const worksheet = workbook.Sheets[firstSheetName];
+    return XLSX.utils.sheet_to_json(worksheet, {
+      defval: "",
+      raw: false,
+      blankrows: false,
+    }) as RawImportRow[];
+  }
+
+  const bestPriority = parsedSheets[0].priority;
+  return parsedSheets
+    .filter((sheet: { priority: number }) => sheet.priority === bestPriority)
+    .flatMap((sheet: { rows: RawImportRow[] }) => sheet.rows);
 }
 
 async function parseDocxFile(file: UploadedAttendanceFile) {
@@ -2978,6 +3097,7 @@ export async function listAttendanceRecords(
   eventId?: string,
   college?: string,
   schoolYearId?: string,
+  importIds: string[] = [],
 ) {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -3002,6 +3122,12 @@ export async function listAttendanceRecords(
   if (schoolYearId) {
     params.push(schoolYearId);
     clauses.push(`ar.school_year_id = $${params.length}`);
+  }
+
+  const cleanImportIds = uniqueCleanTextValues(importIds);
+  if (cleanImportIds.length) {
+    params.push(cleanImportIds);
+    clauses.push(`ar.import_id = ANY($${params.length}::uuid[])`);
   }
 
   params.push(limit);

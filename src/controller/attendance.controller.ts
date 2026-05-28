@@ -516,6 +516,12 @@ export async function index(req: Request, res: Response, next: NextFunction) {
     const schoolYearId = req.query.schoolYearId
       ? String(req.query.schoolYearId).trim()
       : undefined;
+    const importIds = req.query.importIds
+      ? String(req.query.importIds)
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean)
+      : [];
     const records = await listAttendanceRecords(
       limit,
       offset,
@@ -523,6 +529,7 @@ export async function index(req: Request, res: Response, next: NextFunction) {
       eventId,
       college,
       schoolYearId,
+      importIds,
     );
 
     res.json({ data: records });
