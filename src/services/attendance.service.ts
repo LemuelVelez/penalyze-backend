@@ -3481,21 +3481,28 @@ async function refreshCalculationResultsWithClient(
           MAX(updated_at) AS source_updated_at
         FROM imported_records
         GROUP BY school_year_id, LOWER(TRIM(student_id))
-      ), manual_totals AS (
+      ), manual_records AS (
         SELECT
           mar.school_year_id,
           LOWER(TRIM(mar.student_id)) AS normalized_student_id,
-          MAX(mar.student_id) AS student_id,
-          COALESCE(NULLIF(MAX(s.name), ''), NULLIF(MAX(mar.name), ''), MAX(mar.student_id)) AS name,
-          COALESCE(NULLIF(MAX(s.year_level), ''), NULLIF(MAX(mar.year_level), '')) AS year_level,
-          COALESCE(NULLIF(MAX(s.college), ''), NULLIF(MAX(mar.college), '')) AS college,
-          COALESCE(NULLIF(MAX(s.program), ''), NULLIF(MAX(mar.program), '')) AS program,
-          COALESCE(NULLIF(MAX(s.institution), ''), NULLIF(MAX(mar.institution), '')) AS institution,
-          GREATEST(0, SUM(COALESCE(mar.no_of_absences, 0)))::INT AS manual_absences,
-          COUNT(*)::INT AS manual_record_count,
-          MAX(COALESCE(mar.scanned_at, mar.created_at)) AS latest_scanned_at,
-          MAX(mar.updated_at) AS source_updated_at
+          mar.student_id,
+          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id) AS name,
+          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(mar.year_level), '')) AS year_level,
+          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')) AS college,
+          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), '')) AS program,
+          COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(mar.institution), '')) AS institution,
+          CASE
+            WHEN (
+              mar.attendance_type = 'zero_attendance'
+              OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT)
+            ) THEN NULL
+            ELSE COALESCE(mar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), mar.id::TEXT)
+          END AS event_key,
+          GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
+          COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
+          mar.updated_at
         FROM manual_attendance_records mar
+        LEFT JOIN attendance_events ae ON ae.id = mar.event_id
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
           AND (
@@ -3512,7 +3519,49 @@ async function refreshCalculationResultsWithClient(
               )
             )
           )
-        GROUP BY mar.school_year_id, LOWER(TRIM(mar.student_id))
+      ), manual_totals AS (
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          MAX(student_id) AS student_id,
+          COALESCE(NULLIF(MAX(name), ''), MAX(student_id)) AS name,
+          COALESCE(NULLIF(MAX(year_level), ''), '') AS year_level,
+          COALESCE(NULLIF(MAX(college), ''), '') AS college,
+          COALESCE(NULLIF(MAX(program), ''), '') AS program,
+          COALESCE(NULLIF(MAX(institution), ''), '') AS institution,
+          GREATEST(0, SUM(no_of_absences))::INT AS manual_absences,
+          COUNT(*)::INT AS manual_record_count,
+          MAX(scanned_at) AS latest_scanned_at,
+          MAX(updated_at) AS source_updated_at
+        FROM manual_records
+        GROUP BY school_year_id, normalized_student_id
+      ), event_attendance AS (
+        SELECT
+          school_year_id,
+          LOWER(TRIM(student_id)) AS normalized_student_id,
+          event_key
+        FROM imported_records
+        WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
+        UNION
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          event_key
+        FROM manual_records
+        WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
+      ), attended_event_totals AS (
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS attended_events
+        FROM event_attendance
+        GROUP BY school_year_id, normalized_student_id
+      ), expected_event_totals AS (
+        SELECT
+          school_year_id,
+          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS expected_events
+        FROM event_attendance
+        GROUP BY school_year_id
       ), student_keys AS (
         SELECT school_year_id, normalized_student_id FROM imported_totals
         UNION
@@ -3528,12 +3577,27 @@ async function refreshCalculationResultsWithClient(
           COALESCE(imported.college, manual.college) AS college,
           COALESCE(imported.program, manual.program) AS program,
           COALESCE(imported.institution, manual.institution) AS institution,
-          COALESCE(imported.attended_events, 0)::INT AS attended_events,
-          COALESCE(imported.imported_absences, 0)::INT AS imported_absences,
+          COALESCE(attended.attended_events, 0)::INT AS attended_events,
+          GREATEST(
+            COALESCE(imported.imported_absences, 0),
+            GREATEST(
+              COALESCE(expected.expected_events, 0) -
+                COALESCE(attended.attended_events, 0) -
+                COALESCE(manual.manual_absences, 0),
+              0
+            )
+          )::INT AS imported_absences,
           COALESCE(manual.manual_absences, 0)::INT AS manual_absences,
           (
-            COALESCE(imported.imported_absences, 0) +
-            COALESCE(manual.manual_absences, 0)
+            GREATEST(
+              COALESCE(imported.imported_absences, 0),
+              GREATEST(
+                COALESCE(expected.expected_events, 0) -
+                  COALESCE(attended.attended_events, 0) -
+                  COALESCE(manual.manual_absences, 0),
+                0
+              )
+            ) + COALESCE(manual.manual_absences, 0)
           )::INT AS total_absences,
           (
             COALESCE(imported.imported_record_count, 0) +
@@ -3554,6 +3618,11 @@ async function refreshCalculationResultsWithClient(
         LEFT JOIN manual_totals manual
           ON manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
           AND manual.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN attended_event_totals attended
+          ON attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+          AND attended.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN expected_event_totals expected
+          ON expected.school_year_id IS NOT DISTINCT FROM keys.school_year_id
       ), matched AS (
         SELECT
           merged.*,
@@ -3861,7 +3930,10 @@ async function refreshAttendanceFinalResultsWithClient(
           COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), '')) AS college,
           COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), '')) AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
-          COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), ar.import_id::TEXT, ar.id::TEXT) AS event_key,
+          CASE
+            WHEN LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($2::TEXT) THEN NULL
+            ELSE COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), ar.import_id::TEXT, ar.id::TEXT)
+          END AS event_key,
           GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
           ar.updated_at
@@ -3889,13 +3961,20 @@ async function refreshAttendanceFinalResultsWithClient(
       ), manual_records AS (
         SELECT
           mar.school_year_id,
+          LOWER(TRIM(mar.student_id)) AS normalized_student_id,
           mar.student_id,
           COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id) AS name,
           COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(mar.year_level), '')) AS year_level,
           COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')) AS college,
           COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), '')) AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(mar.institution), '')) AS institution,
-          COALESCE(mar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), mar.id::TEXT) AS event_key,
+          CASE
+            WHEN (
+              mar.attendance_type = 'zero_attendance'
+              OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($2::TEXT)
+            ) THEN NULL
+            ELSE COALESCE(mar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), mar.id::TEXT)
+          END AS event_key,
           GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
           mar.updated_at
@@ -3906,20 +3985,46 @@ async function refreshAttendanceFinalResultsWithClient(
       ), manual_totals AS (
         SELECT
           school_year_id,
-          LOWER(TRIM(student_id)) AS normalized_student_id,
+          normalized_student_id,
           MAX(student_id) AS student_id,
           COALESCE(NULLIF(MAX(name), ''), MAX(student_id)) AS name,
           COALESCE(NULLIF(MAX(year_level), ''), '') AS year_level,
           COALESCE(NULLIF(MAX(college), ''), '') AS college,
           COALESCE(NULLIF(MAX(program), ''), '') AS program,
           COALESCE(NULLIF(MAX(institution), ''), '') AS institution,
-          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS attended_events,
           GREATEST(0, SUM(no_of_absences))::INT AS manual_absences,
           COUNT(*)::INT AS manual_record_count,
           MAX(scanned_at) AS latest_scanned_at,
           MAX(updated_at) AS source_updated_at
         FROM manual_records
-        GROUP BY school_year_id, LOWER(TRIM(student_id))
+        GROUP BY school_year_id, normalized_student_id
+      ), event_attendance AS (
+        SELECT
+          school_year_id,
+          LOWER(TRIM(student_id)) AS normalized_student_id,
+          event_key
+        FROM imported_records
+        WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
+        UNION
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          event_key
+        FROM manual_records
+        WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
+      ), attended_event_totals AS (
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS attended_events
+        FROM event_attendance
+        GROUP BY school_year_id, normalized_student_id
+      ), expected_event_totals AS (
+        SELECT
+          school_year_id,
+          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS expected_events
+        FROM event_attendance
+        GROUP BY school_year_id
       ), student_keys AS (
         SELECT school_year_id, normalized_student_id FROM imported_totals
         UNION
@@ -3933,13 +4038,17 @@ async function refreshAttendanceFinalResultsWithClient(
           COALESCE(imported.college, manual.college, '') AS college,
           COALESCE(imported.program, manual.program, '') AS program,
           COALESCE(imported.institution, manual.institution, '') AS institution,
+          COALESCE(attended.attended_events, 0)::INT AS attended_events,
           (
-            COALESCE(imported.attended_events, 0) +
-            COALESCE(manual.attended_events, 0)
-          )::INT AS attended_events,
-          (
-            COALESCE(imported.imported_absences, 0) +
-            COALESCE(manual.manual_absences, 0)
+            GREATEST(
+              COALESCE(imported.imported_absences, 0),
+              GREATEST(
+                COALESCE(expected.expected_events, 0) -
+                  COALESCE(attended.attended_events, 0) -
+                  COALESCE(manual.manual_absences, 0),
+                0
+              )
+            ) + COALESCE(manual.manual_absences, 0)
           )::INT AS total_absences,
           GREATEST(
             COALESCE(imported.latest_scanned_at, '-infinity'::timestamptz),
@@ -3956,6 +4065,11 @@ async function refreshAttendanceFinalResultsWithClient(
         LEFT JOIN manual_totals manual
           ON manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
           AND manual.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN attended_event_totals attended
+          ON attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+          AND attended.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN expected_event_totals expected
+          ON expected.school_year_id IS NOT DISTINCT FROM keys.school_year_id
       )
       INSERT INTO attendance_final_results (
         school_year_id,
@@ -3992,7 +4106,7 @@ async function refreshAttendanceFinalResultsWithClient(
       FROM merged
       RETURNING *
     `,
-    [schoolYearId],
+    [schoolYearId, ZERO_ATTENDANCE_REMARK],
   );
 
   return result.rows;
