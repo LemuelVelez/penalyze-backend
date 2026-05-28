@@ -10,6 +10,8 @@ import {
   deleteAttendanceImports,
   deleteAttendanceImportsByIds,
   deleteAttendanceRecord,
+  deleteCalculationResultsByIds,
+  deleteCalculationResultsBySchoolYear,
   deleteManualAttendanceRecordsByIds,
   deleteManualAttendanceRecordsBySchoolYear,
   getAttendanceImport,
@@ -597,6 +599,36 @@ export async function refreshCalculationResultRows(req: Request, res: Response, 
     });
 
     res.json({ message: "Calculation results refreshed.", data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+
+export async function deleteCalculationResultRows(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const ids = getRequestRecordIds(req);
+    const schoolYearId = getRequestSchoolYearId(req);
+
+    if (!ids.length && !schoolYearId) {
+      res.status(400).json({
+        message: "Calculation result IDs or school year ID are required.",
+      });
+      return;
+    }
+
+    const result = ids.length
+      ? await deleteCalculationResultsByIds(ids)
+      : await deleteCalculationResultsBySchoolYear(schoolYearId);
+
+    res.json({
+      message: "Calculation results deleted successfully.",
+      data: result,
+    });
   } catch (error) {
     next(error);
   }

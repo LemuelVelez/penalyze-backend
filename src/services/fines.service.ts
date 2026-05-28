@@ -88,37 +88,8 @@ function getAttendanceRecordCollegeScopeSql(recordAlias: string) {
   `;
 }
 
-function getManualAttendanceRecordScopeColumnSql(recordAlias: string, columnName: string) {
-  return `
-    LOWER(TRIM(COALESCE(
-      (
-        SELECT NULLIF(TRIM(scope_student.${columnName}), '')
-        FROM students scope_student
-        WHERE LOWER(TRIM(scope_student.student_id)) = LOWER(TRIM(${recordAlias}.student_id))
-        LIMIT 1
-      ),
-      NULLIF(TRIM(${recordAlias}.${columnName}), ''),
-      ''
-    )))
-  `;
-}
-
-function getManualAttendanceRecordCollegeScopeSql(recordAlias: string) {
-  return `
-    CONCAT_WS(
-      '|',
-      ${getManualAttendanceRecordScopeColumnSql(recordAlias, "institution")},
-      ${getManualAttendanceRecordScopeColumnSql(recordAlias, "college")},
-      ${getManualAttendanceRecordScopeColumnSql(recordAlias, "program")},
-      ${getManualAttendanceRecordScopeColumnSql(recordAlias, "year_level")}
-    )
-  `;
-}
-
 const ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL =
   getAttendanceRecordCollegeScopeSql("ar");
-const MANUAL_ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL =
-  getManualAttendanceRecordCollegeScopeSql("mar");
 
 function getFineTableColumnsSql(alias: string) {
   return [
@@ -458,21 +429,15 @@ export async function listFines(options: { schoolYearId?: string; status?: FineS
 async function getAttendanceEventCount(input: ReturnType<typeof validateZeroAttendanceInput>, schoolYearId: string) {
   const result = await query<{ total: number }>(
     `
-      WITH college_event_scope AS (
-        SELECT DISTINCT ar.event_id
-        FROM attendance_records ar
-        WHERE ar.event_id IS NOT NULL
-          AND ar.school_year_id = $2
-          AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1
-        UNION
-        SELECT DISTINCT mar.event_id
-        FROM manual_attendance_records mar
-        WHERE mar.event_id IS NOT NULL
-          AND mar.school_year_id = $2
-          AND ${MANUAL_ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1
-      )
-      SELECT COUNT(DISTINCT event_id)::INT AS total
-      FROM college_event_scope
+      SELECT COUNT(DISTINCT ae.id)::INT AS total
+      FROM attendance_events ae
+      WHERE ae.school_year_id = $2::uuid
+        AND EXISTS (
+          SELECT 1
+          FROM attendance_records ar
+          WHERE ar.event_id = ae.id
+            AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1::TEXT
+        )
     `,
     [buildAcademicScopeKey(input), schoolYearId]
   );

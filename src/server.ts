@@ -13,6 +13,7 @@ import {
   deleteManualRecord as deleteAttendanceManualRecord,
   deleteManualRecords as deleteAttendanceManualRecords,
   deleteRecord as deleteAttendanceRecord,
+  deleteCalculationResultRows as deleteAttendanceCalculationResults,
   events as attendanceEvents,
   finalResults as attendanceFinalResults,
   imports as attendanceImports,
@@ -149,6 +150,7 @@ app.delete("/api/attendance/final-results", deleteAttendanceFinalResults);
 app.delete("/api/attendance/final-results/:id", deleteAttendanceFinalResult);
 app.post("/api/attendance/final-results/refresh", refreshAttendanceFinalResults);
 app.get("/api/attendance/calculation-results", attendanceCalculationResults);
+app.delete("/api/attendance/calculation-results", deleteAttendanceCalculationResults);
 app.post("/api/attendance/calculation-results/refresh", refreshAttendanceCalculationResults);
 app.get("/api/attendance/manual-records", attendanceManualRecords);
 app.delete("/api/attendance/manual-records", deleteAttendanceManualRecords);
