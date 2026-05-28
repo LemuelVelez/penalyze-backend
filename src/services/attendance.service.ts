@@ -19,6 +19,9 @@ import {
 } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
 
+const ZERO_ATTENDANCE_REMARK =
+  "Zero attendance registration from landing page.";
+
 declare const require: any;
 
 export type UploadedAttendanceFile = {
@@ -60,14 +63,14 @@ export type DeletedAttendanceFinalResultsResult = {
   deletedRecords: AttendanceFinalResultRecord[];
 };
 
-export type DeletedManualAttendanceRecordsResult = {
-  deletedCount: number;
-  deletedRecords: ManualAttendanceRecord[];
-};
-
 export type DeletedCalculationResultsResult = {
   deletedCount: number;
   deletedRecords: CalculationResultRecord[];
+};
+
+export type DeletedManualAttendanceRecordsResult = {
+  deletedCount: number;
+  deletedRecords: ManualAttendanceRecord[];
 };
 
 export type AttendanceEventInput = {
@@ -344,8 +347,9 @@ function detectDelimiter(line: string) {
 
 function hasAttendanceStudentHeaders(headers: string[]) {
   return (
-    headers.some((header) => HEADER_ALIASES.studentId.includes(header as any)) &&
-    headers.some((header) => HEADER_ALIASES.name.includes(header as any))
+    headers.some((header) =>
+      HEADER_ALIASES.studentId.includes(header as any),
+    ) && headers.some((header) => HEADER_ALIASES.name.includes(header as any))
   );
 }
 
@@ -591,7 +595,8 @@ function getAttendanceSheetPriority(sheetName: string) {
 
   if (/^raw\s*scans?$/.test(normalizedName)) return 1;
   if (/^student\s*totals?$/.test(normalizedName)) return 2;
-  if (normalizedName.includes("raw") && normalizedName.includes("scan")) return 1;
+  if (normalizedName.includes("raw") && normalizedName.includes("scan"))
+    return 1;
   if (normalizedName.includes("student") && normalizedName.includes("total")) {
     return 2;
   }
@@ -644,8 +649,9 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
         rows,
       };
     })
-    .filter((sheet: { score: number; rows: RawImportRow[] }) =>
-      sheet.score > 0 && sheet.rows.length > 0,
+    .filter(
+      (sheet: { score: number; rows: RawImportRow[] }) =>
+        sheet.score > 0 && sheet.rows.length > 0,
     )
     .sort(
       (
@@ -810,7 +816,6 @@ function normalizeOptionalPositiveInteger(value: unknown, label = "Order") {
   return { value: parsedValue, error: "" };
 }
 
-
 function getEventInput(
   input: AttendanceEventInput | SaveRowsInput | RawImportRow,
 ) {
@@ -864,7 +869,6 @@ function getEventInput(
   };
 }
 
-
 function getSchoolYearRangeFromDate(value: Date = new Date()) {
   const year = value.getFullYear();
   const month = value.getMonth() + 1;
@@ -890,7 +894,10 @@ function getFirstValidSchoolYearDate(values: unknown[]) {
   return new Date();
 }
 
-async function ensureSchoolYearForDate(client: PoolClient, values: unknown[] = []) {
+async function ensureSchoolYearForDate(
+  client: PoolClient,
+  values: unknown[] = [],
+) {
   const range = getSchoolYearRangeFromDate(getFirstValidSchoolYearDate(values));
   const result = await client.query<SchoolYearRecord>(
     `
@@ -1029,7 +1036,6 @@ async function moveAttendanceEventOrder(
   }
 }
 
-
 async function resequenceAttendanceEvents(
   client: PoolClient,
   schoolYearId: string | null,
@@ -1063,12 +1069,21 @@ function getManualAttendanceEventInput(input: RawImportRow) {
   const eventInput = input as Record<string, unknown>;
 
   return {
-    schoolYearId: cleanText(eventInput.schoolYearId ?? eventInput.school_year_id),
+    schoolYearId: cleanText(
+      eventInput.schoolYearId ?? eventInput.school_year_id,
+    ),
     eventId: cleanText(eventInput.eventId ?? eventInput.event_id),
     eventName: cleanText(eventInput.eventName ?? eventInput.event_name),
-    eventStartAt: eventInput.eventStartAt ?? eventInput.event_start_at ?? eventInput.eventDate ?? eventInput.event_date,
+    eventStartAt:
+      eventInput.eventStartAt ??
+      eventInput.event_start_at ??
+      eventInput.eventDate ??
+      eventInput.event_date,
     eventEndAt: eventInput.eventEndAt ?? eventInput.event_end_at,
-    eventDescription: eventInput.eventDescription ?? eventInput.event_description ?? eventInput.description,
+    eventDescription:
+      eventInput.eventDescription ??
+      eventInput.event_description ??
+      eventInput.description,
   };
 }
 
@@ -1106,10 +1121,11 @@ async function findOrCreateAttendanceEvent(
   const name = eventInput.name || cleanText(fallbackName);
   if (!name) return null;
 
-  const schoolYearId = await resolveSchoolYearId(client, eventInput.schoolYearId, [
-    eventInput.eventStartAt,
-    eventInput.eventEndAt,
-  ]);
+  const schoolYearId = await resolveSchoolYearId(
+    client,
+    eventInput.schoolYearId,
+    [eventInput.eventStartAt, eventInput.eventEndAt],
+  );
 
   const existingResult = await client.query<AttendanceEventRecord>(
     `
@@ -1355,7 +1371,10 @@ type AttendanceRecordWithAbsenceScope = AttendanceRecord & {
   attendance_school_year_id: string | null;
 };
 
-function getAttendanceRecordScopeColumnSql(recordAlias: string, columnName: string) {
+function getAttendanceRecordScopeColumnSql(
+  recordAlias: string,
+  columnName: string,
+) {
   return `
     LOWER(TRIM(COALESCE(
       (
@@ -1391,8 +1410,6 @@ function getAttendanceRecordSortTime(record: AttendanceRecord) {
 
 const ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL =
   getAttendanceRecordCollegeScopeSql("ar");
-const MANUAL_ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL =
-  getAttendanceRecordCollegeScopeSql("mar");
 const ATTENDANCE_ATTENDED_RECORD_COLLEGE_SCOPE_SQL =
   getAttendanceRecordCollegeScopeSql("attended");
 const ATTENDANCE_ABSENCE_SYNC_LOCK_SQL =
@@ -1437,7 +1454,7 @@ function filterAttendanceFinesByRecordIds(
   return fines.filter((fine): fine is FineRecord => {
     return Boolean(
       fine?.attendance_record_id &&
-        recordIdSet.has(String(fine.attendance_record_id)),
+      recordIdSet.has(String(fine.attendance_record_id)),
     );
   });
 }
@@ -1646,7 +1663,9 @@ async function syncAbsencesForStudents(
     return { records, fines };
   }
 
-  const existingFineResult = await client.query<{ attendance_record_id: string }>(
+  const existingFineResult = await client.query<{
+    attendance_record_id: string;
+  }>(
     `
       SELECT attendance_record_id
       FROM fines
@@ -1785,7 +1804,9 @@ async function deleteAttendanceImportRecords(
     `,
     [uniqueImportIds],
   );
-  const calculationResultIds = calculationResultIdsResult.rows.map((row) => row.id);
+  const calculationResultIds = calculationResultIdsResult.rows.map(
+    (row) => row.id,
+  );
 
   if (finalResultIds.length || calculationResultIds.length) {
     await client.query(
@@ -1932,7 +1953,11 @@ export async function saveAttendanceRows(
               preview.rowsTotal,
               preview.rowsValid,
               preview.rowsInvalid,
-              defaultEvent?.school_year_id ?? await resolveSchoolYearId(client, input.schoolYearId, [input.eventStartAt, input.eventEndAt]),
+              defaultEvent?.school_year_id ??
+                (await resolveSchoolYearId(client, input.schoolYearId, [
+                  input.eventStartAt,
+                  input.eventEndAt,
+                ])),
             ],
           )
         ).rows[0]
@@ -1944,7 +1969,11 @@ export async function saveAttendanceRows(
               RETURNING *
             `,
             [
-              defaultEvent?.school_year_id ?? await resolveSchoolYearId(client, input.schoolYearId, [input.eventStartAt, input.eventEndAt]),
+              defaultEvent?.school_year_id ??
+                (await resolveSchoolYearId(client, input.schoolYearId, [
+                  input.eventStartAt,
+                  input.eventEndAt,
+                ])),
               defaultEvent?.id ?? null,
               preview.fileName,
               preview.fileType,
@@ -2126,7 +2155,10 @@ function getManualAttendanceType(input: RawImportRow) {
   if (value === "zero_attendance") return "zero_attendance";
 
   if (
-    !cleanText((input as Record<string, unknown>).eventId ?? (input as Record<string, unknown>).event_id) &&
+    !cleanText(
+      (input as Record<string, unknown>).eventId ??
+        (input as Record<string, unknown>).event_id,
+    ) &&
     cleanText((input as Record<string, unknown>).remarks)
       .toLowerCase()
       .includes("zero attendance")
@@ -2161,7 +2193,9 @@ function getManualRecordSelectSql() {
   `;
 }
 
-function manualRecordToAttendanceRecord(record: ManualAttendanceRecord): AttendanceRecord {
+function manualRecordToAttendanceRecord(
+  record: ManualAttendanceRecord,
+): AttendanceRecord {
   return {
     id: record.id,
     school_year_id: record.school_year_id,
@@ -2203,7 +2237,9 @@ async function getManualAttendanceEvent(
     return event;
   }
 
-  throw createValidationError("Please select an existing attendance event for manual attendance.");
+  throw createValidationError(
+    "Please select an existing attendance event for manual attendance.",
+  );
 }
 
 async function countCollegeEventsForManualRecord(
@@ -2211,34 +2247,41 @@ async function countCollegeEventsForManualRecord(
   row: ParsedAttendanceRow,
   schoolYearId: string,
 ) {
-  const scopeKey = [
-    row.institution,
-    row.college,
-    row.program,
-    row.yearLevel,
-  ]
-    .map((value) => cleanText(value).toLowerCase())
-    .join("|");
-
   const scopedCount = await client.query<{ total: number }>(
     `
       SELECT COUNT(DISTINCT ae.id)::INT AS total
       FROM attendance_events ae
-      WHERE ae.school_year_id = $2::uuid
+      WHERE ae.school_year_id = $1
         AND EXISTS (
           SELECT 1
           FROM attendance_records ar
           WHERE ar.event_id = ae.id
-            AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1::TEXT
+            AND LOWER(TRIM(COALESCE(ar.college, ''))) = LOWER(TRIM(COALESCE($2, '')))
+            AND LOWER(TRIM(COALESCE(ar.program, ''))) = LOWER(TRIM(COALESCE($3, ar.program, '')))
         )
     `,
-    [scopeKey, schoolYearId],
+    [schoolYearId, row.college ?? "", row.program ?? ""],
   );
 
-  return Number(scopedCount.rows[0]?.total ?? 0);
+  const total = Number(scopedCount.rows[0]?.total ?? 0);
+  if (total > 0) return total;
+
+  const fallbackCount = await client.query<{ total: number }>(
+    `
+      SELECT COUNT(*)::INT AS total
+      FROM attendance_events
+      WHERE school_year_id = $1
+    `,
+    [schoolYearId],
+  );
+
+  return Number(fallbackCount.rows[0]?.total ?? 0);
 }
 
-async function getPenaltyForAbsenceCount(client: PoolClient, noOfAbsences: number) {
+async function getPenaltyForAbsenceCount(
+  client: PoolClient,
+  noOfAbsences: number,
+) {
   const result = await client.query<{ id: string; prescribed_penalty: string }>(
     `
       SELECT id, prescribed_penalty
@@ -2265,7 +2308,10 @@ function penaltyResultToFine(record: PenaltyResultRecord): FineRecord {
     prescribed_penalty: record.prescribed_penalty,
     status: record.status,
     attendance_event_id: null,
-    attendance_remarks: record.source_table === "manual_attendance_records" ? "Manual attendance result" : "Final attendance result",
+    attendance_remarks:
+      record.source_table === "manual_attendance_records"
+        ? "Manual attendance result"
+        : "Final attendance result",
     created_at: record.created_at,
     updated_at: record.updated_at,
   };
@@ -2292,7 +2338,8 @@ async function upsertPenaltyResultForManualRecord(
   }
 
   const penalty = await getPenaltyForAbsenceCount(client, noOfAbsences);
-  const prescribedPenalty = penalty?.prescribed_penalty ?? "No prescribed penalty configured.";
+  const prescribedPenalty =
+    penalty?.prescribed_penalty ?? "No prescribed penalty configured.";
   const result = await client.query<PenaltyResultRecord>(
     `
       INSERT INTO penalty_results (
@@ -2346,10 +2393,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
           (input as Record<string, unknown>).school_year_id,
         [row.scannedAt],
       ));
-    const noOfAbsences =
-      attendanceType === "zero_attendance"
-        ? await countCollegeEventsForManualRecord(client, row, schoolYearId)
-        : Math.max(0, Number(row.noOfAbsences ?? 0));
+    const noOfAbsences = Math.max(0, Number(row.noOfAbsences ?? 0));
 
     await upsertStudent(client, {
       ...row,
@@ -2395,7 +2439,10 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       ...manualRecord,
       event_name: event?.name ?? null,
     });
-    const penaltyResult = await upsertPenaltyResultForManualRecord(client, manualRecord);
+    const penaltyResult = await upsertPenaltyResultForManualRecord(
+      client,
+      manualRecord,
+    );
 
     return {
       event,
@@ -2445,7 +2492,10 @@ export async function updateAttendanceRecords(
       client,
       uniqueIds,
     );
-    const event = await findOrCreateAttendanceEvent(client, getManualAttendanceEventInput(input));
+    const event = await findOrCreateAttendanceEvent(
+      client,
+      getManualAttendanceEventInput(input),
+    );
     await upsertStudent(client, row);
 
     const updatedResult = await client.query<AttendanceRecord>(
@@ -2469,7 +2519,13 @@ export async function updateAttendanceRecords(
       `,
       [
         uniqueIds,
-        event?.school_year_id ?? await resolveSchoolYearId(client, (input as Record<string, unknown>).schoolYearId ?? (input as Record<string, unknown>).school_year_id, [row.scannedAt]),
+        event?.school_year_id ??
+          (await resolveSchoolYearId(
+            client,
+            (input as Record<string, unknown>).schoolYearId ??
+              (input as Record<string, unknown>).school_year_id,
+            [row.scannedAt],
+          )),
         event?.id ?? null,
         row.studentId,
         row.name,
@@ -2528,7 +2584,9 @@ export async function updateAttendanceRecords(
     }
 
     const fines = await Promise.all(
-      updatedRecords.map((record) => syncFineForAttendanceRecord(client, record)),
+      updatedRecords.map((record) =>
+        syncFineForAttendanceRecord(client, record),
+      ),
     );
     const records = await listRecordsByIds(client, updatedRecordIds);
 
@@ -2574,7 +2632,10 @@ async function updateManualAttendanceRecord(
         existingRecord.school_year_id,
       [row.scannedAt, existingRecord.scanned_at],
     ));
-  const noOfAbsences = Math.max(0, Number(row.noOfAbsences ?? existingRecord.no_of_absences ?? 0));
+  const noOfAbsences = Math.max(
+    0,
+    Number(row.noOfAbsences ?? existingRecord.no_of_absences ?? 0),
+  );
 
   await upsertStudent(client, {
     ...row,
@@ -2616,7 +2677,10 @@ async function updateManualAttendanceRecord(
     ],
   );
   const manualRecord = updatedResult.rows[0];
-  const penaltyResult = await upsertPenaltyResultForManualRecord(client, manualRecord);
+  const penaltyResult = await upsertPenaltyResultForManualRecord(
+    client,
+    manualRecord,
+  );
 
   return {
     event,
@@ -2655,7 +2719,10 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
     const existingCollegeScopeKeys = existingRecord.event_id
       ? await getAttendanceRecordCollegeScopeKeys(client, [existingRecord.id])
       : [];
-    const event = await findOrCreateAttendanceEvent(client, getManualAttendanceEventInput(input));
+    const event = await findOrCreateAttendanceEvent(
+      client,
+      getManualAttendanceEventInput(input),
+    );
     await upsertStudent(client, row);
 
     const updatedResult = await client.query<AttendanceRecord>(
@@ -2679,7 +2746,14 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
       `,
       [
         id,
-        event?.school_year_id ?? existingRecord.school_year_id ?? await resolveSchoolYearId(client, (input as Record<string, unknown>).schoolYearId ?? (input as Record<string, unknown>).school_year_id, [row.scannedAt]),
+        event?.school_year_id ??
+          existingRecord.school_year_id ??
+          (await resolveSchoolYearId(
+            client,
+            (input as Record<string, unknown>).schoolYearId ??
+              (input as Record<string, unknown>).school_year_id,
+            [row.scannedAt],
+          )),
         event?.id ?? null,
         row.studentId,
         row.name,
@@ -2914,7 +2988,11 @@ export async function deleteAttendanceImports(
   });
 }
 
-export async function listAttendanceEvents(limit = 100, offset = 0, schoolYearId?: string) {
+export async function listAttendanceEvents(
+  limit = 100,
+  offset = 0,
+  schoolYearId?: string,
+) {
   const result = await query<AttendanceEventRecord>(
     `
       SELECT
@@ -2941,17 +3019,22 @@ export async function createAttendanceEvent(input: AttendanceEventInput) {
   }
 
   return withTransaction(async (client) => {
-    const schoolYearId = await resolveSchoolYearId(client, eventInput.schoolYearId, [
-      eventInput.eventStartAt,
-      eventInput.eventEndAt,
-    ]);
+    const schoolYearId = await resolveSchoolYearId(
+      client,
+      eventInput.schoolYearId,
+      [eventInput.eventStartAt, eventInput.eventEndAt],
+    );
     const eventCount = await getAttendanceEventCount(client, schoolYearId);
     const eventOrder = eventInput.eventOrder
       ? Math.min(eventInput.eventOrder, eventCount + 1)
       : eventCount + 1;
 
     if (eventInput.eventOrder) {
-      await shiftAttendanceEventOrderForInsert(client, schoolYearId, eventOrder);
+      await shiftAttendanceEventOrderForInsert(
+        client,
+        schoolYearId,
+        eventOrder,
+      );
     }
 
     const result = await client.query<AttendanceEventRecord>(
@@ -2979,7 +3062,10 @@ export async function createAttendanceEvent(input: AttendanceEventInput) {
 
     await resequenceAttendanceEvents(client, schoolYearId);
 
-    return (await getAttendanceEventById(client, result.rows[0].id)) ?? result.rows[0];
+    return (
+      (await getAttendanceEventById(client, result.rows[0].id)) ??
+      result.rows[0]
+    );
   });
 }
 
@@ -3007,14 +3093,22 @@ export async function updateAttendanceEvent(
     const schoolYearChanged = nextSchoolYearId !== existing.school_year_id;
     const eventCount = await getAttendanceEventCount(client, nextSchoolYearId);
     const currentOrder = Number(existing.event_order || 0) || null;
-    const maxOrder = schoolYearChanged ? eventCount + 1 : Math.max(1, eventCount);
+    const maxOrder = schoolYearChanged
+      ? eventCount + 1
+      : Math.max(1, eventCount);
     const requestedOrder = eventInput.eventOrder
       ? Math.min(eventInput.eventOrder, maxOrder)
       : null;
-    const nextOrder = requestedOrder ?? (schoolYearChanged ? eventCount + 1 : currentOrder ?? eventCount + 1);
+    const nextOrder =
+      requestedOrder ??
+      (schoolYearChanged ? eventCount + 1 : (currentOrder ?? eventCount + 1));
 
     if (schoolYearChanged) {
-      await shiftAttendanceEventOrderForInsert(client, nextSchoolYearId, nextOrder);
+      await shiftAttendanceEventOrderForInsert(
+        client,
+        nextSchoolYearId,
+        nextOrder,
+      );
     } else if (requestedOrder && requestedOrder !== currentOrder) {
       await moveAttendanceEventOrder(client, {
         eventId: id,
@@ -3162,7 +3256,11 @@ export async function listAttendanceRecords(
   return result.rows;
 }
 
-export async function listAttendanceImports(limit = 50, offset = 0, schoolYearId?: string) {
+export async function listAttendanceImports(
+  limit = 50,
+  offset = 0,
+  schoolYearId?: string,
+) {
   const result = await query<AttendanceImportRecord>(
     `
       SELECT
@@ -3227,8 +3325,6 @@ export async function getAttendanceImport(importId: string) {
   };
 }
 
-
-
 type CalculationResultsFilter = {
   schoolYearId?: string;
   importIds?: string[];
@@ -3284,14 +3380,20 @@ async function refreshCalculationResultsWithClient(
           COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), '')) AS college,
           COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), '')) AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
-          COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), ar.id::TEXT) AS event_key,
+          CASE
+            WHEN LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($4::TEXT) THEN NULL
+            ELSE COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), ar.id::TEXT)
+          END AS event_key,
           GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
           ar.updated_at
         FROM attendance_records ar
         LEFT JOIN attendance_events ae ON ae.id = ar.event_id
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
-        WHERE ar.import_id IS NOT NULL
+        WHERE (
+            ar.import_id IS NOT NULL
+            OR LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($4::TEXT)
+          )
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
       ), imported_totals AS (
         SELECT
@@ -3311,62 +3413,24 @@ async function refreshCalculationResultsWithClient(
           MAX(updated_at) AS source_updated_at
         FROM imported_records
         GROUP BY school_year_id, LOWER(TRIM(student_id))
-      ), manual_records AS (
-        SELECT
-          mar.id,
-          mar.school_year_id,
-          mar.student_id,
-          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id) AS name,
-          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(mar.year_level), '')) AS year_level,
-          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')) AS college,
-          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), '')) AS program,
-          COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(mar.institution), '')) AS institution,
-          ${MANUAL_ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key,
-          CASE
-            WHEN mar.event_id IS NULL THEN NULL
-            ELSE COALESCE(mar.event_id::TEXT, NULLIF(TRIM(ae.name), ''))
-          END AS event_key,
-          GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
-          COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
-          mar.updated_at
-        FROM manual_attendance_records mar
-        LEFT JOIN attendance_events ae ON ae.id = mar.event_id
-        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
-        WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
-      ), college_event_scope AS (
-        SELECT DISTINCT
-          ar.event_id,
-          ar.school_year_id,
-          ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key
-        FROM attendance_records ar
-        WHERE ar.event_id IS NOT NULL
       ), manual_totals AS (
         SELECT
-          mr.school_year_id,
-          LOWER(TRIM(mr.student_id)) AS normalized_student_id,
-          MAX(mr.student_id) AS student_id,
-          COALESCE(NULLIF(MAX(mr.name), ''), MAX(mr.student_id)) AS name,
-          COALESCE(NULLIF(MAX(mr.year_level), ''), '') AS year_level,
-          COALESCE(NULLIF(MAX(mr.college), ''), '') AS college,
-          COALESCE(NULLIF(MAX(mr.program), ''), '') AS program,
-          COALESCE(NULLIF(MAX(mr.institution), ''), '') AS institution,
-          COUNT(DISTINCT NULLIF(TRIM(mr.event_key), ''))::INT AS attended_events,
-          GREATEST(
-            0,
-            GREATEST(
-              MAX(mr.no_of_absences),
-              COUNT(DISTINCT ces.event_id)::INT -
-                COUNT(DISTINCT NULLIF(TRIM(mr.event_key), ''))::INT
-            )
-          )::INT AS manual_absences,
-          COUNT(DISTINCT mr.id)::INT AS manual_record_count,
-          MAX(mr.scanned_at) AS latest_scanned_at,
-          MAX(mr.updated_at) AS source_updated_at
-        FROM manual_records mr
-        LEFT JOIN college_event_scope ces
-          ON ces.school_year_id IS NOT DISTINCT FROM mr.school_year_id
-         AND ces.college_key = mr.college_key
-        GROUP BY mr.school_year_id, LOWER(TRIM(mr.student_id))
+          mar.school_year_id,
+          LOWER(TRIM(mar.student_id)) AS normalized_student_id,
+          MAX(mar.student_id) AS student_id,
+          COALESCE(NULLIF(MAX(s.name), ''), NULLIF(MAX(mar.name), ''), MAX(mar.student_id)) AS name,
+          COALESCE(NULLIF(MAX(s.year_level), ''), NULLIF(MAX(mar.year_level), '')) AS year_level,
+          COALESCE(NULLIF(MAX(s.college), ''), NULLIF(MAX(mar.college), '')) AS college,
+          COALESCE(NULLIF(MAX(s.program), ''), NULLIF(MAX(mar.program), '')) AS program,
+          COALESCE(NULLIF(MAX(s.institution), ''), NULLIF(MAX(mar.institution), '')) AS institution,
+          GREATEST(0, SUM(COALESCE(mar.no_of_absences, 0)))::INT AS manual_absences,
+          COUNT(*)::INT AS manual_record_count,
+          MAX(COALESCE(mar.scanned_at, mar.created_at)) AS latest_scanned_at,
+          MAX(mar.updated_at) AS source_updated_at
+        FROM manual_attendance_records mar
+        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
+        WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+        GROUP BY mar.school_year_id, LOWER(TRIM(mar.student_id))
       ), student_keys AS (
         SELECT school_year_id, normalized_student_id FROM imported_totals
         UNION
@@ -3494,7 +3558,7 @@ async function refreshCalculationResultsWithClient(
         updated_at = NOW()
       RETURNING *
     `,
-    [schoolYearId, importIds, calculationScopeKey],
+    [schoolYearId, importIds, calculationScopeKey, ZERO_ATTENDANCE_REMARK],
   );
 
   return result.rows;
@@ -3546,7 +3610,9 @@ export async function listCalculationResults(
 
   if (options.college) {
     params.push(options.college);
-    clauses.push(`LOWER(TRIM(COALESCE(cr.college, ''))) = LOWER(TRIM($${params.length}))`);
+    clauses.push(
+      `LOWER(TRIM(COALESCE(cr.college, ''))) = LOWER(TRIM($${params.length}))`,
+    );
   }
 
   params.push(options.limit ?? 100);
@@ -3588,7 +3654,6 @@ export async function listCalculationResults(
   return result.rows;
 }
 
-
 export async function deleteCalculationResultsByIds(
   ids: string[],
 ): Promise<DeletedCalculationResultsResult> {
@@ -3602,16 +3667,16 @@ export async function deleteCalculationResultsByIds(
       };
     }
 
-    const result = await client.query<CalculationResultRecord>(
+    const recordsResult = await client.query<CalculationResultRecord>(
       `
         SELECT *
         FROM calculation_results
         WHERE id = ANY($1::uuid[])
-        ORDER BY calculated_at DESC, created_at DESC
+        ORDER BY calculated_at DESC, updated_at DESC
       `,
       [uniqueIds],
     );
-    const records = result.rows;
+    const records = recordsResult.rows;
     const recordIds = records.map((record) => record.id);
 
     if (!recordIds.length) {
@@ -3631,7 +3696,10 @@ export async function deleteCalculationResultsByIds(
     );
 
     await client.query(
-      "DELETE FROM calculation_results WHERE id = ANY($1::uuid[])",
+      `
+        DELETE FROM calculation_results
+        WHERE id = ANY($1::uuid[])
+      `,
       [recordIds],
     );
 
@@ -3645,13 +3713,25 @@ export async function deleteCalculationResultsByIds(
 export async function deleteCalculationResultsBySchoolYear(
   schoolYearId: string,
 ): Promise<DeletedCalculationResultsResult> {
-  const records = await listCalculationResults({
-    schoolYearId,
-    limit: 100000,
-    offset: 0,
-  });
+  const scopedSchoolYearId = cleanText(schoolYearId);
 
-  return deleteCalculationResultsByIds(records.map((record) => record.id));
+  if (!scopedSchoolYearId) {
+    return {
+      deletedCount: 0,
+      deletedRecords: [],
+    };
+  }
+
+  const result = await query<CalculationResultRecord>(
+    `
+      SELECT *
+      FROM calculation_results
+      WHERE school_year_id = $1::uuid
+    `,
+    [scopedSchoolYearId],
+  );
+
+  return deleteCalculationResultsByIds(result.rows.map((record) => record.id));
 }
 
 type AttendanceFinalResultsFilter = {
@@ -3715,7 +3795,6 @@ async function refreshAttendanceFinalResultsWithClient(
         GROUP BY school_year_id, LOWER(TRIM(student_id))
       ), manual_records AS (
         SELECT
-          mar.id,
           mar.school_year_id,
           mar.student_id,
           COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id) AS name,
@@ -3723,11 +3802,7 @@ async function refreshAttendanceFinalResultsWithClient(
           COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')) AS college,
           COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), '')) AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(mar.institution), '')) AS institution,
-          ${MANUAL_ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key,
-          CASE
-            WHEN mar.event_id IS NULL THEN NULL
-            ELSE COALESCE(mar.event_id::TEXT, NULLIF(TRIM(ae.name), ''))
-          END AS event_key,
+          COALESCE(mar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), mar.id::TEXT) AS event_key,
           GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
           mar.updated_at
@@ -3735,40 +3810,23 @@ async function refreshAttendanceFinalResultsWithClient(
         LEFT JOIN attendance_events ae ON ae.id = mar.event_id
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
-      ), college_event_scope AS (
-        SELECT DISTINCT
-          ar.event_id,
-          ar.school_year_id,
-          ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key
-        FROM attendance_records ar
-        WHERE ar.event_id IS NOT NULL
       ), manual_totals AS (
         SELECT
-          mr.school_year_id,
-          LOWER(TRIM(mr.student_id)) AS normalized_student_id,
-          MAX(mr.student_id) AS student_id,
-          COALESCE(NULLIF(MAX(mr.name), ''), MAX(mr.student_id)) AS name,
-          COALESCE(NULLIF(MAX(mr.year_level), ''), '') AS year_level,
-          COALESCE(NULLIF(MAX(mr.college), ''), '') AS college,
-          COALESCE(NULLIF(MAX(mr.program), ''), '') AS program,
-          COALESCE(NULLIF(MAX(mr.institution), ''), '') AS institution,
-          COUNT(DISTINCT NULLIF(TRIM(mr.event_key), ''))::INT AS attended_events,
-          GREATEST(
-            0,
-            GREATEST(
-              MAX(mr.no_of_absences),
-              COUNT(DISTINCT ces.event_id)::INT -
-                COUNT(DISTINCT NULLIF(TRIM(mr.event_key), ''))::INT
-            )
-          )::INT AS manual_absences,
-          COUNT(DISTINCT mr.id)::INT AS manual_record_count,
-          MAX(mr.scanned_at) AS latest_scanned_at,
-          MAX(mr.updated_at) AS source_updated_at
-        FROM manual_records mr
-        LEFT JOIN college_event_scope ces
-          ON ces.school_year_id IS NOT DISTINCT FROM mr.school_year_id
-         AND ces.college_key = mr.college_key
-        GROUP BY mr.school_year_id, LOWER(TRIM(mr.student_id))
+          school_year_id,
+          LOWER(TRIM(student_id)) AS normalized_student_id,
+          MAX(student_id) AS student_id,
+          COALESCE(NULLIF(MAX(name), ''), MAX(student_id)) AS name,
+          COALESCE(NULLIF(MAX(year_level), ''), '') AS year_level,
+          COALESCE(NULLIF(MAX(college), ''), '') AS college,
+          COALESCE(NULLIF(MAX(program), ''), '') AS program,
+          COALESCE(NULLIF(MAX(institution), ''), '') AS institution,
+          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS attended_events,
+          GREATEST(0, SUM(no_of_absences))::INT AS manual_absences,
+          COUNT(*)::INT AS manual_record_count,
+          MAX(scanned_at) AS latest_scanned_at,
+          MAX(updated_at) AS source_updated_at
+        FROM manual_records
+        GROUP BY school_year_id, LOWER(TRIM(student_id))
       ), student_keys AS (
         SELECT school_year_id, normalized_student_id FROM imported_totals
         UNION
@@ -3935,7 +3993,10 @@ export async function refreshAttendanceFinalResults(
 ) {
   return withTransaction(async (client) => {
     const rows = await refreshAttendanceFinalResultsWithClient(client, options);
-    await refreshPenaltyResultsForSchoolYearWithClient(client, options.schoolYearId);
+    await refreshPenaltyResultsForSchoolYearWithClient(
+      client,
+      options.schoolYearId,
+    );
     return rows;
   });
 }
@@ -3958,12 +4019,16 @@ export async function listAttendanceFinalResults(
 
   if (options.studentId) {
     params.push(options.studentId);
-    clauses.push(`LOWER(TRIM(afr.student_id)) = LOWER(TRIM($${params.length}))`);
+    clauses.push(
+      `LOWER(TRIM(afr.student_id)) = LOWER(TRIM($${params.length}))`,
+    );
   }
 
   if (options.college) {
     params.push(options.college);
-    clauses.push(`LOWER(TRIM(COALESCE(afr.college, ''))) = LOWER(TRIM($${params.length}))`);
+    clauses.push(
+      `LOWER(TRIM(COALESCE(afr.college, ''))) = LOWER(TRIM($${params.length}))`,
+    );
   }
 
   params.push(options.limit ?? 100);
@@ -4010,12 +4075,16 @@ export async function listManualAttendanceRecords(
 
   if (options.studentId) {
     params.push(options.studentId);
-    clauses.push(`LOWER(TRIM(mar.student_id)) = LOWER(TRIM($${params.length}))`);
+    clauses.push(
+      `LOWER(TRIM(mar.student_id)) = LOWER(TRIM($${params.length}))`,
+    );
   }
 
   if (options.college) {
     params.push(options.college);
-    clauses.push(`LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($${params.length}))`);
+    clauses.push(
+      `LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($${params.length}))`,
+    );
   }
 
   if (options.eventId) {

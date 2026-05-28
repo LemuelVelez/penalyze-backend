@@ -5,12 +5,13 @@ import {
   PenaltyRecord,
   PenaltyResultRecord,
   SchoolYearRecord,
-  StudentRecord
+  StudentRecord,
 } from "../database/model/schema.model";
 import { DEFAULT_PENALTIES } from "../database/seeder/penalties.seeder";
 import { query } from "../lib/db";
 
-export const ZERO_ATTENDANCE_REMARK = "Zero attendance registration from landing page.";
+export const ZERO_ATTENDANCE_REMARK =
+  "Zero attendance registration from landing page.";
 
 export type DeletedPenaltyResultsResult = {
   deletedCount: number;
@@ -52,16 +53,26 @@ function uniqueCleanTextValues(values: Array<string | null | undefined>) {
 }
 
 function normalizeAcademicScopeValue(value: unknown) {
-  return String(value ?? "").trim().toLowerCase();
+  return String(value ?? "")
+    .trim()
+    .toLowerCase();
 }
 
-function buildAcademicScopeKey(input: Pick<ReturnType<typeof validateZeroAttendanceInput>, "institution" | "college" | "program" | "yearLevel">) {
+function buildAcademicScopeKey(
+  input: Pick<
+    ReturnType<typeof validateZeroAttendanceInput>,
+    "institution" | "college" | "program" | "yearLevel"
+  >,
+) {
   return [input.institution, input.college, input.program, input.yearLevel]
     .map(normalizeAcademicScopeValue)
     .join("|");
 }
 
-function getAttendanceRecordScopeColumnSql(recordAlias: string, columnName: string) {
+function getAttendanceRecordScopeColumnSql(
+  recordAlias: string,
+  columnName: string,
+) {
   return `
     LOWER(TRIM(COALESCE(
       (
@@ -120,7 +131,6 @@ const FINE_RETURNING_COLUMNS_SQL = `
   created_at,
   updated_at
 `;
-
 
 function getSchoolYearRangeFromDate(value: Date = new Date()) {
   const year = value.getFullYear();
@@ -209,7 +219,7 @@ function validateZeroAttendanceInput(input: ZeroAttendanceFineInput) {
     yearLevel: cleanOptionalText(input.yearLevel),
     college: cleanOptionalText(input.college),
     program: cleanOptionalText(input.program),
-    institution: cleanOptionalText(input.institution)
+    institution: cleanOptionalText(input.institution),
   };
 }
 
@@ -234,13 +244,16 @@ export async function getPenaltyByAbsences(noOfAbsences: number) {
       ORDER BY no_of_absences DESC
       LIMIT 1
     `,
-    [noOfAbsences]
+    [noOfAbsences],
   );
 
   return result.rows[0] ?? null;
 }
 
-export async function upsertPenalty(noOfAbsences: number, prescribedPenalty: string) {
+export async function upsertPenalty(
+  noOfAbsences: number,
+  prescribedPenalty: string,
+) {
   const cleanPenalty = validatePenaltyInput(noOfAbsences, prescribedPenalty);
 
   const result = await query<PenaltyRecord>(
@@ -253,13 +266,17 @@ export async function upsertPenalty(noOfAbsences: number, prescribedPenalty: str
         updated_at = NOW()
       RETURNING *
     `,
-    [noOfAbsences, cleanPenalty]
+    [noOfAbsences, cleanPenalty],
   );
 
   return result.rows[0];
 }
 
-export async function updatePenalty(id: string, noOfAbsences: number, prescribedPenalty: string) {
+export async function updatePenalty(
+  id: string,
+  noOfAbsences: number,
+  prescribedPenalty: string,
+) {
   const cleanPenalty = validatePenaltyInput(noOfAbsences, prescribedPenalty);
 
   const duplicate = await query<PenaltyRecord>(
@@ -270,7 +287,7 @@ export async function updatePenalty(id: string, noOfAbsences: number, prescribed
         AND id <> $2
       LIMIT 1
     `,
-    [noOfAbsences, id]
+    [noOfAbsences, id],
   );
 
   if (duplicate.rows[0]) {
@@ -286,7 +303,7 @@ export async function updatePenalty(id: string, noOfAbsences: number, prescribed
       WHERE id = $1
       RETURNING *
     `,
-    [id, noOfAbsences, cleanPenalty]
+    [id, noOfAbsences, cleanPenalty],
   );
 
   if (!result.rows[0]) {
@@ -300,7 +317,7 @@ export async function updatePenalty(id: string, noOfAbsences: number, prescribed
           updated_at = NOW()
       WHERE penalty_id = $1
     `,
-    [id, cleanPenalty]
+    [id, cleanPenalty],
   );
 
   await query(
@@ -310,7 +327,7 @@ export async function updatePenalty(id: string, noOfAbsences: number, prescribed
           updated_at = NOW()
       WHERE penalty_id = $1
     `,
-    [id, cleanPenalty]
+    [id, cleanPenalty],
   );
 
   return result.rows[0];
@@ -324,7 +341,7 @@ export async function deletePenalty(id: string) {
       WHERE id = $1
       LIMIT 1
     `,
-    [id]
+    [id],
   );
 
   if (!existing.rows[0]) {
@@ -338,7 +355,7 @@ export async function deletePenalty(id: string) {
           updated_at = NOW()
       WHERE penalty_id = $1
     `,
-    [id]
+    [id],
   );
 
   await query(
@@ -348,7 +365,7 @@ export async function deletePenalty(id: string) {
           updated_at = NOW()
       WHERE penalty_id = $1
     `,
-    [id]
+    [id],
   );
 
   const result = await query<PenaltyRecord>(
@@ -357,7 +374,7 @@ export async function deletePenalty(id: string) {
       WHERE id = $1
       RETURNING *
     `,
-    [id]
+    [id],
   );
 
   return result.rows[0];
@@ -367,13 +384,23 @@ export async function seedDefaultPenalties() {
   const rows: PenaltyRecord[] = [];
 
   for (const penalty of DEFAULT_PENALTIES) {
-    rows.push(await upsertPenalty(penalty.no_of_absences, penalty.prescribed_penalty));
+    rows.push(
+      await upsertPenalty(penalty.no_of_absences, penalty.prescribed_penalty),
+    );
   }
 
   return rows;
 }
 
-export async function listFines(options: { schoolYearId?: string; status?: FineStatus; studentId?: string; limit?: number; offset?: number } = {}) {
+export async function listFines(
+  options: {
+    schoolYearId?: string;
+    status?: FineStatus;
+    studentId?: string;
+    limit?: number;
+    offset?: number;
+  } = {},
+) {
   const clauses: string[] = [];
   const params: unknown[] = [];
 
@@ -420,32 +447,33 @@ export async function listFines(options: { schoolYearId?: string; status?: FineS
         f.created_at ASC
       LIMIT $${limitPosition} OFFSET $${offsetPosition}
     `,
-    params
+    params,
   );
 
   return result.rows;
 }
 
-async function getAttendanceEventCount(input: ReturnType<typeof validateZeroAttendanceInput>, schoolYearId: string) {
+async function getAttendanceEventCount(
+  input: ReturnType<typeof validateZeroAttendanceInput>,
+  schoolYearId: string,
+) {
   const result = await query<{ total: number }>(
     `
-      SELECT COUNT(DISTINCT ae.id)::INT AS total
-      FROM attendance_events ae
-      WHERE ae.school_year_id = $2::uuid
-        AND EXISTS (
-          SELECT 1
-          FROM attendance_records ar
-          WHERE ar.event_id = ae.id
-            AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1::TEXT
-        )
+      SELECT COUNT(DISTINCT ar.event_id)::INT AS total
+      FROM attendance_records ar
+      WHERE ar.event_id IS NOT NULL
+        AND ar.school_year_id = $2::uuid
+        AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1::TEXT
     `,
-    [buildAcademicScopeKey(input), schoolYearId]
+    [buildAcademicScopeKey(input), schoolYearId],
   );
 
   return Number(result.rows[0]?.total ?? 0);
 }
 
-async function upsertStudentRecord(input: ReturnType<typeof validateZeroAttendanceInput>) {
+async function upsertStudentRecord(
+  input: ReturnType<typeof validateZeroAttendanceInput>,
+) {
   const result = await query<StudentRecord>(
     `
       INSERT INTO students (student_id, name, year_level, college, program, institution)
@@ -460,25 +488,36 @@ async function upsertStudentRecord(input: ReturnType<typeof validateZeroAttendan
         updated_at = NOW()
       RETURNING *
     `,
-    [input.studentId, input.name, input.yearLevel, input.college, input.program, input.institution]
+    [
+      input.studentId,
+      input.name,
+      input.yearLevel,
+      input.college,
+      input.program,
+      input.institution,
+    ],
   );
 
   return result.rows[0];
 }
 
-async function upsertZeroAttendanceRecord(input: ReturnType<typeof validateZeroAttendanceInput>, schoolYearId: string, noOfAbsences: number) {
+async function upsertZeroAttendanceRecord(
+  input: ReturnType<typeof validateZeroAttendanceInput>,
+  schoolYearId: string,
+  noOfAbsences: number,
+) {
   const existing = await query<AttendanceRecord>(
     `
       SELECT *
       FROM attendance_records
       WHERE event_id IS NULL
-        AND school_year_id = $3
-        AND LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-        AND remarks = $2
+        AND school_year_id = $3::uuid
+        AND LOWER(TRIM(student_id)) = LOWER(TRIM($1::TEXT))
+        AND remarks = $2::TEXT
       ORDER BY created_at DESC
       LIMIT 1
     `,
-    [input.studentId, ZERO_ATTENDANCE_REMARK, schoolYearId]
+    [input.studentId, ZERO_ATTENDANCE_REMARK, schoolYearId],
   );
 
   if (existing.rows[0]) {
@@ -504,8 +543,8 @@ async function upsertZeroAttendanceRecord(input: ReturnType<typeof validateZeroA
         input.program,
         input.institution,
         schoolYearId,
-        noOfAbsences
-      ]
+        noOfAbsences,
+      ],
     );
 
     return result.rows[0];
@@ -527,7 +566,7 @@ async function upsertZeroAttendanceRecord(input: ReturnType<typeof validateZeroA
         remarks,
         scanned_at
       )
-      VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8, $9, NULL)
+      VALUES ($1::uuid, NULL, NULL, $2, $3, $4, $5, $6, $7, $8, $9, NULL)
       RETURNING *
     `,
     [
@@ -539,21 +578,25 @@ async function upsertZeroAttendanceRecord(input: ReturnType<typeof validateZeroA
       input.program,
       input.institution,
       noOfAbsences,
-      ZERO_ATTENDANCE_REMARK
-    ]
+      ZERO_ATTENDANCE_REMARK,
+    ],
   );
 
   return result.rows[0];
 }
 
-async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, penalty: PenaltyRecord | null) {
+async function upsertFineForZeroAttendance(
+  attendanceRecord: AttendanceRecord,
+  penalty: PenaltyRecord | null,
+) {
   const noOfAbsences = Number(attendanceRecord.no_of_absences || 0);
 
   if (noOfAbsences <= 0) {
     return null;
   }
 
-  const prescribedPenalty = penalty?.prescribed_penalty ?? "No prescribed penalty configured.";
+  const prescribedPenalty =
+    penalty?.prescribed_penalty ?? "No prescribed penalty configured.";
 
   const existing = await query<FineRecord>(
     `
@@ -562,7 +605,7 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
       WHERE attendance_record_id = $1
       LIMIT 1
     `,
-    [attendanceRecord.id]
+    [attendanceRecord.id],
   );
 
   if (existing.rows[0]) {
@@ -585,8 +628,8 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
         attendanceRecord.student_id,
         attendanceRecord.name,
         prescribedPenalty,
-        noOfAbsences
-      ]
+        noOfAbsences,
+      ],
     );
 
     return result.rows[0];
@@ -613,22 +656,29 @@ async function upsertFineForZeroAttendance(attendanceRecord: AttendanceRecord, p
       attendanceRecord.student_id,
       attendanceRecord.name,
       prescribedPenalty,
-      noOfAbsences
-    ]
+      noOfAbsences,
+    ],
   );
 
   return result.rows[0];
 }
 
-export async function registerZeroAttendanceFine(input: ZeroAttendanceFineInput) {
+export async function registerZeroAttendanceFine(
+  input: ZeroAttendanceFineInput,
+) {
   const cleanInput = validateZeroAttendanceInput(input);
   const schoolYearId = await resolveSchoolYearId(cleanInput.schoolYearId);
   const totalEvents = await getAttendanceEventCount(cleanInput, schoolYearId);
 
   await upsertStudentRecord(cleanInput);
 
-  const attendanceRecord = await upsertZeroAttendanceRecord(cleanInput, schoolYearId, totalEvents);
-  const penalty = totalEvents > 0 ? await getPenaltyByAbsences(totalEvents) : null;
+  const attendanceRecord = await upsertZeroAttendanceRecord(
+    cleanInput,
+    schoolYearId,
+    totalEvents,
+  );
+  const penalty =
+    totalEvents > 0 ? await getPenaltyByAbsences(totalEvents) : null;
   const fine = await upsertFineForZeroAttendance(attendanceRecord, penalty);
 
   return {
@@ -637,11 +687,11 @@ export async function registerZeroAttendanceFine(input: ZeroAttendanceFineInput)
       ? {
           ...fine,
           attendance_event_id: attendanceRecord.event_id ?? null,
-          attendance_remarks: attendanceRecord.remarks ?? null
+          attendance_remarks: attendanceRecord.remarks ?? null,
         }
       : null,
     totalEvents,
-    penalty
+    penalty,
   };
 }
 
@@ -667,7 +717,7 @@ export async function updateFineStatus(id: string, status: FineStatus) {
       FROM updated
       LEFT JOIN attendance_records ar ON ar.id = updated.attendance_record_id
     `,
-    [id, status]
+    [id, status],
   );
 
   if (!result.rows[0]) {
@@ -693,14 +743,16 @@ export async function getFineSummary(schoolYearId?: string) {
   );
 
   return result.rows.reduce<Record<FineStatus, number>>(
-    (summary: Record<FineStatus, number>, row: { status: FineStatus; count: string }) => {
+    (
+      summary: Record<FineStatus, number>,
+      row: { status: FineStatus; count: string },
+    ) => {
       summary[row.status] = Number(row.count);
       return summary;
     },
-    { unpaid: 0, paid: 0, waived: 0 }
+    { unpaid: 0, paid: 0, waived: 0 },
   );
 }
-
 
 type ListPenaltyResultsOptions = {
   schoolYearId?: string;
@@ -727,7 +779,9 @@ function getCalculationScopeKey(importIds: string[]) {
   return importIds.length ? importIds.join(":") : "";
 }
 
-export async function listPenaltyResults(options: ListPenaltyResultsOptions = {}) {
+export async function listPenaltyResults(
+  options: ListPenaltyResultsOptions = {},
+) {
   const clauses: string[] = [];
   const params: unknown[] = [];
 
@@ -801,10 +855,12 @@ export async function listPenaltyResults(options: ListPenaltyResultsOptions = {}
   return result.rows;
 }
 
-export async function refreshPenaltyResults(options: {
-  schoolYearId?: string;
-  importIds?: string[];
-} = {}) {
+export async function refreshPenaltyResults(
+  options: {
+    schoolYearId?: string;
+    importIds?: string[];
+  } = {},
+) {
   const schoolYearId = cleanOptionalText(options.schoolYearId);
 
   const result = await query<PenaltyResultRecord>(
@@ -885,7 +941,10 @@ export async function refreshPenaltyResults(options: {
   return result.rows;
 }
 
-export async function updatePenaltyResultStatus(id: string, status: FineStatus) {
+export async function updatePenaltyResultStatus(
+  id: string,
+  status: FineStatus,
+) {
   if (!["unpaid", "paid", "waived"].includes(status)) {
     throw new Error("Invalid penalty result status.");
   }

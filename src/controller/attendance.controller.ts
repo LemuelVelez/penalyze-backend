@@ -8,10 +8,10 @@ import {
   deleteAttendanceFinalResultsBySchoolYear,
   deleteAttendanceImport,
   deleteAttendanceImports,
-  deleteAttendanceImportsByIds,
-  deleteAttendanceRecord,
   deleteCalculationResultsByIds,
   deleteCalculationResultsBySchoolYear,
+  deleteAttendanceImportsByIds,
+  deleteAttendanceRecord,
   deleteManualAttendanceRecordsByIds,
   deleteManualAttendanceRecordsBySchoolYear,
   getAttendanceImport,
@@ -133,8 +133,12 @@ function getRequestRecordIds(req: Request) {
 }
 
 function getRequestSchoolYearId(req: Request) {
-  return String(req.body?.schoolYearId ?? req.body?.school_year_id ?? req.query.schoolYearId ?? "")
-    .trim();
+  return String(
+    req.body?.schoolYearId ??
+      req.body?.school_year_id ??
+      req.query.schoolYearId ??
+      "",
+  ).trim();
 }
 
 function parseImportIds(value: unknown) {
@@ -198,7 +202,9 @@ export async function events(req: Request, res: Response, next: NextFunction) {
   try {
     const limit = toPositiveInt(req.query.limit, 100);
     const offset = toPositiveInt(req.query.offset, 0);
-    const schoolYearId = req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined;
+    const schoolYearId = req.query.schoolYearId
+      ? String(req.query.schoolYearId).trim()
+      : undefined;
     const records = await listAttendanceEvents(limit, offset, schoolYearId);
 
     res.json({ data: records });
@@ -397,12 +403,10 @@ export async function saveImport(
 
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
     if (!rows.length) {
-      res
-        .status(400)
-        .json({
-          message:
-            "Please upload a file or provide rows from the preview response.",
-        });
+      res.status(400).json({
+        message:
+          "Please upload a file or provide rows from the preview response.",
+      });
       return;
     }
 
@@ -443,12 +447,10 @@ export async function saveImportWithProgress(
     const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
 
     if (!file && !rows.length) {
-      res
-        .status(400)
-        .json({
-          message:
-            "Please upload a file or provide rows from the preview response.",
-        });
+      res.status(400).json({
+        message:
+          "Please upload a file or provide rows from the preview response.",
+      });
       return;
     }
 
@@ -540,14 +542,24 @@ export async function index(req: Request, res: Response, next: NextFunction) {
   }
 }
 
-export async function finalResults(req: Request, res: Response, next: NextFunction) {
+export async function finalResults(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
   try {
     const limit = toPositiveInt(req.query.limit, 100);
     const offset = toPositiveInt(req.query.offset, 0);
     const records = await listAttendanceFinalResults({
-      schoolYearId: req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined,
-      importId: req.query.importId ? String(req.query.importId).trim() : undefined,
-      studentId: req.query.studentId ? String(req.query.studentId).trim() : undefined,
+      schoolYearId: req.query.schoolYearId
+        ? String(req.query.schoolYearId).trim()
+        : undefined,
+      importId: req.query.importId
+        ? String(req.query.importId).trim()
+        : undefined,
+      studentId: req.query.studentId
+        ? String(req.query.studentId).trim()
+        : undefined,
       college: req.query.college ? String(req.query.college).trim() : undefined,
       limit,
       offset,
@@ -559,7 +571,11 @@ export async function finalResults(req: Request, res: Response, next: NextFuncti
   }
 }
 
-export async function refreshFinalResults(req: Request, res: Response, next: NextFunction) {
+export async function refreshFinalResults(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
   try {
     const records = await refreshAttendanceFinalResults({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
@@ -572,14 +588,22 @@ export async function refreshFinalResults(req: Request, res: Response, next: Nex
   }
 }
 
-export async function calculationResults(req: Request, res: Response, next: NextFunction) {
+export async function calculationResults(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
   try {
     const limit = toPositiveInt(req.query.limit, 100);
     const offset = toPositiveInt(req.query.offset, 0);
     const records = await listCalculationResults({
-      schoolYearId: req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined,
+      schoolYearId: req.query.schoolYearId
+        ? String(req.query.schoolYearId).trim()
+        : undefined,
       importIds: parseImportIds(req.query.importIds),
-      studentId: req.query.studentId ? String(req.query.studentId).trim() : undefined,
+      studentId: req.query.studentId
+        ? String(req.query.studentId).trim()
+        : undefined,
       college: req.query.college ? String(req.query.college).trim() : undefined,
       limit,
       offset,
@@ -591,7 +615,11 @@ export async function calculationResults(req: Request, res: Response, next: Next
   }
 }
 
-export async function refreshCalculationResultRows(req: Request, res: Response, next: NextFunction) {
+export async function refreshCalculationResultRows(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
   try {
     const records = await refreshCalculationResults({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
@@ -603,7 +631,6 @@ export async function refreshCalculationResultRows(req: Request, res: Response, 
     next(error);
   }
 }
-
 
 export async function deleteCalculationResultRows(
   req: Request,
@@ -634,14 +661,22 @@ export async function deleteCalculationResultRows(
   }
 }
 
-export async function manualRecords(req: Request, res: Response, next: NextFunction) {
+export async function manualRecords(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
   try {
     const limit = toPositiveInt(req.query.limit, 100);
     const offset = toPositiveInt(req.query.offset, 0);
     const records = await listManualAttendanceRecords({
-      schoolYearId: req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined,
+      schoolYearId: req.query.schoolYearId
+        ? String(req.query.schoolYearId).trim()
+        : undefined,
       eventId: req.query.eventId ? String(req.query.eventId).trim() : undefined,
-      studentId: req.query.studentId ? String(req.query.studentId).trim() : undefined,
+      studentId: req.query.studentId
+        ? String(req.query.studentId).trim()
+        : undefined,
       college: req.query.college ? String(req.query.college).trim() : undefined,
       limit,
       offset,
@@ -657,7 +692,9 @@ export async function imports(req: Request, res: Response, next: NextFunction) {
   try {
     const limit = toPositiveInt(req.query.limit, 50);
     const offset = toPositiveInt(req.query.offset, 0);
-    const schoolYearId = req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined;
+    const schoolYearId = req.query.schoolYearId
+      ? String(req.query.schoolYearId).trim()
+      : undefined;
     const records = await listAttendanceImports(limit, offset, schoolYearId);
 
     res.json({ data: records });
@@ -719,7 +756,9 @@ export async function deleteFinalResult(
     const id = getRouteParam(req, "id");
 
     if (!id) {
-      res.status(400).json({ message: "Final attendance result ID is required." });
+      res
+        .status(400)
+        .json({ message: "Final attendance result ID is required." });
       return;
     }
 
@@ -807,7 +846,9 @@ export async function deleteManualRecord(
     const id = getRouteParam(req, "id");
 
     if (!id) {
-      res.status(400).json({ message: "Manual attendance record ID is required." });
+      res
+        .status(400)
+        .json({ message: "Manual attendance record ID is required." });
       return;
     }
 
