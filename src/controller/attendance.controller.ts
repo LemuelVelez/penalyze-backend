@@ -154,6 +154,29 @@ function parseImportIds(value: unknown) {
   );
 }
 
+type CalculationSourceType = "imported" | "manual" | "zero_attendance";
+
+const CALCULATION_SOURCE_TYPES = new Set<CalculationSourceType>([
+  "imported",
+  "manual",
+  "zero_attendance",
+]);
+
+function parseCalculationSourceTypes(value: unknown) {
+  const values = Array.isArray(value) ? value : [value];
+
+  return Array.from(
+    new Set(
+      values
+        .flatMap((item) => String(item ?? "").split(","))
+        .map((item) => item.trim())
+        .filter((item): item is CalculationSourceType =>
+          CALCULATION_SOURCE_TYPES.has(item as CalculationSourceType),
+        ),
+    ),
+  );
+}
+
 function getUploadedFile(req: Request) {
   return req.file as UploadedAttendanceFile | undefined;
 }
@@ -601,6 +624,7 @@ export async function calculationResults(
         ? String(req.query.schoolYearId).trim()
         : undefined,
       importIds: parseImportIds(req.query.importIds),
+      sourceTypes: parseCalculationSourceTypes(req.query.sourceTypes),
       studentId: req.query.studentId
         ? String(req.query.studentId).trim()
         : undefined,
@@ -624,6 +648,9 @@ export async function refreshCalculationResultRows(
     const records = await refreshCalculationResults({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
       importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
+      sourceTypes: parseCalculationSourceTypes(
+        req.body?.sourceTypes ?? req.body?.source_types,
+      ),
     });
 
     res.json({ message: "Calculation results refreshed.", data: records });

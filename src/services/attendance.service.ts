@@ -32,6 +32,7 @@ export type UploadedAttendanceFile = {
 };
 
 type RawImportRow = Record<string, unknown>;
+type CalculationSourceType = "imported" | "manual" | "zero_attendance";
 
 type SaveRowsInput = {
   schoolYearId?: string;
@@ -3328,6 +3329,7 @@ export async function getAttendanceImport(importId: string) {
 type CalculationResultsFilter = {
   schoolYearId?: string;
   importIds?: string[];
+  sourceTypes?: CalculationSourceType[];
   studentId?: string;
   college?: string;
   limit?: number;
@@ -3347,17 +3349,73 @@ function normalizeImportIds(value: unknown) {
   ).sort((left, right) => left.localeCompare(right));
 }
 
-function getCalculationScopeKey(_importIds: string[]) {
-  return "school_year";
+const CALCULATION_SOURCE_TYPE_ORDER: CalculationSourceType[] = [
+  "imported",
+  "manual",
+  "zero_attendance",
+];
+
+function normalizeCalculationSourceTypes(value: unknown) {
+  const values = Array.isArray(value) ? value : [value];
+  const selectedSourceTypes = Array.from(
+    new Set(
+      values
+        .flatMap((item) => String(item ?? "").split(","))
+        .map((item) => cleanText(item))
+        .filter((item): item is CalculationSourceType =>
+          CALCULATION_SOURCE_TYPE_ORDER.includes(item as CalculationSourceType),
+        ),
+    ),
+  );
+
+  if (!selectedSourceTypes.length) return CALCULATION_SOURCE_TYPE_ORDER;
+
+  return CALCULATION_SOURCE_TYPE_ORDER.filter((sourceType) =>
+    selectedSourceTypes.includes(sourceType),
+  );
+}
+
+function getCalculationScopeKey(
+  importIds: string[],
+  sourceTypes?: CalculationSourceType[],
+) {
+  const normalizedImportIds = normalizeImportIds(importIds);
+  const normalizedSourceTypes = normalizeCalculationSourceTypes(sourceTypes ?? []);
+
+  if (
+    !normalizedImportIds.length &&
+    normalizedSourceTypes.length === CALCULATION_SOURCE_TYPE_ORDER.length
+  ) {
+    return "school_year";
+  }
+
+  return [
+    `sources:${normalizedSourceTypes.join(",") || "none"}`,
+    `imports:${normalizedImportIds.join(",") || "all"}`,
+  ].join("|");
+}
+
+function getCalculationSourceFlags(sourceTypes?: CalculationSourceType[]) {
+  const selectedSourceTypes = new Set(
+    normalizeCalculationSourceTypes(sourceTypes ?? []),
+  );
+
+  return {
+    includeImported: selectedSourceTypes.has("imported"),
+    includeManual: selectedSourceTypes.has("manual"),
+    includeZeroAttendance: selectedSourceTypes.has("zero_attendance"),
+  };
 }
 
 async function refreshCalculationResultsWithClient(
   client: PoolClient,
-  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds"> = {},
+  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
 ) {
   const schoolYearId = cleanText(options.schoolYearId) || null;
   const importIds = normalizeImportIds(options.importIds ?? []);
-  const calculationScopeKey = getCalculationScopeKey(importIds);
+  const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
+  const sourceFlags = getCalculationSourceFlags(sourceTypes);
+  const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
 
   await client.query(
     `
@@ -3391,8 +3449,18 @@ async function refreshCalculationResultsWithClient(
         LEFT JOIN attendance_events ae ON ae.id = ar.event_id
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
         WHERE (
-            ar.import_id IS NOT NULL
-            OR LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($4::TEXT)
+            (
+              $5::BOOLEAN
+              AND ar.import_id IS NOT NULL
+              AND (
+                CARDINALITY($2::uuid[]) = 0
+                OR ar.import_id = ANY($2::uuid[])
+              )
+            )
+            OR (
+              $7::BOOLEAN
+              AND LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($4::TEXT)
+            )
           )
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
       ), imported_totals AS (
@@ -3430,6 +3498,20 @@ async function refreshCalculationResultsWithClient(
         FROM manual_attendance_records mar
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+          AND (
+            (
+              $6::BOOLEAN
+              AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+              AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($4::TEXT)
+            )
+            OR (
+              $7::BOOLEAN
+              AND (
+                mar.attendance_type = 'zero_attendance'
+                OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT)
+              )
+            )
+          )
         GROUP BY mar.school_year_id, LOWER(TRIM(mar.student_id))
       ), student_keys AS (
         SELECT school_year_id, normalized_student_id FROM imported_totals
@@ -3558,20 +3640,30 @@ async function refreshCalculationResultsWithClient(
         updated_at = NOW()
       RETURNING *
     `,
-    [schoolYearId, importIds, calculationScopeKey, ZERO_ATTENDANCE_REMARK],
+    [
+      schoolYearId,
+      importIds,
+      calculationScopeKey,
+      ZERO_ATTENDANCE_REMARK,
+      sourceFlags.includeImported,
+      sourceFlags.includeManual,
+      sourceFlags.includeZeroAttendance,
+    ],
   );
 
   return result.rows;
 }
 
 export async function refreshCalculationResults(
-  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds"> = {},
+  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
 ) {
   return withTransaction(async (client) => {
     const importIds = normalizeImportIds(options.importIds ?? []);
+    const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
     const rows = await refreshCalculationResultsWithClient(client, {
       schoolYearId: options.schoolYearId,
       importIds,
+      sourceTypes,
     });
     await refreshAttendanceFinalResultsWithClient(client, {
       schoolYearId: options.schoolYearId,
@@ -3579,7 +3671,7 @@ export async function refreshCalculationResults(
     await refreshPenaltyResultsForSchoolYearWithClient(
       client,
       options.schoolYearId,
-      getCalculationScopeKey(importIds),
+      getCalculationScopeKey(importIds, sourceTypes),
     );
 
     return rows;
@@ -3598,8 +3690,9 @@ export async function listCalculationResults(
   }
 
   const importIds = normalizeImportIds(options.importIds ?? []);
-  if (importIds.length) {
-    params.push(getCalculationScopeKey(importIds));
+  const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
+  if (importIds.length || options.sourceTypes?.length) {
+    params.push(getCalculationScopeKey(importIds, sourceTypes));
     clauses.push(`cr.calculation_scope_key = $${params.length}`);
   }
 
