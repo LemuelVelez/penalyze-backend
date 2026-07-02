@@ -1780,6 +1780,53 @@ async function getAttendanceImportById(client: PoolClient, importId: string) {
   return result.rows[0] ?? null;
 }
 
+async function findDuplicateAttendanceImport(
+  client: PoolClient,
+  input: {
+    fileName: string;
+    schoolYearId?: string | null;
+    eventId?: string | null;
+    eventName?: string | null;
+  },
+) {
+  const fileName = cleanText(input.fileName);
+  const schoolYearId = cleanText(input.schoolYearId) || null;
+  const eventId = cleanText(input.eventId) || null;
+  const eventName = cleanText(input.eventName);
+
+  if (!fileName) return null;
+
+  const result = await client.query<AttendanceImportRecord>(
+    `
+      SELECT
+        ai.*,
+        ae.name AS event_name,
+        ae.event_order,
+        ae.event_start_at,
+        ae.event_end_at
+      FROM attendance_imports ai
+      LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+      WHERE LOWER(TRIM(ai.file_name)) = LOWER(TRIM($1))
+        AND ($2::uuid IS NULL OR ai.school_year_id = $2::uuid)
+        AND (
+          ($3::uuid IS NOT NULL AND ai.event_id = $3::uuid)
+          OR (
+            $3::uuid IS NULL
+            AND $4::TEXT <> ''
+            AND LOWER(TRIM(COALESCE(ae.name, ''))) = LOWER(TRIM($4::TEXT))
+          )
+          OR ($3::uuid IS NULL AND $4::TEXT = '')
+        )
+        AND ai.status = 'saved'
+      ORDER BY ai.created_at DESC
+      LIMIT 1
+    `,
+    [fileName, schoolYearId, eventId, eventName],
+  );
+
+  return result.rows[0] ?? null;
+}
+
 async function deleteAttendanceImportRecords(
   client: PoolClient,
   importIds: string[],
@@ -1932,6 +1979,28 @@ export async function saveAttendanceRows(
         : existingImport?.event_id
           ? await getAttendanceEventById(client, existingImport.event_id)
           : null;
+    const resolvedSchoolYearId =
+      defaultEvent?.school_year_id ??
+      (await resolveSchoolYearId(client, input.schoolYearId, [
+        input.eventStartAt,
+        input.eventEndAt,
+      ]));
+
+    if (!existingImport) {
+      const duplicateImport = await findDuplicateAttendanceImport(client, {
+        fileName: preview.fileName,
+        schoolYearId: resolvedSchoolYearId,
+        eventId: defaultEvent?.id ?? input.eventId,
+        eventName: defaultEvent?.name ?? input.eventName,
+      });
+
+      if (duplicateImport) {
+        throw createValidationError(
+          `The attendance file "${preview.fileName}" has already been uploaded for this event. Delete the existing uploaded file before uploading it again.`,
+          409,
+        );
+      }
+    }
 
     const importRecord = existingImport
       ? (
@@ -1954,11 +2023,7 @@ export async function saveAttendanceRows(
               preview.rowsTotal,
               preview.rowsValid,
               preview.rowsInvalid,
-              defaultEvent?.school_year_id ??
-                (await resolveSchoolYearId(client, input.schoolYearId, [
-                  input.eventStartAt,
-                  input.eventEndAt,
-                ])),
+              resolvedSchoolYearId,
             ],
           )
         ).rows[0]
@@ -1970,11 +2035,7 @@ export async function saveAttendanceRows(
               RETURNING *
             `,
             [
-              defaultEvent?.school_year_id ??
-                (await resolveSchoolYearId(client, input.schoolYearId, [
-                  input.eventStartAt,
-                  input.eventEndAt,
-                ])),
+              resolvedSchoolYearId,
               defaultEvent?.id ?? null,
               preview.fileName,
               preview.fileType,
