@@ -73,11 +73,11 @@ function isSupportedAttendanceUpload(
     .trim()
     .toLowerCase();
 
-  return (
-    ACCEPTED_ATTENDANCE_EXTENSIONS.includes(extension as any) ||
-    !mimeType ||
-    ALLOWED_MIME_TYPES.has(mimeType)
-  );
+  if (!ACCEPTED_ATTENDANCE_EXTENSIONS.includes(extension as any)) {
+    return false;
+  }
+
+  return !mimeType || ALLOWED_MIME_TYPES.has(mimeType);
 }
 
 export const attendanceUpload = multer({
@@ -183,6 +183,7 @@ function getUploadedFile(req: Request) {
 
 function getEventPayload(req: Request) {
   return {
+    schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
     eventId: req.body?.eventId,
     eventName: req.body?.eventName,
     eventStartAt: req.body?.eventStartAt,
