@@ -8,6 +8,8 @@ export const TABLES = {
   attendanceFinalResults: "attendance_final_results",
   calculationResults: "calculation_results",
   manualAttendanceRecords: "manual_attendance_records",
+  attendanceRequests: "attendance_requests",
+  attendanceRequestEvents: "attendance_request_events",
   penalties: "penalties",
   penaltyResults: "penalty_results",
   fines: "fines",
@@ -24,6 +26,7 @@ export type AttendanceImportProgressStage =
   | "completed"
   | "cancelled";
 export type FineStatus = "unpaid" | "paid" | "waived";
+export type AttendanceRequestStatus = "pending" | "approved" | "rejected";
 export type SchoolSemester = "first_semester" | "second_semester";
 
 export type SchoolYearRecord = {
@@ -109,6 +112,33 @@ export type AttendanceRecord = {
   scanned_at: Date | string | null;
   created_at: Date;
   updated_at: Date;
+};
+
+export type AttendanceRequestEventRecord = {
+  id: string;
+  request_id: string;
+  event_id: string | null;
+  event_name: string;
+  evidence_url: string;
+  created_at: Date | string;
+};
+
+export type AttendanceRequestRecord = {
+  id: string;
+  school_year_id: string;
+  student_id: string;
+  name: string;
+  year_level: string | null;
+  college: string | null;
+  program: string | null;
+  institution: string | null;
+  request_note: string | null;
+  status: AttendanceRequestStatus;
+  reviewed_by: string | null;
+  review_note: string | null;
+  reviewed_at: Date | string | null;
+  created_at: Date | string;
+  updated_at: Date | string;
 };
 
 export type ManualAttendanceType = "manual" | "zero_attendance";

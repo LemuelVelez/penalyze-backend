@@ -12,6 +12,11 @@ import {
   updateUser,
 } from "./controller/auth.controller";
 import {
+  createRequest as createAttendanceRequest,
+  requests as attendanceRequests,
+  reviewRequest as reviewAttendanceRequest,
+} from "./controller/attendance-requests.controller";
+import {
   attendanceUpload,
   calculationResults as attendanceCalculationResults,
   deleteCalculationResultRows as deleteAttendanceCalculationResults,
@@ -175,6 +180,15 @@ app.patch("/api/school-years/:id/activate", activateSchoolYear);
 app.patch("/api/school-years/:id", updateSchoolYear);
 app.put("/api/school-years/:id", updateSchoolYear);
 app.delete("/api/school-years/:id", deleteSchoolYear);
+
+
+app.post("/api/attendance/requests", createAttendanceRequest);
+app.get("/api/attendance/requests", requireAuth, attendanceRequests);
+app.patch(
+  "/api/attendance/requests/:id/review",
+  requireAuth,
+  reviewAttendanceRequest,
+);
 
 app.get("/api/attendance/events", attendanceEvents);
 app.post("/api/attendance/events", saveAttendanceEvent);

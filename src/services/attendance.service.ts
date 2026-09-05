@@ -3078,9 +3078,18 @@ export async function listAttendanceEvents(
     `
       SELECT
         e.*,
-        COUNT(DISTINCT ar.student_id)::INT AS attendees_count
+        COUNT(DISTINCT attendee.normalized_student_id)::INT AS attendees_count
       FROM attendance_events e
-      LEFT JOIN attendance_records ar ON ar.event_id = e.id
+      LEFT JOIN LATERAL (
+        SELECT LOWER(TRIM(ar.student_id)) AS normalized_student_id
+        FROM attendance_records ar
+        WHERE ar.event_id = e.id
+        UNION
+        SELECT LOWER(TRIM(mar.student_id)) AS normalized_student_id
+        FROM manual_attendance_records mar
+        WHERE mar.event_id = e.id
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+      ) attendee ON TRUE
       ${schoolYearId ? "WHERE e.school_year_id = $3" : ""}
       GROUP BY e.id
       ORDER BY e.event_order ASC NULLS LAST, COALESCE(e.event_start_at, e.event_end_at, e.created_at) ASC, e.created_at ASC
