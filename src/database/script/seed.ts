@@ -8,18 +8,20 @@ async function runSeeders() {
   console.log("Running database seeders...");
 
   const userResult = await seedUser();
-  console.log(
-    userResult.alreadySeeded
-      ? `Seeded user already seeded: ${userResult.email}`
-      : `Seeded user created: ${userResult.email}`
-  );
-
   const penaltiesResult = await seedPenalties();
-  console.log(
-    penaltiesResult.alreadySeeded
-      ? "Penalties already seeded."
-      : `Seeded ${penaltiesResult.seededCount} penalties.`
-  );
+
+  if (userResult.alreadySeeded && penaltiesResult.alreadySeeded) {
+    console.log("No pending seeders.");
+    return;
+  }
+
+  if (!userResult.alreadySeeded) {
+    console.log(`Seeded user created: ${userResult.email}`);
+  }
+
+  if (!penaltiesResult.alreadySeeded) {
+    console.log(`Seeded ${penaltiesResult.seededCount} penalties.`);
+  }
 
   console.log("Seeders completed.");
 }

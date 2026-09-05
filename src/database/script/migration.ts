@@ -56,9 +56,10 @@ async function runMigrations() {
 
   await ensureMigrationsTable();
 
+  let appliedCount = 0;
+
   for (const file of files) {
     if (await isMigrationApplied(file)) {
-      console.log(`Already migrated: ${file}`);
       continue;
     }
 
@@ -70,18 +71,25 @@ async function runMigrations() {
       await query(sql);
       await registerMigration(file);
       await query("COMMIT");
+      appliedCount += 1;
       console.log(`Applied migration: ${file}`);
     } catch (error) {
       await query("ROLLBACK");
       throw error;
     }
   }
+
+  if (appliedCount === 0) {
+    console.log("No pending migrations.");
+    return;
+  }
+
+  console.log("Migrations completed.");
 }
 
 runMigrations()
   .then(async () => {
     await closeDatabasePool();
-    console.log("Migrations completed.");
   })
   .catch(async (error) => {
     console.error("Migration failed:", error);
