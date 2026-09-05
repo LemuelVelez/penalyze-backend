@@ -159,11 +159,28 @@ async function ensureCurrentSchoolYear() {
   if (active.rows[0]) return active.rows[0];
 
   const range = getSchoolYearRangeFromDate();
+  const existing = await query<SchoolYearRecord>(
+    `
+      SELECT *
+      FROM school_years
+      WHERE name = $1
+      ORDER BY semester ASC
+    `,
+    [range.name],
+  );
+
+  if (existing.rows.length === 1) return existing.rows[0];
+  if (existing.rows.length > 1) {
+    throw new Error(
+      "Active school year / semester is required when multiple semesters exist.",
+    );
+  }
+
   const result = await query<SchoolYearRecord>(
     `
-      INSERT INTO school_years (name, starts_at, ends_at)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (name)
+      INSERT INTO school_years (name, semester, starts_at, ends_at)
+      VALUES ($1, 'first_semester', $2, $3)
+      ON CONFLICT (name, semester)
       DO UPDATE SET
         starts_at = EXCLUDED.starts_at,
         ends_at = EXCLUDED.ends_at,

@@ -41,6 +41,7 @@ export async function save(req: Request, res: Response, next: NextFunction) {
   try {
     const row = await createSchoolYear({
       name: req.body?.name,
+      semester: req.body?.semester,
       startsAt: req.body?.startsAt ?? req.body?.starts_at,
       endsAt: req.body?.endsAt ?? req.body?.ends_at,
       isActive: toBoolean(req.body?.isActive ?? req.body?.is_active),
@@ -64,6 +65,7 @@ export async function update(req: Request, res: Response, next: NextFunction) {
 
     const row = await updateSchoolYear(id, {
       name: req.body?.name,
+      semester: req.body?.semester,
       startsAt: req.body?.startsAt ?? req.body?.starts_at,
       endsAt: req.body?.endsAt ?? req.body?.ends_at,
       isActive: toBoolean(req.body?.isActive ?? req.body?.is_active),

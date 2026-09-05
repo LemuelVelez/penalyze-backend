@@ -900,11 +900,30 @@ async function ensureSchoolYearForDate(
   values: unknown[] = [],
 ) {
   const range = getSchoolYearRangeFromDate(getFirstValidSchoolYearDate(values));
+  const existing = await client.query<SchoolYearRecord>(
+    `
+      SELECT *
+      FROM school_years
+      WHERE name = $1
+      ORDER BY is_active DESC, semester ASC
+    `,
+    [range.name],
+  );
+
+  if (existing.rows.length === 1) return existing.rows[0];
+  if (existing.rows.length > 1) {
+    const active = existing.rows.find((row) => row.is_active);
+    if (active) return active;
+    throw createValidationError(
+      "Active school year / semester is required when multiple semesters exist.",
+    );
+  }
+
   const result = await client.query<SchoolYearRecord>(
     `
-      INSERT INTO school_years (name, starts_at, ends_at)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (name)
+      INSERT INTO school_years (name, semester, starts_at, ends_at)
+      VALUES ($1, 'first_semester', $2, $3)
+      ON CONFLICT (name, semester)
       DO UPDATE SET
         starts_at = EXCLUDED.starts_at,
         ends_at = EXCLUDED.ends_at,

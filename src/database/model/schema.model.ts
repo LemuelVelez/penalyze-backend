@@ -24,10 +24,12 @@ export type AttendanceImportProgressStage =
   | "completed"
   | "cancelled";
 export type FineStatus = "unpaid" | "paid" | "waived";
+export type SchoolSemester = "first_semester" | "second_semester";
 
 export type SchoolYearRecord = {
   id: string;
   name: string;
+  semester: SchoolSemester;
   starts_at: Date | string;
   ends_at: Date | string;
   is_active: boolean;

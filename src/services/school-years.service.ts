@@ -1,11 +1,12 @@
 import { PoolClient } from "pg";
 
-import { SchoolYearRecord } from "../database/model/schema.model";
+import { SchoolSemester, SchoolYearRecord } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
 import { syncAbsencesForAttendanceRecordIds } from "./attendance.service";
 
 export type SchoolYearInput = {
   name?: string;
+  semester?: SchoolSemester | string;
   startsAt?: string;
   endsAt?: string;
   isActive?: boolean;
@@ -73,6 +74,21 @@ function getDateFromInput(value: unknown) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+function parseSemester(value: unknown): SchoolSemester {
+  const semester = cleanText(value).toLowerCase().replace(/[\s-]+/g, "_");
+
+  if (!semester || semester === "first" || semester === "1" || semester === "semester_1") {
+    return "first_semester";
+  }
+
+  if (semester === "first_semester") return "first_semester";
+  if (semester === "second" || semester === "2" || semester === "semester_2" || semester === "second_semester") {
+    return "second_semester";
+  }
+
+  throw createValidationError("Semester must be First Semester or Second Semester.");
+}
+
 export function getSchoolYearRangeFromDate(value: Date = new Date()) {
   const year = value.getFullYear();
   const month = value.getMonth() + 1;
@@ -116,6 +132,7 @@ function parseSchoolYearInput(input: SchoolYearInput) {
 
   return {
     name,
+    semester: parseSemester(input.semester),
     startsAt,
     endsAt,
     isActive: Boolean(input.isActive),
@@ -129,9 +146,9 @@ export async function ensureSchoolYearForDate(
   const range = getSchoolYearRangeFromDate(value);
   const result = await client.query<SchoolYearRecord>(
     `
-      INSERT INTO school_years (name, starts_at, ends_at)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (name)
+      INSERT INTO school_years (name, semester, starts_at, ends_at)
+      VALUES ($1, 'first_semester', $2, $3)
+      ON CONFLICT (name, semester)
       DO UPDATE SET
         starts_at = EXCLUDED.starts_at,
         ends_at = EXCLUDED.ends_at,
@@ -161,6 +178,28 @@ async function setActiveSchoolYear(client: PoolClient, id: string) {
   return result.rows[0];
 }
 
+async function resolveCurrentSchoolYearForActivation(client: PoolClient) {
+  const range = getSchoolYearRangeFromDate();
+  const currentRows = await client.query<SchoolYearRecord>(
+    `
+      SELECT *
+      FROM school_years
+      WHERE name = $1
+      ORDER BY semester ASC
+    `,
+    [range.name],
+  );
+
+  if (currentRows.rows.length === 1) return currentRows.rows[0];
+  if (currentRows.rows.length > 1) {
+    throw createValidationError(
+      "Activate a school year / semester before using active-only records.",
+    );
+  }
+
+  return ensureSchoolYearForDate(client);
+}
+
 export async function getActiveOrCurrentSchoolYear(client?: PoolClient) {
   if (client) {
     const activeResult = await client.query<SchoolYearRecord>(
@@ -175,7 +214,7 @@ export async function getActiveOrCurrentSchoolYear(client?: PoolClient) {
 
     if (activeResult.rows[0]) return activeResult.rows[0];
 
-    const currentSchoolYear = await ensureSchoolYearForDate(client);
+    const currentSchoolYear = await resolveCurrentSchoolYearForActivation(client);
     return setActiveSchoolYear(client, currentSchoolYear.id);
   }
 
@@ -192,7 +231,7 @@ export async function getActiveOrCurrentSchoolYear(client?: PoolClient) {
   if (activeResult.rows[0]) return activeResult.rows[0];
 
   return withTransaction(async (transactionClient) => {
-    const currentSchoolYear = await ensureSchoolYearForDate(transactionClient);
+    const currentSchoolYear = await resolveCurrentSchoolYearForActivation(transactionClient);
     return setActiveSchoolYear(transactionClient, currentSchoolYear.id);
   });
 }
@@ -203,7 +242,7 @@ export async function listSchoolYears(activeOnly = false) {
       SELECT *
       FROM school_years
       ${activeOnly ? "WHERE is_active = TRUE" : ""}
-      ORDER BY starts_at DESC, name DESC
+      ORDER BY starts_at DESC, name DESC, semester ASC
     `,
   );
 
@@ -231,9 +270,9 @@ export async function createSchoolYear(input: SchoolYearInput) {
 
     const result = await client.query<SchoolYearRecord>(
       `
-        INSERT INTO school_years (name, starts_at, ends_at, is_active)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (name)
+        INSERT INTO school_years (name, semester, starts_at, ends_at, is_active)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (name, semester)
         DO UPDATE SET
           starts_at = EXCLUDED.starts_at,
           ends_at = EXCLUDED.ends_at,
@@ -241,7 +280,13 @@ export async function createSchoolYear(input: SchoolYearInput) {
           updated_at = NOW()
         RETURNING *
       `,
-      [cleanInput.name, cleanInput.startsAt, cleanInput.endsAt, cleanInput.isActive],
+      [
+        cleanInput.name,
+        cleanInput.semester,
+        cleanInput.startsAt,
+        cleanInput.endsAt,
+        cleanInput.isActive,
+      ],
     );
 
     return result.rows[0];
@@ -304,14 +349,22 @@ export async function updateSchoolYear(id: string, input: SchoolYearInput) {
       `
         UPDATE school_years
         SET name = $2,
-            starts_at = $3,
-            ends_at = $4,
-            is_active = $5,
+            semester = $3,
+            starts_at = $4,
+            ends_at = $5,
+            is_active = $6,
             updated_at = NOW()
         WHERE id = $1
         RETURNING *
       `,
-      [id, cleanInput.name, cleanInput.startsAt, cleanInput.endsAt, cleanInput.isActive],
+      [
+        id,
+        cleanInput.name,
+        cleanInput.semester,
+        cleanInput.startsAt,
+        cleanInput.endsAt,
+        cleanInput.isActive,
+      ],
     );
 
     return result.rows[0];
