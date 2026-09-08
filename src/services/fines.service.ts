@@ -418,7 +418,9 @@ export async function listFines(
     offset?: number;
   } = {},
 ) {
-  const clauses: string[] = [];
+  const clauses: string[] = [
+    "(f.attendance_record_id IS NULL OR ar.id IS NOT NULL)",
+  ];
   const params: unknown[] = [];
 
   if (options.schoolYearId) {
@@ -454,7 +456,7 @@ export async function listFines(
         ae.event_end_at AS attendance_event_end_at,
         ar.remarks AS attendance_remarks
       FROM fines f
-      LEFT JOIN attendance_records ar ON ar.id = f.attendance_record_id
+      LEFT JOIN attendance_records ar ON ar.id = f.attendance_record_id AND ar.deleted_at IS NULL
       LEFT JOIN attendance_events ae ON ae.id = ar.event_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY
@@ -479,6 +481,7 @@ async function getAttendanceEventCount(
       SELECT COUNT(DISTINCT ar.event_id)::INT AS total
       FROM attendance_records ar
       WHERE ar.event_id IS NOT NULL
+        AND ar.deleted_at IS NULL
         AND ar.school_year_id = $2::uuid
         AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1::TEXT
     `,
@@ -528,6 +531,7 @@ async function upsertZeroAttendanceRecord(
       SELECT *
       FROM attendance_records
       WHERE event_id IS NULL
+        AND deleted_at IS NULL
         AND school_year_id = $3::uuid
         AND LOWER(TRIM(student_id)) = LOWER(TRIM($1::TEXT))
         AND remarks = $2::TEXT
@@ -550,6 +554,7 @@ async function upsertZeroAttendanceRecord(
             no_of_absences = $8,
             updated_at = NOW()
         WHERE id = $1
+          AND deleted_at IS NULL
         RETURNING *
       `,
       [
@@ -724,6 +729,15 @@ export async function updateFineStatus(id: string, status: FineStatus) {
         SET status = $2,
             updated_at = NOW()
         WHERE id = $1
+          AND (
+            attendance_record_id IS NULL
+            OR EXISTS (
+              SELECT 1
+              FROM attendance_records active_record
+              WHERE active_record.id = fines.attendance_record_id
+                AND active_record.deleted_at IS NULL
+            )
+          )
         RETURNING *
       )
       SELECT
@@ -732,7 +746,7 @@ export async function updateFineStatus(id: string, status: FineStatus) {
         ar.event_id AS attendance_event_id,
         ar.remarks AS attendance_remarks
       FROM updated
-      LEFT JOIN attendance_records ar ON ar.id = updated.attendance_record_id
+      LEFT JOIN attendance_records ar ON ar.id = updated.attendance_record_id AND ar.deleted_at IS NULL
     `,
     [id, status],
   );
@@ -750,10 +764,19 @@ export async function getFineSummary(schoolYearId?: string) {
     count: string;
   }>(
     `
-      SELECT status, COUNT(*)::TEXT AS count
-      FROM fines
-      ${schoolYearId ? "WHERE school_year_id = $1" : ""}
-      GROUP BY status
+      SELECT f.status, COUNT(*)::TEXT AS count
+      FROM fines f
+      WHERE (
+        f.attendance_record_id IS NULL
+        OR EXISTS (
+          SELECT 1
+          FROM attendance_records ar
+          WHERE ar.id = f.attendance_record_id
+            AND ar.deleted_at IS NULL
+        )
+      )
+      ${schoolYearId ? "AND f.school_year_id = $1" : ""}
+      GROUP BY f.status
       ORDER BY status ASC
     `,
     schoolYearId ? [schoolYearId] : [],
@@ -799,7 +822,27 @@ function getCalculationScopeKey(importIds: string[]) {
 export async function listPenaltyResults(
   options: ListPenaltyResultsOptions = {},
 ) {
-  const clauses: string[] = [];
+  const clauses: string[] = [
+    `(
+      pr.source_table <> 'attendance_final_results'
+      OR afr.import_id IS NULL
+      OR EXISTS (
+        SELECT 1
+        FROM attendance_imports active_import
+        WHERE active_import.id = afr.import_id
+          AND active_import.deleted_at IS NULL
+      )
+    )`,
+    `(
+      pr.source_table <> 'calculation_results'
+      OR NOT EXISTS (
+        SELECT 1
+        FROM attendance_imports hidden_import
+        WHERE hidden_import.id = ANY(COALESCE(cr.import_ids, ARRAY[]::uuid[]))
+          AND hidden_import.deleted_at IS NOT NULL
+      )
+    )`,
+  ];
   const params: unknown[] = [];
 
   if (options.schoolYearId) {
@@ -852,6 +895,7 @@ export async function listPenaltyResults(
         FROM attendance_imports ai
         LEFT JOIN attendance_events ae ON ae.id = ai.event_id
         WHERE ai.id = ANY(COALESCE(cr.import_ids, ARRAY[]::uuid[]))
+          AND ai.deleted_at IS NULL
       ) calculation_event ON TRUE
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY

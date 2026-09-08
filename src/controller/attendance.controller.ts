@@ -8,6 +8,9 @@ import {
   deleteAttendanceFinalResultsBySchoolYear,
   deleteAttendanceImport,
   deleteAttendanceImports,
+  getAttendanceImportDeleteImpact,
+  purgeAttendanceImport,
+  restoreAttendanceImport,
   deleteCalculationResultsByIds,
   deleteCalculationResultsBySchoolYear,
   deleteAttendanceImportsByIds,
@@ -36,6 +39,7 @@ import {
   ACCEPTED_ATTENDANCE_EXTENSIONS,
   AttendanceImportProgress,
 } from "../database/model/schema.model";
+import type { AuthenticatedRequest } from "./auth.controller";
 
 const MAX_FILE_SIZE = Number(
   process.env.ATTENDANCE_UPLOAD_MAX_BYTES ?? 10 * 1024 * 1024,
@@ -120,6 +124,10 @@ function getRequestSchoolYearId(req: Request) {
       req.query.schoolYearId ??
       "",
   ).trim();
+}
+
+function getAuthenticatedUserId(req: Request) {
+  return (req as AuthenticatedRequest).user?.sub;
 }
 
 function parseImportIds(value: unknown) {
@@ -493,7 +501,10 @@ export async function saveImport(
         try {
           const result = await saveAttendanceFile(
             file,
-            getEventPayloadForFile(req, file, index),
+            {
+              ...getEventPayloadForFile(req, file, index),
+              uploadedBy: getAuthenticatedUserId(req),
+            },
           );
           fileResults.push({
             fileName: file.originalname,
@@ -530,6 +541,7 @@ export async function saveImport(
 
     const result = await saveAttendanceRows({
       ...eventPayload,
+      uploadedBy: getAuthenticatedUserId(req),
       fileName: req.body?.fileName ?? "preview-import",
       fileType: req.body?.fileType ?? "json",
       rows,
@@ -618,6 +630,7 @@ export async function saveImportWithProgress(
             file,
             {
               ...getEventPayloadForFile(req, file, index),
+              uploadedBy: getAuthenticatedUserId(req),
               isCancelled,
             },
             onProgress,
@@ -683,6 +696,7 @@ export async function saveImportWithProgress(
 
     const result = await saveAttendanceRows({
       ...eventPayload,
+      uploadedBy: getAuthenticatedUserId(req),
       fileName: req.body?.fileName ?? "preview-import",
       fileType: req.body?.fileType ?? "json",
       rows,
@@ -905,7 +919,14 @@ export async function imports(req: Request, res: Response, next: NextFunction) {
     const schoolYearId = req.query.schoolYearId
       ? String(req.query.schoolYearId).trim()
       : undefined;
-    const records = await listAttendanceImports(limit, offset, schoolYearId);
+    const includeDeleted =
+      String(req.query.includeDeleted ?? "").trim().toLowerCase() === "true";
+    const records = await listAttendanceImports(
+      limit,
+      offset,
+      schoolYearId,
+      includeDeleted,
+    );
 
     res.json({ data: records });
   } catch (error) {
@@ -926,9 +947,13 @@ export async function deleteImport(
       return;
     }
 
-    const result = await deleteAttendanceImport(importId);
+    const result = await deleteAttendanceImport(
+      importId,
+      getAuthenticatedUserId(req),
+      req.body?.deleteReason ?? req.body?.delete_reason,
+    );
     res.json({
-      message: "Attendance import deleted successfully.",
+      message: "Attendance import moved to recently deleted.",
       data: result,
     });
   } catch (error) {
@@ -944,12 +969,90 @@ export async function deleteImports(
   try {
     const importIds = getRequestRecordIds(req);
     const schoolYearId = getRequestSchoolYearId(req);
+
+    if (!importIds.length && !schoolYearId) {
+      res.status(400).json({
+        message: "School year ID is required when deleting all attendance imports.",
+      });
+      return;
+    }
+
+    const deletedBy = getAuthenticatedUserId(req);
+    const deleteReason = req.body?.deleteReason ?? req.body?.delete_reason;
     const result = importIds.length
-      ? await deleteAttendanceImportsByIds(importIds)
-      : await deleteAttendanceImports(schoolYearId || undefined);
+      ? await deleteAttendanceImportsByIds(importIds, deletedBy, deleteReason)
+      : await deleteAttendanceImports(schoolYearId, deletedBy, deleteReason);
 
     res.json({
-      message: "Attendance imports deleted successfully.",
+      message: "Attendance imports moved to recently deleted.",
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function restoreImport(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const importId = getRouteParam(req, "importId");
+
+    if (!importId) {
+      res.status(400).json({ message: "Attendance import ID is required." });
+      return;
+    }
+
+    const result = await restoreAttendanceImport(importId);
+    res.json({
+      message: result.restored
+        ? "Attendance import restored successfully."
+        : "Attendance import is already active.",
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function importDeleteImpact(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const importId = getRouteParam(req, "importId");
+
+    if (!importId) {
+      res.status(400).json({ message: "Attendance import ID is required." });
+      return;
+    }
+
+    const result = await getAttendanceImportDeleteImpact(importId);
+    res.json({ data: result });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function purgeImport(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const importId = getRouteParam(req, "importId");
+
+    if (!importId) {
+      res.status(400).json({ message: "Attendance import ID is required." });
+      return;
+    }
+
+    const result = await purgeAttendanceImport(importId);
+    res.json({
+      message: "Attendance import permanently purged.",
       data: result,
     });
   } catch (error) {

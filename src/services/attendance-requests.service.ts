@@ -387,6 +387,7 @@ async function addApprovedManualAttendance(
           SELECT 1
           FROM attendance_records ar
           WHERE ar.event_id = $1
+            AND ar.deleted_at IS NULL
             AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM($2))
           UNION ALL
           SELECT 1
@@ -464,6 +465,7 @@ async function addApprovedManualAttendance(
     `
       DELETE FROM attendance_records
       WHERE school_year_id = $1
+        AND deleted_at IS NULL
         AND event_id IS NULL
         AND LOWER(TRIM(student_id)) = LOWER(TRIM($2))
         AND remarks = $3

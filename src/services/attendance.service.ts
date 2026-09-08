@@ -37,6 +37,7 @@ type CalculationSourceType = "imported" | "manual" | "zero_attendance";
 
 type SaveRowsInput = {
   schoolYearId?: string;
+  uploadedBy?: string;
   eventId?: string;
   eventName?: string;
   eventStartAt?: string;
@@ -59,6 +60,44 @@ export type DeletedAttendanceImportsResult = {
   deletedCount: number;
   deletedImports: AttendanceImportRecord[];
 };
+
+export type AttendanceImportDeleteImpact = {
+  importId: string;
+  fileName: string;
+  uploadedAt: Date | string;
+  uploader: {
+    id: string | null;
+    name: string | null;
+    email: string | null;
+  };
+  recordCount: number;
+  distinctStudentCount: number;
+  affectedEvents: Array<{
+    id: string | null;
+    name: string;
+    recordCount: number;
+  }>;
+  studentsGainingAbsence: number;
+  finesCreated: number;
+  finesChanged: number;
+  finesCreatedOrChanged: number;
+};
+
+export type RestoredAttendanceImportResult = {
+  import: AttendanceImportRecord;
+  restored: boolean;
+  reattachedEvent: AttendanceEventRecord | null;
+  needsReattachment: boolean;
+};
+
+const configuredAttendanceImportRetentionDays = Number(
+  process.env.ATTENDANCE_IMPORT_RETENTION_DAYS ?? 30,
+);
+const ATTENDANCE_IMPORT_RETENTION_DAYS =
+  Number.isFinite(configuredAttendanceImportRetentionDays) &&
+  configuredAttendanceImportRetentionDays > 0
+    ? Math.max(1, Math.floor(configuredAttendanceImportRetentionDays))
+    : 30;
 
 export type DeletedAttendanceFinalResultsResult = {
   deletedCount: number;
@@ -305,9 +344,49 @@ const ATTENDANCE_RECORD_SELECT = `
   ar.no_of_absences,
   ar.remarks,
   ar.scanned_at,
+  ar.deleted_at,
+  ar.deleted_by,
+  ar.delete_reason,
   ar.created_at,
   ar.updated_at
 `;
+
+const ATTENDANCE_IMPORT_SELECT = `
+  ai.*,
+  COALESCE(ae.name, ai.event_name_snapshot) AS event_name,
+  ae.event_order,
+  ae.event_start_at,
+  ae.event_end_at,
+  uploader.name AS uploader_name,
+  uploader.email AS uploader_email,
+  deleter.name AS deleted_by_name,
+  deleter.email AS deleted_by_email
+`;
+
+function withAttendanceImportRetention(record: AttendanceImportRecord) {
+  if (!record.deleted_at) {
+    return {
+      ...record,
+      purge_after: null,
+      days_remaining: null,
+    };
+  }
+
+  const deletedAt = new Date(record.deleted_at);
+  const purgeAt = new Date(
+    deletedAt.getTime() + ATTENDANCE_IMPORT_RETENTION_DAYS * 24 * 60 * 60 * 1000,
+  );
+  const remainingMs = purgeAt.getTime() - Date.now();
+
+  return {
+    ...record,
+    purge_after: purgeAt.toISOString(),
+    days_remaining: Math.max(
+      0,
+      Math.ceil(remainingMs / (24 * 60 * 60 * 1000)),
+    ),
+  };
+}
 
 function isNumericDateCandidate(value: string) {
   return /^\d+(?:\.\d+)?$/.test(value.trim());
@@ -1289,7 +1368,7 @@ async function getAttendanceEventById(client: PoolClient, id: string) {
         e.*,
         COUNT(DISTINCT ar.student_id)::INT AS attendees_count
       FROM attendance_events e
-      LEFT JOIN attendance_records ar ON ar.event_id = e.id
+      LEFT JOIN attendance_records ar ON ar.event_id = e.id AND ar.deleted_at IS NULL
       WHERE e.id = $1
       GROUP BY e.id
       LIMIT 1
@@ -1397,7 +1476,7 @@ async function findOrCreateAttendanceEvent(
         e.*,
         COUNT(DISTINCT ar.student_id)::INT AS attendees_count
       FROM attendance_events e
-      LEFT JOIN attendance_records ar ON ar.event_id = e.id
+      LEFT JOIN attendance_records ar ON ar.event_id = e.id AND ar.deleted_at IS NULL
       WHERE e.school_year_id = $1
       GROUP BY e.id
       ORDER BY e.created_at DESC
@@ -1669,7 +1748,8 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
       ar.event_id,
       LOWER(TRIM(ar.student_id)) AS normalized_student_id
     FROM attendance_records ar
-    WHERE ar.event_id IS NOT NULL
+    WHERE ar.deleted_at IS NULL
+      AND ar.event_id IS NOT NULL
       AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
   )
 `;
@@ -1680,7 +1760,8 @@ const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
       ar.event_id,
       ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
     FROM attendance_records ar
-    WHERE ar.event_id IS NOT NULL
+    WHERE ar.deleted_at IS NULL
+      AND ar.event_id IS NOT NULL
   )
 `;
 const ATTENDANCE_ABSENCE_SYNC_LOCK_SQL =
@@ -1749,6 +1830,7 @@ async function getAttendanceRecordEventRosterCollegeKeys(
         ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
       FROM attendance_records ar
       WHERE ar.id = ANY($1::uuid[])
+        AND ar.deleted_at IS NULL
         AND ar.event_id IS NOT NULL
     `,
     [uniqueRecordIds],
@@ -1772,6 +1854,7 @@ async function getAttendanceImportEventRosterCollegeKeys(
         ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
       FROM attendance_records ar
       WHERE ar.import_id = ANY($1::uuid[])
+        AND ar.deleted_at IS NULL
         AND ar.event_id IS NOT NULL
     `,
     [uniqueImportIds],
@@ -1795,6 +1878,7 @@ async function getAttendanceEventRosterCollegeKeys(
         ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
       FROM attendance_records ar
       WHERE ar.event_id = ANY($1::uuid[])
+        AND ar.deleted_at IS NULL
     `,
     [uniqueEventIds],
   );
@@ -1816,7 +1900,8 @@ async function getAttendanceStudentIdsByEventRosterCollegeKeys(
     `
       SELECT DISTINCT ar.student_id
       FROM attendance_records ar
-      WHERE ar.event_id IS NOT NULL
+      WHERE ar.deleted_at IS NULL
+        AND ar.event_id IS NOT NULL
         AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} = ANY($1::TEXT[])
     `,
     [uniqueEventRosterCollegeKeys],
@@ -1882,7 +1967,8 @@ async function syncAbsencesForStudents(
           ar.school_year_id,
           ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
         FROM attendance_records ar
-        WHERE ar.event_id IS NOT NULL
+        WHERE ar.deleted_at IS NULL
+          AND ar.event_id IS NOT NULL
           AND LOWER(TRIM(ar.student_id)) = ANY($1::TEXT[])
       ),
       student_absences AS (
@@ -1916,7 +2002,8 @@ async function syncAbsencesForStudents(
           ON LOWER(TRIM(ar.student_id)) = sa.student_key
          AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} = sa.college_key
          AND ar.school_year_id IS NOT DISTINCT FROM sa.school_year_id
-        WHERE ar.event_id IS NOT NULL
+        WHERE ar.deleted_at IS NULL
+          AND ar.event_id IS NOT NULL
         ORDER BY ar.id
         FOR UPDATE OF ar
       )
@@ -2028,6 +2115,7 @@ async function listRecordsByIds(client: PoolClient, ids: string[]) {
       LEFT JOIN attendance_events ae ON ae.id = ar.event_id
       LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
       WHERE ar.id = ANY($1::uuid[])
+        AND ar.deleted_at IS NULL
       ORDER BY ar.created_at DESC
     `,
     [uniqueIds],
@@ -2036,24 +2124,27 @@ async function listRecordsByIds(client: PoolClient, ids: string[]) {
   return result.rows;
 }
 
-async function getAttendanceImportById(client: PoolClient, importId: string) {
+async function getAttendanceImportById(
+  client: PoolClient,
+  importId: string,
+  includeDeleted = false,
+) {
   const result = await client.query<AttendanceImportRecord>(
     `
       SELECT
-        ai.*,
-        ae.name AS event_name,
-        ae.event_order,
-        ae.event_start_at,
-        ae.event_end_at
+        ${ATTENDANCE_IMPORT_SELECT}
       FROM attendance_imports ai
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+      LEFT JOIN users uploader ON uploader.id = ai.uploaded_by
+      LEFT JOIN users deleter ON deleter.id = ai.deleted_by
       WHERE ai.id = $1
+        AND ($2::BOOLEAN OR ai.deleted_at IS NULL)
       LIMIT 1
     `,
-    [importId],
+    [importId, includeDeleted],
   );
 
-  return result.rows[0] ?? null;
+  return result.rows[0] ? withAttendanceImportRetention(result.rows[0]) : null;
 }
 
 async function findDuplicateAttendanceImport(
@@ -2094,6 +2185,7 @@ async function findDuplicateAttendanceImport(
           OR ($3::uuid IS NULL AND $4::TEXT = '')
         )
         AND ai.status = 'saved'
+        AND ai.deleted_at IS NULL
       ORDER BY ai.created_at DESC
       LIMIT 1
     `,
@@ -2314,11 +2406,14 @@ export async function saveAttendanceRows(
               SET
                 school_year_id = COALESCE(school_year_id, $6),
                 event_id = COALESCE(event_id, $2),
+                event_name_snapshot = COALESCE(NULLIF(event_name_snapshot, ''), NULLIF($7, '')),
+                uploaded_by = COALESCE(uploaded_by, $8::uuid),
                 rows_total = rows_total + $3,
                 rows_valid = rows_valid + $4,
                 rows_invalid = rows_invalid + $5,
                 status = 'saved'
               WHERE id = $1
+                AND deleted_at IS NULL
               RETURNING *
             `,
             [
@@ -2328,19 +2423,34 @@ export async function saveAttendanceRows(
               preview.rowsValid,
               preview.rowsInvalid,
               resolvedSchoolYearId,
+              defaultEvent?.name ?? input.eventName ?? null,
+              cleanText(input.uploadedBy) || null,
             ],
           )
         ).rows[0]
       : (
           await client.query<AttendanceImportRecord>(
             `
-              INSERT INTO attendance_imports (school_year_id, event_id, file_name, file_type, rows_total, rows_valid, rows_invalid, status)
-              VALUES ($1, $2, $3, $4, $5, $6, $7, 'saved')
+              INSERT INTO attendance_imports (
+                school_year_id,
+                event_id,
+                event_name_snapshot,
+                uploaded_by,
+                file_name,
+                file_type,
+                rows_total,
+                rows_valid,
+                rows_invalid,
+                status
+              )
+              VALUES ($1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, 'saved')
               RETURNING *
             `,
             [
               resolvedSchoolYearId,
               defaultEvent?.id ?? null,
+              defaultEvent?.name ?? input.eventName ?? null,
+              cleanText(input.uploadedBy) || null,
               preview.fileName,
               preview.fileType,
               preview.rowsTotal,
@@ -2618,6 +2728,9 @@ function manualRecordToAttendanceRecord(
     no_of_absences: record.no_of_absences,
     remarks: record.remarks,
     scanned_at: record.scanned_at,
+    deleted_at: null,
+    deleted_by: null,
+    delete_reason: null,
     created_at: record.created_at as Date,
     updated_at: record.updated_at as Date,
   };
@@ -2660,6 +2773,7 @@ async function countCollegeEventsForManualRecord(
           SELECT 1
           FROM attendance_records ar
           WHERE ar.event_id = ae.id
+            AND ar.deleted_at IS NULL
             AND LOWER(TRIM(COALESCE(ar.college, ''))) = LOWER(TRIM(COALESCE($2, '')))
             AND LOWER(TRIM(COALESCE(ar.program, ''))) = LOWER(TRIM(COALESCE($3, ar.program, '')))
         )
@@ -2878,6 +2992,7 @@ export async function updateAttendanceRecords(
         SELECT *
         FROM attendance_records
         WHERE id = ANY($1::uuid[])
+          AND deleted_at IS NULL
         ORDER BY id
         FOR UPDATE
       `,
@@ -2917,6 +3032,7 @@ export async function updateAttendanceRecords(
           remarks = NULLIF($12, ''),
           updated_at = NOW()
         WHERE id = ANY($1::uuid[])
+          AND deleted_at IS NULL
         RETURNING *
       `,
       [
@@ -3111,7 +3227,7 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
 
   return withTransaction(async (client) => {
     const existingResult = await client.query<AttendanceRecord>(
-      "SELECT * FROM attendance_records WHERE id = $1 LIMIT 1",
+      "SELECT * FROM attendance_records WHERE id = $1 AND deleted_at IS NULL LIMIT 1",
       [id],
     );
     const existingRecord = existingResult.rows[0];
@@ -3148,6 +3264,7 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
           remarks = NULLIF($12, ''),
           updated_at = NOW()
         WHERE id = $1
+          AND deleted_at IS NULL
         RETURNING *
       `,
       [
@@ -3222,7 +3339,7 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
 export async function deleteAttendanceRecord(id: string) {
   return withTransaction(async (client) => {
     const existingResult = await client.query<AttendanceRecord>(
-      "SELECT * FROM attendance_records WHERE id = $1 LIMIT 1",
+      "SELECT * FROM attendance_records WHERE id = $1 AND deleted_at IS NULL LIMIT 1",
       [id],
     );
     const record = existingResult.rows[0];
@@ -3279,31 +3396,231 @@ export async function deleteAttendanceRecord(id: string) {
   });
 }
 
-export async function deleteAttendanceImport(importId: string) {
+type AttendanceImportVisibilityContext = {
+  importIds: string[];
+  schoolYearIds: Array<string | null>;
+  eventRosterCollegeKeys: string[];
+  studentIds: string[];
+};
+
+async function getAttendanceImportVisibilityContext(
+  client: PoolClient,
+  importIds: string[],
+  includeDeleted: boolean,
+): Promise<AttendanceImportVisibilityContext> {
+  const uniqueImportIds = uniqueCleanTextValues(importIds);
+
+  if (!uniqueImportIds.length) {
+    return {
+      importIds: [],
+      schoolYearIds: [],
+      eventRosterCollegeKeys: [],
+      studentIds: [],
+    };
+  }
+
+  const importsResult = await client.query<{ id: string; school_year_id: string | null }>(
+    `
+      SELECT id, school_year_id
+      FROM attendance_imports
+      WHERE id = ANY($1::uuid[])
+        AND ($2::BOOLEAN OR deleted_at IS NULL)
+    `,
+    [uniqueImportIds, includeDeleted],
+  );
+  const existingImportIds = importsResult.rows.map((row) => row.id);
+
+  if (!existingImportIds.length) {
+    return {
+      importIds: [],
+      schoolYearIds: [],
+      eventRosterCollegeKeys: [],
+      studentIds: [],
+    };
+  }
+
+  const recordsResult = await client.query<{
+    student_id: string;
+    college_key: string;
+  }>(
+    `
+      SELECT DISTINCT
+        ar.student_id,
+        ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
+      FROM attendance_records ar
+      WHERE ar.import_id = ANY($1::uuid[])
+        AND ($2::BOOLEAN OR ar.deleted_at IS NULL)
+    `,
+    [existingImportIds, includeDeleted],
+  );
+  const eventRosterCollegeKeys = uniqueAttendanceEventRosterCollegeKeys(
+    recordsResult.rows.map((row) => row.college_key),
+  );
+  const scopeStudentIds = includeDeleted
+    ? []
+    : await getAttendanceStudentIdsByEventRosterCollegeKeys(
+        client,
+        eventRosterCollegeKeys,
+      );
+
+  return {
+    importIds: existingImportIds,
+    schoolYearIds: Array.from(
+      new Set(importsResult.rows.map((row) => row.school_year_id)),
+    ),
+    eventRosterCollegeKeys,
+    studentIds: uniqueCleanTextValues([
+      ...recordsResult.rows.map((row) => row.student_id),
+      ...scopeStudentIds,
+    ]),
+  };
+}
+
+async function recomputeAttendanceAfterImportVisibilityChange(
+  client: PoolClient,
+  context: AttendanceImportVisibilityContext,
+) {
+  await lockAttendanceAbsenceSync(client);
+
+  const currentScopeStudentIds = await getAttendanceStudentIdsByEventRosterCollegeKeys(
+    client,
+    context.eventRosterCollegeKeys,
+  );
+  const studentIds = uniqueCleanTextValues([
+    ...context.studentIds,
+    ...currentScopeStudentIds,
+  ]);
+
+  await syncAbsencesForStudents(client, studentIds);
+
+  const schoolYearScopes: Array<string | undefined> = context.schoolYearIds.some(
+    (schoolYearId) => !schoolYearId,
+  )
+    ? [undefined]
+    : context.schoolYearIds.map((schoolYearId) => schoolYearId || undefined);
+
+  for (const schoolYearId of schoolYearScopes) {
+    await refreshAttendanceFinalResultsWithClient(client, { schoolYearId });
+    await refreshCalculationResultsWithClient(client, { schoolYearId });
+    await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
+  }
+}
+
+async function softDeleteAttendanceImportRecords(
+  client: PoolClient,
+  importIds: string[],
+  deletedBy?: string,
+  deleteReason?: string,
+) {
+  const uniqueImportIds = uniqueCleanTextValues(importIds);
+  if (!uniqueImportIds.length) return [];
+
+  const deletedAt = new Date();
+  const actorId = cleanText(deletedBy) || null;
+  const reason = cleanText(deleteReason) || "Deleted from uploaded files history.";
+
+  await client.query(
+    `
+      UPDATE attendance_records
+      SET deleted_at = $2::timestamptz,
+          deleted_by = $3::uuid,
+          delete_reason = $4,
+          updated_at = NOW()
+      WHERE import_id = ANY($1::uuid[])
+        AND deleted_at IS NULL
+    `,
+    [uniqueImportIds, deletedAt, actorId, reason],
+  );
+
+  await client.query(
+    `
+      DELETE FROM fines f
+      USING attendance_records ar
+      WHERE f.attendance_record_id = ar.id
+        AND ar.import_id = ANY($1::uuid[])
+        AND ar.deleted_at IS NOT NULL
+    `,
+    [uniqueImportIds],
+  );
+
+  const result = await client.query<AttendanceImportRecord>(
+    `
+      UPDATE attendance_imports ai
+      SET deleted_at = $2::timestamptz,
+          deleted_by = $3::uuid,
+          delete_reason = $4,
+          event_name_snapshot = COALESCE(NULLIF(ai.event_name_snapshot, ''), ae.name)
+      FROM attendance_events ae
+      WHERE ai.id = ANY($1::uuid[])
+        AND ai.deleted_at IS NULL
+        AND ae.id = ai.event_id
+      RETURNING ai.*
+    `,
+    [uniqueImportIds, deletedAt, actorId, reason],
+  );
+
+  const updatedIds = new Set(result.rows.map((row) => row.id));
+  const importsWithoutEvent = uniqueImportIds.filter((id) => !updatedIds.has(id));
+
+  if (importsWithoutEvent.length) {
+    const fallbackResult = await client.query<AttendanceImportRecord>(
+      `
+        UPDATE attendance_imports
+        SET deleted_at = $2::timestamptz,
+            deleted_by = $3::uuid,
+            delete_reason = $4
+        WHERE id = ANY($1::uuid[])
+          AND deleted_at IS NULL
+        RETURNING *
+      `,
+      [importsWithoutEvent, deletedAt, actorId, reason],
+    );
+    result.rows.push(...fallbackResult.rows);
+  }
+
+  return result.rows.map(withAttendanceImportRetention);
+}
+
+export async function deleteAttendanceImport(
+  importId: string,
+  deletedBy?: string,
+  deleteReason?: string,
+) {
   return withTransaction(async (client) => {
+    await lockAttendanceAbsenceSync(client);
+
     const importRecord = await getAttendanceImportById(client, importId);
 
     if (!importRecord) {
       throw createValidationError("Attendance import not found.", 404);
     }
 
-    const eventRosterCollegeKeys =
-      await getAttendanceImportEventRosterCollegeKeys(client, [importId]);
-
-    await deleteAttendanceImportRecords(client, [importId]);
-    await syncAbsencesForAttendanceEventRosterColleges(
+    const context = await getAttendanceImportVisibilityContext(
       client,
-      eventRosterCollegeKeys,
+      [importId],
+      false,
+    );
+    const deletedImports = await softDeleteAttendanceImportRecords(
+      client,
+      [importId],
+      deletedBy,
+      deleteReason,
     );
 
-    return importRecord;
+    await recomputeAttendanceAfterImportVisibilityChange(client, context);
+
+    return deletedImports[0] ?? importRecord;
   });
 }
 
 export async function deleteAttendanceImportsByIds(
   importIds: string[],
+  deletedBy?: string,
+  deleteReason?: string,
 ): Promise<DeletedAttendanceImportsResult> {
   return withTransaction(async (client) => {
+    await lockAttendanceAbsenceSync(client);
+
     const uniqueImportIds = uniqueCleanTextValues(importIds);
 
     if (!uniqueImportIds.length) {
@@ -3313,40 +3630,26 @@ export async function deleteAttendanceImportsByIds(
       };
     }
 
-    const importsResult = await client.query<AttendanceImportRecord>(
-      `
-        SELECT
-          ai.*,
-          ae.name AS event_name,
-          ae.event_order,
-          ae.event_start_at,
-          ae.event_end_at
-        FROM attendance_imports ai
-        LEFT JOIN attendance_events ae ON ae.id = ai.event_id
-        WHERE ai.id = ANY($1::uuid[])
-        ORDER BY ai.created_at DESC
-      `,
-      [uniqueImportIds],
+    const context = await getAttendanceImportVisibilityContext(
+      client,
+      uniqueImportIds,
+      false,
     );
 
-    const deletedImports = importsResult.rows;
-    const idsToDelete = deletedImports.map((record) => record.id);
-
-    if (!idsToDelete.length) {
+    if (!context.importIds.length) {
       return {
         deletedCount: 0,
         deletedImports: [],
       };
     }
 
-    const eventRosterCollegeKeys =
-      await getAttendanceImportEventRosterCollegeKeys(client, idsToDelete);
-
-    await deleteAttendanceImportRecords(client, idsToDelete);
-    await syncAbsencesForAttendanceEventRosterColleges(
+    const deletedImports = await softDeleteAttendanceImportRecords(
       client,
-      eventRosterCollegeKeys,
+      context.importIds,
+      deletedBy,
+      deleteReason,
     );
+    await recomputeAttendanceAfterImportVisibilityChange(client, context);
 
     return {
       deletedCount: deletedImports.length,
@@ -3357,27 +3660,31 @@ export async function deleteAttendanceImportsByIds(
 
 export async function deleteAttendanceImports(
   schoolYearId?: string,
+  deletedBy?: string,
+  deleteReason?: string,
 ): Promise<DeletedAttendanceImportsResult> {
-  return withTransaction(async (client) => {
-    const scopedSchoolYearId = cleanOptionalText(schoolYearId);
-    const importsResult = await client.query<AttendanceImportRecord>(
-      `
-        SELECT
-          ai.*,
-          ae.name AS event_name,
-          ae.event_order,
-          ae.event_start_at,
-          ae.event_end_at
-        FROM attendance_imports ai
-        LEFT JOIN attendance_events ae ON ae.id = ai.event_id
-        ${scopedSchoolYearId ? "WHERE ai.school_year_id = $1" : ""}
-        ORDER BY ai.created_at DESC
-      `,
-      scopedSchoolYearId ? [scopedSchoolYearId] : [],
-    );
+  const scopedSchoolYearId = cleanText(schoolYearId);
 
-    const deletedImports = importsResult.rows;
-    const importIds = deletedImports.map((record) => record.id);
+  if (!scopedSchoolYearId) {
+    throw createValidationError(
+      "School year ID is required when deleting all attendance imports.",
+    );
+  }
+
+  return withTransaction(async (client) => {
+    await lockAttendanceAbsenceSync(client);
+
+    const importsResult = await client.query<{ id: string }>(
+      `
+        SELECT id
+        FROM attendance_imports
+        WHERE school_year_id = $1
+          AND deleted_at IS NULL
+        ORDER BY created_at DESC
+      `,
+      [scopedSchoolYearId],
+    );
+    const importIds = importsResult.rows.map((record) => record.id);
 
     if (!importIds.length) {
       return {
@@ -3386,19 +3693,429 @@ export async function deleteAttendanceImports(
       };
     }
 
-    const eventRosterCollegeKeys =
-      await getAttendanceImportEventRosterCollegeKeys(client, importIds);
-
-    await deleteAttendanceImportRecords(client, importIds);
-    await syncAbsencesForAttendanceEventRosterColleges(
+    const context = await getAttendanceImportVisibilityContext(
       client,
-      eventRosterCollegeKeys,
+      importIds,
+      false,
     );
+    const deletedImports = await softDeleteAttendanceImportRecords(
+      client,
+      importIds,
+      deletedBy,
+      deleteReason,
+    );
+    await recomputeAttendanceAfterImportVisibilityChange(client, context);
 
     return {
       deletedCount: deletedImports.length,
       deletedImports,
     };
+  });
+}
+
+async function findRestoreAttendanceEvent(
+  client: PoolClient,
+  importRecord: AttendanceImportRecord,
+) {
+  if (importRecord.event_id) {
+    const event = await getAttendanceEventById(client, importRecord.event_id);
+    if (event) return event;
+  }
+
+  const normalizedName = normalizeAttendanceEventName(
+    importRecord.event_name_snapshot ?? importRecord.event_name,
+  );
+  if (!normalizedName) return null;
+
+  const result = await client.query<AttendanceEventRecord>(
+    `
+      SELECT e.*, 0::INT AS attendees_count
+      FROM attendance_events e
+      WHERE e.school_year_id IS NOT DISTINCT FROM $1::uuid
+      ORDER BY e.event_order ASC NULLS LAST, e.created_at DESC
+    `,
+    [importRecord.school_year_id],
+  );
+
+  return (
+    result.rows.find(
+      (event) => normalizeAttendanceEventName(event.name) === normalizedName,
+    ) ?? null
+  );
+}
+
+export async function restoreAttendanceImport(
+  importId: string,
+): Promise<RestoredAttendanceImportResult> {
+  return withTransaction(async (client) => {
+    await lockAttendanceAbsenceSync(client);
+
+    const importRecord = await getAttendanceImportById(client, importId, true);
+
+    if (!importRecord) {
+      throw createValidationError("Attendance import not found.", 404);
+    }
+
+    if (!importRecord.deleted_at) {
+      return {
+        import: importRecord,
+        restored: false,
+        reattachedEvent: importRecord.event_id
+          ? await getAttendanceEventById(client, importRecord.event_id)
+          : null,
+        needsReattachment: Boolean(importRecord.needs_reattachment),
+      };
+    }
+
+    const deletedAt = new Date(importRecord.deleted_at).getTime();
+    const retentionDeadline =
+      deletedAt + ATTENDANCE_IMPORT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    if (Number.isFinite(deletedAt) && Date.now() >= retentionDeadline) {
+      throw createValidationError(
+        "The attendance import restore window has expired.",
+        410,
+      );
+    }
+
+    const context = await getAttendanceImportVisibilityContext(
+      client,
+      [importId],
+      true,
+    );
+    const event = await findRestoreAttendanceEvent(client, importRecord);
+    const needsReattachment = !event;
+
+    await client.query(
+      `
+        UPDATE attendance_imports
+        SET event_id = $2::uuid,
+            deleted_at = NULL,
+            deleted_by = NULL,
+            delete_reason = NULL,
+            needs_reattachment = $3
+        WHERE id = $1
+      `,
+      [importId, event?.id ?? null, needsReattachment],
+    );
+
+    await client.query(
+      `
+        UPDATE attendance_records
+        SET event_id = $2::uuid,
+            deleted_at = NULL,
+            deleted_by = NULL,
+            delete_reason = NULL,
+            updated_at = NOW()
+        WHERE import_id = $1
+      `,
+      [importId, event?.id ?? null],
+    );
+
+    const activeContext = await getAttendanceImportVisibilityContext(
+      client,
+      [importId],
+      false,
+    );
+    await recomputeAttendanceAfterImportVisibilityChange(client, {
+      ...activeContext,
+      studentIds: uniqueCleanTextValues([
+        ...context.studentIds,
+        ...activeContext.studentIds,
+      ]),
+      eventRosterCollegeKeys: uniqueAttendanceEventRosterCollegeKeys([
+        ...context.eventRosterCollegeKeys,
+        ...activeContext.eventRosterCollegeKeys,
+      ]),
+      schoolYearIds: Array.from(
+        new Set([...context.schoolYearIds, ...activeContext.schoolYearIds]),
+      ),
+    });
+
+    const restoredImport = await getAttendanceImportById(client, importId);
+    if (!restoredImport) {
+      throw createValidationError("Attendance import could not be restored.", 500);
+    }
+
+    return {
+      import: restoredImport,
+      restored: true,
+      reattachedEvent: event,
+      needsReattachment,
+    };
+  });
+}
+
+export async function purgeAttendanceImport(importId: string) {
+  return withTransaction(async (client) => {
+    const importRecord = await getAttendanceImportById(client, importId, true);
+
+    if (!importRecord) {
+      throw createValidationError("Attendance import not found.", 404);
+    }
+
+    if (!importRecord.deleted_at) {
+      throw createValidationError(
+        "Attendance import must be soft-deleted before it can be purged.",
+        409,
+      );
+    }
+
+    await deleteAttendanceImportRecords(client, [importId]);
+    return importRecord;
+  });
+}
+
+export async function purgeExpiredAttendanceImports() {
+  return withTransaction(async (client) => {
+    const result = await client.query<{ id: string }>(
+      `
+        SELECT id
+        FROM attendance_imports
+        WHERE deleted_at IS NOT NULL
+          AND deleted_at <= NOW() - ($1::TEXT || ' days')::INTERVAL
+        ORDER BY deleted_at ASC
+        FOR UPDATE
+      `,
+      [String(ATTENDANCE_IMPORT_RETENTION_DAYS)],
+    );
+    const importIds = result.rows.map((row) => row.id);
+
+    if (importIds.length) {
+      await deleteAttendanceImportRecords(client, importIds);
+    }
+
+    return importIds.length;
+  });
+}
+
+type AttendanceImpactSnapshot = {
+  absencesByStudent: Map<string, number>;
+  finesByStudent: Map<string, string>;
+};
+
+async function getAttendanceImpactSnapshot(
+  client: PoolClient,
+  studentIds: string[],
+  schoolYearId: string | null,
+): Promise<AttendanceImpactSnapshot> {
+  const normalizedStudentIds = uniqueCleanTextValues(
+    studentIds.map((studentId) => studentId.toLowerCase()),
+  );
+
+  if (!normalizedStudentIds.length) {
+    return {
+      absencesByStudent: new Map(),
+      finesByStudent: new Map(),
+    };
+  }
+
+  const absenceResult = await client.query<{
+    student_key: string;
+    total_absences: number;
+  }>(
+    `
+      SELECT
+        LOWER(TRIM(student_id)) AS student_key,
+        MAX(total_absences)::INT AS total_absences
+      FROM attendance_final_results afr
+      WHERE afr.school_year_id IS NOT DISTINCT FROM $1::uuid
+        AND LOWER(TRIM(afr.student_id)) = ANY($2::TEXT[])
+        AND (
+          afr.import_id IS NULL
+          OR EXISTS (
+            SELECT 1
+            FROM attendance_imports ai
+            WHERE ai.id = afr.import_id
+              AND ai.deleted_at IS NULL
+          )
+        )
+      GROUP BY LOWER(TRIM(student_id))
+    `,
+    [schoolYearId, normalizedStudentIds],
+  );
+
+  const fineResult = await client.query<{
+    student_key: string;
+    fine_fingerprint: string;
+  }>(
+    `
+      SELECT
+        LOWER(TRIM(f.student_id)) AS student_key,
+        STRING_AGG(
+          CONCAT_WS(
+            ':',
+            COALESCE(ar.no_of_absences, 0)::TEXT,
+            COALESCE(f.penalty_id::TEXT, ''),
+            COALESCE(f.prescribed_penalty, ''),
+            COALESCE(f.status, '')
+          ),
+          '||'
+          ORDER BY f.id
+        ) AS fine_fingerprint
+      FROM fines f
+      LEFT JOIN attendance_records ar
+        ON ar.id = f.attendance_record_id
+       AND ar.deleted_at IS NULL
+      WHERE f.school_year_id IS NOT DISTINCT FROM $1::uuid
+        AND LOWER(TRIM(f.student_id)) = ANY($2::TEXT[])
+        AND (f.attendance_record_id IS NULL OR ar.id IS NOT NULL)
+      GROUP BY LOWER(TRIM(f.student_id))
+    `,
+    [schoolYearId, normalizedStudentIds],
+  );
+
+  return {
+    absencesByStudent: new Map(
+      absenceResult.rows.map((row) => [
+        row.student_key,
+        Number(row.total_absences ?? 0),
+      ]),
+    ),
+    finesByStudent: new Map(
+      fineResult.rows.map((row) => [row.student_key, row.fine_fingerprint]),
+    ),
+  };
+}
+
+export async function getAttendanceImportDeleteImpact(
+  importId: string,
+): Promise<AttendanceImportDeleteImpact> {
+  return withTransaction(async (client) => {
+    const importRecord = await getAttendanceImportById(client, importId);
+
+    if (!importRecord) {
+      throw createValidationError("Attendance import not found.", 404);
+    }
+
+    const statsResult = await client.query<{
+      record_count: number;
+      distinct_student_count: number;
+    }>(
+      `
+        SELECT
+          COUNT(*)::INT AS record_count,
+          COUNT(DISTINCT LOWER(TRIM(student_id)))::INT AS distinct_student_count
+        FROM attendance_records
+        WHERE import_id = $1
+          AND deleted_at IS NULL
+      `,
+      [importId],
+    );
+    const eventsResult = await client.query<{
+      event_id: string | null;
+      event_name: string | null;
+      record_count: number;
+    }>(
+      `
+        SELECT
+          ar.event_id,
+          COALESCE(ae.name, ai.event_name_snapshot, 'Unattached event') AS event_name,
+          COUNT(*)::INT AS record_count
+        FROM attendance_records ar
+        JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
+        LEFT JOIN attendance_events ae ON ae.id = ar.event_id
+        WHERE ar.import_id = $1
+          AND ar.deleted_at IS NULL
+        GROUP BY ar.event_id, COALESCE(ae.name, ai.event_name_snapshot, 'Unattached event')
+        ORDER BY event_name ASC
+      `,
+      [importId],
+    );
+    const context = await getAttendanceImportVisibilityContext(
+      client,
+      [importId],
+      false,
+    );
+    const importStudentResult = await client.query<{ student_id: string }>(
+      `
+        SELECT DISTINCT student_id
+        FROM attendance_records
+        WHERE import_id = $1
+          AND deleted_at IS NULL
+      `,
+      [importId],
+    );
+    const importStudentIds = uniqueCleanTextValues(
+      importStudentResult.rows.map((row) => row.student_id),
+    );
+    const impactStudentIds = uniqueCleanTextValues([
+      ...context.studentIds,
+      ...importStudentIds,
+    ]);
+
+    await client.query("SAVEPOINT attendance_delete_impact");
+
+    try {
+      await recomputeAttendanceAfterImportVisibilityChange(client, context);
+      const before = await getAttendanceImpactSnapshot(
+        client,
+        impactStudentIds,
+        importRecord.school_year_id,
+      );
+
+      await softDeleteAttendanceImportRecords(
+        client,
+        [importId],
+        undefined,
+        "Delete impact preview",
+      );
+      await recomputeAttendanceAfterImportVisibilityChange(client, context);
+
+      const after = await getAttendanceImpactSnapshot(
+        client,
+        impactStudentIds,
+        importRecord.school_year_id,
+      );
+
+      let studentsGainingAbsence = 0;
+      let finesCreated = 0;
+      let finesChanged = 0;
+
+      for (const studentId of importStudentIds) {
+        const studentKey = studentId.toLowerCase();
+        const beforeAbsences = before.absencesByStudent.get(studentKey) ?? 0;
+        const afterAbsences = after.absencesByStudent.get(studentKey) ?? 0;
+        if (afterAbsences > beforeAbsences) studentsGainingAbsence += 1;
+      }
+
+      for (const studentId of impactStudentIds) {
+        const studentKey = studentId.toLowerCase();
+        const beforeFine = before.finesByStudent.get(studentKey) ?? "";
+        const afterFine = after.finesByStudent.get(studentKey) ?? "";
+        if (!beforeFine && afterFine) {
+          finesCreated += 1;
+        } else if (beforeFine !== afterFine) {
+          finesChanged += 1;
+        }
+      }
+
+      return {
+        importId,
+        fileName: importRecord.file_name,
+        uploadedAt: importRecord.created_at,
+        uploader: {
+          id: importRecord.uploaded_by ?? null,
+          name: importRecord.uploader_name ?? null,
+          email: importRecord.uploader_email ?? null,
+        },
+        recordCount: Number(statsResult.rows[0]?.record_count ?? 0),
+        distinctStudentCount: Number(
+          statsResult.rows[0]?.distinct_student_count ?? 0,
+        ),
+        affectedEvents: eventsResult.rows.map((row) => ({
+          id: row.event_id,
+          name: row.event_name || "Unattached event",
+          recordCount: Number(row.record_count ?? 0),
+        })),
+        studentsGainingAbsence,
+        finesCreated,
+        finesChanged,
+        finesCreatedOrChanged: finesCreated + finesChanged,
+      };
+    } finally {
+      await client.query("ROLLBACK TO SAVEPOINT attendance_delete_impact");
+      await client.query("RELEASE SAVEPOINT attendance_delete_impact");
+    }
   });
 }
 
@@ -3417,6 +4134,7 @@ export async function listAttendanceEvents(
         SELECT LOWER(TRIM(ar.student_id)) AS normalized_student_id
         FROM attendance_records ar
         WHERE ar.event_id = e.id
+          AND ar.deleted_at IS NULL
         UNION
         SELECT LOWER(TRIM(mar.student_id)) AS normalized_student_id
         FROM manual_attendance_records mar
@@ -3553,6 +4271,7 @@ export async function updateAttendanceEvent(
           event_order = $7,
           updated_at = NOW()
         WHERE id = $1
+          AND deleted_at IS NULL
         RETURNING *
       `,
       [
@@ -3590,16 +4309,31 @@ export async function deleteAttendanceEvent(id: string) {
 
     await client.query(
       `
+        UPDATE attendance_imports ai
+        SET event_name_snapshot = COALESCE(NULLIF(TRIM(ai.event_name_snapshot), ''), ae.name),
+            needs_reattachment = CASE WHEN ai.deleted_at IS NOT NULL THEN TRUE ELSE ai.needs_reattachment END
+        FROM attendance_events ae
+        WHERE ai.event_id = ae.id
+          AND ae.id = $1
+      `,
+      [id],
+    );
+    await client.query(
+      `
         DELETE FROM fines
         WHERE attendance_record_id IN (
-          SELECT id FROM attendance_records WHERE event_id = $1
+          SELECT id
+          FROM attendance_records
+          WHERE event_id = $1
+            AND deleted_at IS NULL
         )
       `,
       [id],
     );
-    await client.query("DELETE FROM attendance_records WHERE event_id = $1", [
-      id,
-    ]);
+    await client.query(
+      "DELETE FROM attendance_records WHERE event_id = $1 AND deleted_at IS NULL",
+      [id],
+    );
     await client.query(
       "UPDATE attendance_imports SET event_id = NULL WHERE event_id = $1",
       [id],
@@ -3624,7 +4358,7 @@ export async function listAttendanceRecords(
   schoolYearId?: string,
   importIds: string[] = [],
 ) {
-  const clauses: string[] = [];
+  const clauses: string[] = ["ar.deleted_at IS NULL"];
   const params: unknown[] = [];
 
   if (studentId) {
@@ -3685,19 +4419,23 @@ export async function listAttendanceImports(
   limit = 50,
   offset = 0,
   schoolYearId?: string,
+  includeDeleted = false,
 ) {
+  const clauses = [
+    ...(includeDeleted ? [] : ["ai.deleted_at IS NULL"]),
+    ...(schoolYearId ? ["ai.school_year_id = $3"] : []),
+  ];
   const result = await query<AttendanceImportRecord>(
     `
       SELECT
-        ai.*,
-        ae.name AS event_name,
-        ae.event_order,
-        ae.event_start_at,
-        ae.event_end_at
+        ${ATTENDANCE_IMPORT_SELECT}
       FROM attendance_imports ai
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id
-      ${schoolYearId ? "WHERE ai.school_year_id = $3" : ""}
+      LEFT JOIN users uploader ON uploader.id = ai.uploaded_by
+      LEFT JOIN users deleter ON deleter.id = ai.deleted_by
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY
+        ai.deleted_at DESC NULLS LAST,
         ae.event_order ASC NULLS LAST,
         COALESCE(ae.event_start_at, ae.event_end_at, ai.created_at) ASC,
         ai.created_at ASC
@@ -3706,21 +4444,20 @@ export async function listAttendanceImports(
     schoolYearId ? [limit, offset, schoolYearId] : [limit, offset],
   );
 
-  return result.rows;
+  return result.rows.map(withAttendanceImportRetention);
 }
 
 export async function getAttendanceImport(importId: string) {
   const importResult = await query<AttendanceImportRecord>(
     `
       SELECT
-        ai.*,
-        ae.name AS event_name,
-        ae.event_order,
-        ae.event_start_at,
-        ae.event_end_at
+        ${ATTENDANCE_IMPORT_SELECT}
       FROM attendance_imports ai
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+      LEFT JOIN users uploader ON uploader.id = ai.uploaded_by
+      LEFT JOIN users deleter ON deleter.id = ai.deleted_by
       WHERE ai.id = $1
+        AND ai.deleted_at IS NULL
       LIMIT 1
     `,
     [importId],
@@ -3735,6 +4472,7 @@ export async function getAttendanceImport(importId: string) {
       LEFT JOIN attendance_events ae ON ae.id = ar.event_id
       LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
       WHERE ar.import_id = $1
+        AND ar.deleted_at IS NULL
       ORDER BY
         ae.event_order ASC NULLS LAST,
         COALESCE(ae.event_start_at, ae.event_end_at, ar.scanned_at, ar.created_at) ASC,
@@ -3745,7 +4483,7 @@ export async function getAttendanceImport(importId: string) {
   );
 
   return {
-    import: importResult.rows[0],
+    import: withAttendanceImportRetention(importResult.rows[0]),
     records: recordsResult.rows,
   };
 }
@@ -3892,7 +4630,8 @@ async function refreshCalculationResultsWithClient(
         FROM attendance_records ar
         LEFT JOIN attendance_events ae ON ae.id = ar.event_id
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
-        WHERE (
+        WHERE ar.deleted_at IS NULL
+          AND (
             (
               $5::BOOLEAN
               AND ar.import_id IS NOT NULL
@@ -4253,7 +4992,14 @@ export async function refreshCalculationResults(
 export async function listCalculationResults(
   options: CalculationResultsFilter = {},
 ) {
-  const clauses: string[] = [];
+  const clauses: string[] = [
+    `NOT EXISTS (
+      SELECT 1
+      FROM attendance_imports hidden_import
+      WHERE hidden_import.id = ANY(cr.import_ids)
+        AND hidden_import.deleted_at IS NOT NULL
+    )`,
+  ];
   const params: unknown[] = [];
 
   if (options.schoolYearId) {
@@ -4303,6 +5049,7 @@ export async function listCalculationResults(
         FROM attendance_imports ai
         LEFT JOIN attendance_events ae ON ae.id = ai.event_id
         WHERE ai.id = ANY(cr.import_ids)
+          AND ai.deleted_at IS NULL
       ) event_scope ON TRUE
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY
@@ -4445,7 +5192,8 @@ async function refreshAttendanceFinalResultsWithClient(
         FROM attendance_records ar
         LEFT JOIN attendance_events ae ON ae.id = ar.event_id
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
-        WHERE ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+        WHERE ar.deleted_at IS NULL
+          AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
       ), imported_totals AS (
         SELECT
           school_year_id,
@@ -4767,7 +5515,7 @@ export async function refreshAttendanceFinalResults(
 export async function listAttendanceFinalResults(
   options: AttendanceFinalResultsFilter = {},
 ) {
-  const clauses: string[] = [];
+  const clauses: string[] = ["(afr.import_id IS NULL OR ai.id IS NOT NULL)"];
   const params: unknown[] = [];
 
   if (options.schoolYearId) {
@@ -4810,7 +5558,7 @@ export async function listAttendanceFinalResults(
         ae.event_start_at,
         ae.event_end_at
       FROM attendance_final_results afr
-      LEFT JOIN attendance_imports ai ON ai.id = afr.import_id
+      LEFT JOIN attendance_imports ai ON ai.id = afr.import_id AND ai.deleted_at IS NULL
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY
@@ -4903,9 +5651,10 @@ export async function deleteAttendanceFinalResultsByIds(
           ae.event_start_at,
           ae.event_end_at
         FROM attendance_final_results afr
-        LEFT JOIN attendance_imports ai ON ai.id = afr.import_id
+        LEFT JOIN attendance_imports ai ON ai.id = afr.import_id AND ai.deleted_at IS NULL
         LEFT JOIN attendance_events ae ON ae.id = ai.event_id
         WHERE afr.id = ANY($1::uuid[])
+          AND (afr.import_id IS NULL OR ai.id IS NOT NULL)
         ORDER BY afr.created_at DESC
       `,
       [uniqueIds],

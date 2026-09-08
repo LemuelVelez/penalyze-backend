@@ -463,6 +463,7 @@ export async function transferSchoolYearRecords(
             SET school_year_id = $2,
                 updated_at = NOW()
             WHERE id = ANY($1::uuid[])
+              AND deleted_at IS NULL
           `,
           [eventIds, targetSchoolYear.id],
         )
@@ -473,8 +474,11 @@ export async function transferSchoolYearRecords(
           `
             UPDATE attendance_imports
             SET school_year_id = $3
-            WHERE ($1::uuid[] <> '{}'::uuid[] AND id = ANY($1::uuid[]))
-               OR ($2::uuid[] <> '{}'::uuid[] AND event_id = ANY($2::uuid[]))
+            WHERE deleted_at IS NULL
+              AND (
+                ($1::uuid[] <> '{}'::uuid[] AND id = ANY($1::uuid[]))
+                OR ($2::uuid[] <> '{}'::uuid[] AND event_id = ANY($2::uuid[]))
+              )
           `,
           [importIds, eventIds, targetSchoolYear.id],
         )
@@ -484,9 +488,12 @@ export async function transferSchoolYearRecords(
       `
         SELECT id
         FROM attendance_records
-        WHERE ($1::uuid[] <> '{}'::uuid[] AND id = ANY($1::uuid[]))
-           OR ($2::uuid[] <> '{}'::uuid[] AND event_id = ANY($2::uuid[]))
-           OR ($3::uuid[] <> '{}'::uuid[] AND import_id = ANY($3::uuid[]))
+        WHERE deleted_at IS NULL
+          AND (
+            ($1::uuid[] <> '{}'::uuid[] AND id = ANY($1::uuid[]))
+            OR ($2::uuid[] <> '{}'::uuid[] AND event_id = ANY($2::uuid[]))
+            OR ($3::uuid[] <> '{}'::uuid[] AND import_id = ANY($3::uuid[]))
+          )
       `,
       [attendanceRecordIds, eventIds, importIds],
     );
@@ -588,6 +595,7 @@ export async function assignCurrentRecordsToSchoolYear(
         UPDATE attendance_imports
         SET school_year_id = $1
         WHERE school_year_id IS NULL
+          AND deleted_at IS NULL
       `,
       [schoolYear.id],
     );
@@ -598,6 +606,7 @@ export async function assignCurrentRecordsToSchoolYear(
         SET school_year_id = $1,
             updated_at = NOW()
         WHERE school_year_id IS NULL
+          AND deleted_at IS NULL
       `,
       [schoolYear.id],
     );

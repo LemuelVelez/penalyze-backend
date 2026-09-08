@@ -89,6 +89,18 @@ export type AttendanceImportRecord = {
   rows_valid: number;
   rows_invalid: number;
   status: ImportStatus;
+  uploaded_by: string | null;
+  deleted_at: Date | string | null;
+  deleted_by: string | null;
+  delete_reason: string | null;
+  event_name_snapshot: string | null;
+  needs_reattachment: boolean;
+  deleted_by_name?: string | null;
+  deleted_by_email?: string | null;
+  uploader_name?: string | null;
+  uploader_email?: string | null;
+  purge_after?: Date | string | null;
+  days_remaining?: number | null;
   created_at: Date;
 };
 
@@ -110,6 +122,9 @@ export type AttendanceRecord = {
   no_of_absences: number;
   remarks: string | null;
   scanned_at: Date | string | null;
+  deleted_at: Date | string | null;
+  deleted_by: string | null;
+  delete_reason: string | null;
   created_at: Date;
   updated_at: Date;
 };

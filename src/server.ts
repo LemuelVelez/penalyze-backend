@@ -32,16 +32,19 @@ import {
   events as attendanceEvents,
   finalResults as attendanceFinalResults,
   imports as attendanceImports,
+  importDeleteImpact as attendanceImportDeleteImpact,
   index as attendanceIndex,
   manualRecords as attendanceManualRecords,
   manualSave,
   previewImport,
+  purgeImport as purgeAttendanceImport,
   refreshCalculationResultRows as refreshAttendanceCalculationResults,
   refreshFinalResults as refreshAttendanceFinalResults,
   saveEvent as saveAttendanceEvent,
   saveImport,
   saveImportWithProgress,
   showImport,
+  restoreImport as restoreAttendanceImport,
   updateEvent as updateAttendanceEvent,
   updateRecord as updateAttendanceRecord,
   updateRecordsBulk as updateAttendanceRecordsBulk,
@@ -75,6 +78,7 @@ import {
   update as updateSchoolYear,
 } from "./controller/school-years.controller";
 import { query } from "./lib/db";
+import { purgeExpiredAttendanceImports } from "./services/attendance.service";
 
 const app = express();
 const attendanceBatchUpload = attendanceUpload.fields([
@@ -221,10 +225,34 @@ app.get("/api/attendance/manual-records", attendanceManualRecords);
 app.delete("/api/attendance/manual-records", deleteAttendanceManualRecords);
 app.delete("/api/attendance/manual-records/:id", deleteAttendanceManualRecord);
 app.get("/api/attendance", attendanceIndex);
-app.get("/api/attendance/imports", attendanceImports);
-app.delete("/api/attendance/imports", deleteAttendanceImports);
-app.get("/api/attendance/imports/:importId", showImport);
-app.delete("/api/attendance/imports/:importId", deleteAttendanceImport);
+app.get("/api/attendance/imports", requireAuth, attendanceImports);
+app.delete(
+  "/api/attendance/imports",
+  requireAuth,
+  deleteAttendanceImports,
+);
+app.get(
+  "/api/attendance/imports/:importId/delete-impact",
+  requireAuth,
+  attendanceImportDeleteImpact,
+);
+app.post(
+  "/api/attendance/imports/:importId/restore",
+  requireAuth,
+  restoreAttendanceImport,
+);
+app.delete(
+  "/api/attendance/imports/:importId/purge",
+  requireAuth,
+  requireAdmin,
+  purgeAttendanceImport,
+);
+app.get("/api/attendance/imports/:importId", requireAuth, showImport);
+app.delete(
+  "/api/attendance/imports/:importId",
+  requireAuth,
+  deleteAttendanceImport,
+);
 app.post("/api/attendance/manual", manualSave);
 app.post(
   "/api/attendance/import/preview",
@@ -233,11 +261,13 @@ app.post(
 );
 app.post(
   "/api/attendance/import/save/progress",
+  requireAuth,
   attendanceBatchUpload,
   saveImportWithProgress,
 );
 app.post(
   "/api/attendance/import/save",
+  requireAuth,
   attendanceBatchUpload,
   saveImport,
 );
@@ -268,6 +298,31 @@ app.get("/api/fines/penalties/match/:noOfAbsences", matchPenalty);
 app.put("/api/fines/penalties/:id", updatePenalty);
 app.patch("/api/fines/penalties/:id", updatePenalty);
 app.delete("/api/fines/penalties/:id", deletePenalty);
+
+const configuredAttendanceRetentionSweepMs = Number(
+  process.env.ATTENDANCE_IMPORT_RETENTION_SWEEP_MS ?? 6 * 60 * 60 * 1000,
+);
+const ATTENDANCE_RETENTION_SWEEP_MS =
+  Number.isFinite(configuredAttendanceRetentionSweepMs) &&
+  configuredAttendanceRetentionSweepMs > 0
+    ? Math.max(60_000, configuredAttendanceRetentionSweepMs)
+    : 6 * 60 * 60 * 1000;
+
+if (process.env.ATTENDANCE_IMPORT_RETENTION_ENABLED !== "false") {
+  const runAttendanceRetentionSweep = () => {
+    void purgeExpiredAttendanceImports().catch((error) => {
+      console.error("Attendance import retention purge failed:", error);
+    });
+  };
+
+  const initialSweep = setTimeout(runAttendanceRetentionSweep, 10_000);
+  initialSweep.unref();
+  const retentionInterval = setInterval(
+    runAttendanceRetentionSweep,
+    ATTENDANCE_RETENTION_SWEEP_MS,
+  );
+  retentionInterval.unref();
+}
 
 app.use((_req: Request, res: Response) => {
   res.status(404).json({ message: "Route not found." });
