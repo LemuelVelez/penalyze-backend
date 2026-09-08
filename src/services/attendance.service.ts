@@ -284,9 +284,7 @@ function ensureSupportedFile(fileName: string) {
   const extension = getFileExtension(fileName);
 
   if (!ACCEPTED_ATTENDANCE_EXTENSIONS.includes(extension as any)) {
-    throw new Error(
-      `Unsupported file type. Accepted files: ${ACCEPTED_ATTENDANCE_EXTENSIONS.join(", ")}`,
-    );
+    throw new Error("Unsupported file. Please upload an .xlsx file.");
   }
 
   return extension;
@@ -302,126 +300,12 @@ function loadRequiredModule<T = any>(packageName: string): T {
   }
 }
 
-function parseDelimitedLine(line: string, delimiter: string) {
-  const cells: string[] = [];
-  let current = "";
-  let quoted = false;
-
-  for (let index = 0; index < line.length; index += 1) {
-    const char = line[index];
-    const next = line[index + 1];
-
-    if (char === '"' && quoted && next === '"') {
-      current += '"';
-      index += 1;
-      continue;
-    }
-
-    if (char === '"') {
-      quoted = !quoted;
-      continue;
-    }
-
-    if (char === delimiter && !quoted) {
-      cells.push(current.trim());
-      current = "";
-      continue;
-    }
-
-    current += char;
-  }
-
-  cells.push(current.trim());
-  return cells;
-}
-
-function scoreDelimiter(line: string, delimiter: string) {
-  return parseDelimitedLine(line, delimiter).length;
-}
-
-function detectDelimiter(line: string) {
-  const delimiters = [",", "\t", ";", "|"];
-  return delimiters
-    .map((delimiter) => ({ delimiter, score: scoreDelimiter(line, delimiter) }))
-    .sort((a, b) => b.score - a.score)[0].delimiter;
-}
-
 function hasAttendanceStudentHeaders(headers: string[]) {
   return (
     headers.some((header) =>
       HEADER_ALIASES.studentId.includes(header as any),
     ) && headers.some((header) => HEADER_ALIASES.name.includes(header as any))
   );
-}
-
-function parseNamedDelimitedRows(lines: string[]) {
-  const rows: RawImportRow[] = [];
-
-  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-    const delimiter = detectDelimiter(lines[lineIndex]);
-    const headerCells = parseDelimitedLine(lines[lineIndex], delimiter);
-    const normalizedHeaders = headerCells.map(normalizeHeader);
-
-    if (!hasAttendanceStudentHeaders(normalizedHeaders)) continue;
-
-    for (let rowIndex = lineIndex + 1; rowIndex < lines.length; rowIndex += 1) {
-      const rowDelimiter = detectDelimiter(lines[rowIndex]);
-      const rowHeaders = parseDelimitedLine(lines[rowIndex], rowDelimiter).map(
-        normalizeHeader,
-      );
-
-      if (hasAttendanceStudentHeaders(rowHeaders)) {
-        lineIndex = rowIndex - 1;
-        break;
-      }
-
-      const cells = parseDelimitedLine(lines[rowIndex], delimiter);
-      const hasValue = cells.some((cell) => cleanText(cell));
-
-      if (!hasValue) continue;
-
-      rows.push(
-        headerCells.reduce<RawImportRow>((row, header, index) => {
-          row[header] = cells[index] ?? "";
-          return row;
-        }, {}),
-      );
-    }
-  }
-
-  return rows;
-}
-
-function textToRows(text: string) {
-  const normalizedText = text
-    .replace(/\u00A0|\u202F/g, " ")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
-  const lines = normalizedText
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (!lines.length) return [];
-
-  const namedRows = parseNamedDelimitedRows(lines);
-  if (namedRows.length) return namedRows;
-
-  const delimiter = detectDelimiter(lines[0]);
-
-  return lines.map((line) => {
-    const cells = parseDelimitedLine(line, delimiter);
-    return {
-      studentId: cells[0] ?? "",
-      name: cells[1] ?? "",
-      yearLevel: cells[2] ?? "",
-      college: cells[3] ?? "",
-      program: cells[4] ?? "",
-      institution: cells[5] ?? "",
-      noOfAbsences: cells[6] ?? "",
-      remarks: cells.slice(7).join(" "),
-    };
-  });
 }
 
 function getByAliases(row: RawImportRow, aliases: readonly string[]) {
@@ -677,37 +561,9 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
     .flatMap((sheet: { rows: RawImportRow[] }) => sheet.rows);
 }
 
-async function parseDocxFile(file: UploadedAttendanceFile) {
-  const mammoth = loadRequiredModule<any>("mammoth");
-  const result = await mammoth.extractRawText({ buffer: file.buffer });
-  return textToRows(result.value ?? "");
-}
-
-function parseLegacyDocFallback(file: UploadedAttendanceFile) {
-  const text = file.buffer
-    .toString("utf8")
-    .replace(/[\x00-\x08\x0E-\x1F]+/g, " ")
-    .replace(/\s{2,}/g, " ");
-
-  return textToRows(text);
-}
-
 async function parseFileToRawRows(file: UploadedAttendanceFile) {
-  const extension = ensureSupportedFile(file.originalname);
-
-  if (
-    extension === ".xlsx" ||
-    extension === ".xls" ||
-    extension === ".xlsm" ||
-    extension === ".xlsb" ||
-    extension === ".xltx" ||
-    extension === ".xltm" ||
-    extension === ".ods"
-  ) {
-    return parseExcelFile(file);
-  }
-
-  return textToRows(file.buffer.toString("utf8"));
+  ensureSupportedFile(file.originalname);
+  return parseExcelFile(file);
 }
 
 function getParsedAttendanceRowTime(row: ParsedAttendanceRow) {

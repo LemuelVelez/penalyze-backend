@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
+import multer from "multer";
 
 import {
   deleteUser,
@@ -268,7 +269,11 @@ app.use((_req: Request, res: Response) => {
 });
 
 app.use((error: any, _req: Request, res: Response, _next: NextFunction) => {
-  const status = Number(error?.statusCode ?? error?.status ?? 500);
+  const status = Number(
+    error instanceof multer.MulterError
+      ? 400
+      : (error?.statusCode ?? error?.status ?? 500),
+  );
   const safeStatus = status >= 400 && status < 600 ? status : 500;
   const message = error?.message || "Internal server error.";
 

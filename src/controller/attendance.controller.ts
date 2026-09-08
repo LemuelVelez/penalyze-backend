@@ -40,21 +40,6 @@ import {
 const MAX_FILE_SIZE = Number(
   process.env.ATTENDANCE_UPLOAD_MAX_BYTES ?? 10 * 1024 * 1024,
 );
-const ALLOWED_MIME_TYPES = new Set(
-  [
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.ms-excel",
-    "application/vnd.ms-excel.sheet.macroEnabled.12",
-    "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
-    "application/vnd.ms-excel.template.macroEnabled.12",
-    "application/vnd.oasis.opendocument.spreadsheet",
-    "text/plain",
-    "text/csv",
-    "application/csv",
-    "application/octet-stream",
-  ].map((type) => type.toLowerCase()),
-);
 
 function getUploadFileExtension(fileName: string) {
   const extension = String(fileName ?? "")
@@ -66,18 +51,10 @@ function getUploadFileExtension(fileName: string) {
 }
 
 function isSupportedAttendanceUpload(
-  file: Pick<UploadedAttendanceFile, "originalname" | "mimetype">,
+  file: Pick<UploadedAttendanceFile, "originalname">,
 ) {
   const extension = getUploadFileExtension(file.originalname);
-  const mimeType = String(file.mimetype ?? "")
-    .trim()
-    .toLowerCase();
-
-  if (!ACCEPTED_ATTENDANCE_EXTENSIONS.includes(extension as any)) {
-    return false;
-  }
-
-  return !mimeType || ALLOWED_MIME_TYPES.has(mimeType);
+  return ACCEPTED_ATTENDANCE_EXTENSIONS.includes(extension as any);
 }
 
 export const attendanceUpload = multer({
@@ -92,7 +69,11 @@ export const attendanceUpload = multer({
       return;
     }
 
-    callback(new Error("Unsupported file. Please upload Excel, CSV, or TXT."));
+    const error = new Error("Unsupported file. Please upload an .xlsx file.") as Error & {
+      statusCode?: number;
+    };
+    error.statusCode = 400;
+    callback(error);
   },
 });
 

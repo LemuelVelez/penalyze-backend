@@ -318,13 +318,5 @@ export type SavedAttendanceImportResult = AttendancePreviewResult & {
 
 export const ACCEPTED_ATTENDANCE_EXTENSIONS = [
   ".xlsx",
-  ".xls",
-  ".xlsm",
-  ".xlsb",
-  ".xltx",
-  ".xltm",
-  ".ods",
-  ".csv",
-  ".txt",
 ] as const;
 export const REQUIRED_ATTENDANCE_FIELDS = ["studentId", "name"] as const;
