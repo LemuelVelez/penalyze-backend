@@ -1615,38 +1615,23 @@ async function insertFineIfNeeded(
   return syncFineForAttendanceRecord(client, record);
 }
 
-type AttendanceRecordWithAbsenceScope = AttendanceRecord & {
-  attendance_college_scope_key: string | null;
+type AttendanceRecordWithEventRosterScope = AttendanceRecord & {
+  attendance_event_roster_college_key: string | null;
   attendance_school_year_id: string | null;
 };
 
-function getAttendanceRecordScopeColumnSql(
-  recordAlias: string,
-  columnName: string,
-) {
+function getAttendanceRecordEventRosterCollegeSql(recordAlias: string) {
   return `
     LOWER(TRIM(COALESCE(
       (
-        SELECT NULLIF(TRIM(scope_student.${columnName}), '')
+        SELECT NULLIF(TRIM(scope_student.college), '')
         FROM students scope_student
         WHERE LOWER(TRIM(scope_student.student_id)) = LOWER(TRIM(${recordAlias}.student_id))
         LIMIT 1
       ),
-      NULLIF(TRIM(${recordAlias}.${columnName}), ''),
+      NULLIF(TRIM(${recordAlias}.college), ''),
       ''
     )))
-  `;
-}
-
-function getAttendanceRecordCollegeScopeSql(recordAlias: string) {
-  return `
-    CONCAT_WS(
-      '|',
-      ${getAttendanceRecordScopeColumnSql(recordAlias, "institution")},
-      ${getAttendanceRecordScopeColumnSql(recordAlias, "college")},
-      ${getAttendanceRecordScopeColumnSql(recordAlias, "program")},
-      ${getAttendanceRecordScopeColumnSql(recordAlias, "year_level")}
-    )
   `;
 }
 
@@ -1657,8 +1642,8 @@ function getAttendanceRecordSortTime(record: AttendanceRecord) {
   return Number.isNaN(time) ? 0 : time;
 }
 
-const ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL =
-  getAttendanceRecordCollegeScopeSql("ar");
+const ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL =
+  getAttendanceRecordEventRosterCollegeSql("ar");
 const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
   event_participation AS (
     SELECT DISTINCT
@@ -1668,6 +1653,16 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
     FROM attendance_records ar
     WHERE ar.event_id IS NOT NULL
       AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
+  )
+`;
+const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
+  event_roster_scope AS (
+    SELECT DISTINCT
+      ar.school_year_id,
+      ar.event_id,
+      ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
+    FROM attendance_records ar
+    WHERE ar.event_id IS NOT NULL
   )
 `;
 const ATTENDANCE_ABSENCE_SYNC_LOCK_SQL =
@@ -1693,14 +1688,16 @@ function uniqueFineRecords(fines: Array<FineRecord | null>) {
   return Array.from(finesById.values());
 }
 
-function uniqueTextValues(values: string[]) {
-  return Array.from(new Set(values.filter(Boolean)));
-}
-
 function uniqueCleanTextValues(values: Array<string | null | undefined>) {
   return Array.from(
     new Set(values.map((value) => cleanText(value)).filter(Boolean)),
   );
+}
+
+function uniqueAttendanceEventRosterCollegeKeys(
+  values: Array<string | null | undefined>,
+) {
+  return Array.from(new Set(values.map((value) => cleanText(value))));
 }
 
 function filterAttendanceFinesByRecordIds(
@@ -1721,7 +1718,7 @@ async function lockAttendanceAbsenceSync(client: PoolClient) {
   await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
 }
 
-async function getAttendanceRecordCollegeScopeKeys(
+async function getAttendanceRecordEventRosterCollegeKeys(
   client: PoolClient,
   recordIds: string[],
 ) {
@@ -1731,7 +1728,7 @@ async function getAttendanceRecordCollegeScopeKeys(
   const result = await client.query<{ college_key: string }>(
     `
       SELECT DISTINCT
-        ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key
+        ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
       FROM attendance_records ar
       WHERE ar.id = ANY($1::uuid[])
         AND ar.event_id IS NOT NULL
@@ -1739,10 +1736,12 @@ async function getAttendanceRecordCollegeScopeKeys(
     [uniqueRecordIds],
   );
 
-  return uniqueCleanTextValues(result.rows.map((row) => row.college_key));
+  return uniqueAttendanceEventRosterCollegeKeys(
+    result.rows.map((row) => row.college_key),
+  );
 }
 
-async function getAttendanceImportCollegeScopeKeys(
+async function getAttendanceImportEventRosterCollegeKeys(
   client: PoolClient,
   importIds: string[],
 ) {
@@ -1752,7 +1751,7 @@ async function getAttendanceImportCollegeScopeKeys(
   const result = await client.query<{ college_key: string }>(
     `
       SELECT DISTINCT
-        ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key
+        ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
       FROM attendance_records ar
       WHERE ar.import_id = ANY($1::uuid[])
         AND ar.event_id IS NOT NULL
@@ -1760,10 +1759,12 @@ async function getAttendanceImportCollegeScopeKeys(
     [uniqueImportIds],
   );
 
-  return uniqueCleanTextValues(result.rows.map((row) => row.college_key));
+  return uniqueAttendanceEventRosterCollegeKeys(
+    result.rows.map((row) => row.college_key),
+  );
 }
 
-async function getAttendanceEventCollegeScopeKeys(
+async function getAttendanceEventRosterCollegeKeys(
   client: PoolClient,
   eventIds: string[],
 ) {
@@ -1773,44 +1774,48 @@ async function getAttendanceEventCollegeScopeKeys(
   const result = await client.query<{ college_key: string }>(
     `
       SELECT DISTINCT
-        ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key
+        ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
       FROM attendance_records ar
       WHERE ar.event_id = ANY($1::uuid[])
     `,
     [uniqueEventIds],
   );
 
-  return uniqueCleanTextValues(result.rows.map((row) => row.college_key));
+  return uniqueAttendanceEventRosterCollegeKeys(
+    result.rows.map((row) => row.college_key),
+  );
 }
 
-async function getAttendanceStudentIdsByCollegeScopeKeys(
+async function getAttendanceStudentIdsByEventRosterCollegeKeys(
   client: PoolClient,
-  collegeKeys: string[],
+  eventRosterCollegeKeys: string[],
 ) {
-  const uniqueCollegeKeys = uniqueCleanTextValues(collegeKeys);
-  if (!uniqueCollegeKeys.length) return [];
+  const uniqueEventRosterCollegeKeys =
+    uniqueAttendanceEventRosterCollegeKeys(eventRosterCollegeKeys);
+  if (!uniqueEventRosterCollegeKeys.length) return [];
 
   const result = await client.query<{ student_id: string }>(
     `
       SELECT DISTINCT ar.student_id
       FROM attendance_records ar
       WHERE ar.event_id IS NOT NULL
-        AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = ANY($1::TEXT[])
+        AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} = ANY($1::TEXT[])
     `,
-    [uniqueCollegeKeys],
+    [uniqueEventRosterCollegeKeys],
   );
 
   return uniqueCleanTextValues(result.rows.map((row) => row.student_id));
 }
 
-async function syncAbsencesForAttendanceCollegeScopes(
+async function syncAbsencesForAttendanceEventRosterColleges(
   client: PoolClient,
-  collegeKeys: string[],
+  eventRosterCollegeKeys: string[],
 ) {
-  const uniqueCollegeKeys = uniqueCleanTextValues(collegeKeys);
-  const studentIds = await getAttendanceStudentIdsByCollegeScopeKeys(
+  const uniqueEventRosterCollegeKeys =
+    uniqueAttendanceEventRosterCollegeKeys(eventRosterCollegeKeys);
+  const studentIds = await getAttendanceStudentIdsByEventRosterCollegeKeys(
     client,
-    uniqueCollegeKeys,
+    uniqueEventRosterCollegeKeys,
   );
 
   return syncAbsencesForStudents(client, studentIds);
@@ -1820,12 +1825,15 @@ export async function syncAbsencesForAttendanceRecordIds(
   client: PoolClient,
   recordIds: string[],
 ) {
-  const collegeKeys = await getAttendanceRecordCollegeScopeKeys(
+  const eventRosterCollegeKeys = await getAttendanceRecordEventRosterCollegeKeys(
     client,
     recordIds,
   );
 
-  return syncAbsencesForAttendanceCollegeScopes(client, collegeKeys);
+  return syncAbsencesForAttendanceEventRosterColleges(
+    client,
+    eventRosterCollegeKeys,
+  );
 }
 
 async function syncAbsencesForStudents(
@@ -1846,22 +1854,15 @@ async function syncAbsencesForStudents(
 
   await lockAttendanceAbsenceSync(client);
 
-  const updatedResult = await client.query<AttendanceRecordWithAbsenceScope>(
+  const updatedResult = await client.query<AttendanceRecordWithEventRosterScope>(
     `
       WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
-      college_event_scope AS (
-        SELECT DISTINCT
-          ar.event_id,
-          ar.school_year_id,
-          ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key
-        FROM attendance_records ar
-        WHERE ar.event_id IS NOT NULL
-      ),
+      ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
       student_scope AS (
         SELECT DISTINCT
           LOWER(TRIM(ar.student_id)) AS student_key,
           ar.school_year_id,
-          ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} AS college_key
+          ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
         FROM attendance_records ar
         WHERE ar.event_id IS NOT NULL
           AND LOWER(TRIM(ar.student_id)) = ANY($1::TEXT[])
@@ -1872,17 +1873,17 @@ async function syncAbsencesForStudents(
           ss.college_key,
           ss.school_year_id,
           GREATEST(
-            COUNT(DISTINCT ces.event_id)::INT -
+            COUNT(DISTINCT roster.event_id)::INT -
               COUNT(DISTINCT attended.event_id)::INT,
             0
           ) AS no_of_absences
         FROM student_scope ss
-        LEFT JOIN college_event_scope ces
-          ON ces.college_key = ss.college_key
-         AND ces.school_year_id IS NOT DISTINCT FROM ss.school_year_id
+        LEFT JOIN event_roster_scope roster
+          ON roster.college_key = ss.college_key
+         AND roster.school_year_id IS NOT DISTINCT FROM ss.school_year_id
         LEFT JOIN event_participation attended
           ON attended.normalized_student_id = ss.student_key
-          AND attended.event_id = ces.event_id
+          AND attended.event_id = roster.event_id
           AND attended.school_year_id IS NOT DISTINCT FROM ss.school_year_id
         GROUP BY ss.student_key, ss.college_key, ss.school_year_id
       ),
@@ -1895,7 +1896,7 @@ async function syncAbsencesForStudents(
         FROM attendance_records ar
         JOIN student_absences sa
           ON LOWER(TRIM(ar.student_id)) = sa.student_key
-         AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = sa.college_key
+         AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} = sa.college_key
          AND ar.school_year_id IS NOT DISTINCT FROM sa.school_year_id
         WHERE ar.event_id IS NOT NULL
         ORDER BY ar.id
@@ -1909,7 +1910,7 @@ async function syncAbsencesForStudents(
           END
       FROM target_records target
       WHERE ar.id = target.id
-      RETURNING ar.*, target.college_key AS attendance_college_scope_key, target.school_year_id AS attendance_school_year_id
+      RETURNING ar.*, target.college_key AS attendance_event_roster_college_key, target.school_year_id AS attendance_school_year_id
     `,
     [uniqueStudentIds],
   );
@@ -1938,13 +1939,13 @@ async function syncAbsencesForStudents(
   );
   const recordsByStudentScope = new Map<
     string,
-    AttendanceRecordWithAbsenceScope[]
+    AttendanceRecordWithEventRosterScope[]
   >();
 
   records.forEach((record) => {
     const scopeKey = [
       cleanText(record.student_id).toLowerCase(),
-      cleanText(record.attendance_college_scope_key),
+      cleanText(record.attendance_event_roster_college_key),
       cleanText(record.attendance_school_year_id),
     ].join(":");
     const scopeRecords = recordsByStudentScope.get(scopeKey) ?? [];
@@ -1954,7 +1955,7 @@ async function syncAbsencesForStudents(
   });
 
   const recordIdsToRemoveFinesFrom: string[] = [];
-  const recordsToSyncFine: AttendanceRecordWithAbsenceScope[] = [];
+  const recordsToSyncFine: AttendanceRecordWithEventRosterScope[] = [];
 
   recordsByStudentScope.forEach((scopeRecords) => {
     const existingFineRecords = scopeRecords.filter((record) =>
@@ -2873,10 +2874,8 @@ export async function updateAttendanceRecords(
       );
     }
 
-    const existingCollegeScopeKeys = await getAttendanceRecordCollegeScopeKeys(
-      client,
-      uniqueIds,
-    );
+    const existingEventRosterCollegeKeys =
+      await getAttendanceRecordEventRosterCollegeKeys(client, uniqueIds);
     const event = await findOrCreateAttendanceEvent(
       client,
       getManualAttendanceEventInput(input),
@@ -2925,19 +2924,21 @@ export async function updateAttendanceRecords(
     );
     const updatedRecords = updatedResult.rows;
     const updatedRecordIds = updatedRecords.map((record) => record.id);
-    const updatedCollegeScopeKeys = await getAttendanceRecordCollegeScopeKeys(
-      client,
-      updatedRecordIds,
-    );
-    const attendanceSyncCollegeKeys = uniqueTextValues([
-      ...existingCollegeScopeKeys,
-      ...updatedCollegeScopeKeys,
-    ]);
-
-    if (attendanceSyncCollegeKeys.length) {
-      const attendanceSynced = await syncAbsencesForAttendanceCollegeScopes(
+    const updatedEventRosterCollegeKeys =
+      await getAttendanceRecordEventRosterCollegeKeys(
         client,
-        attendanceSyncCollegeKeys,
+        updatedRecordIds,
+      );
+    const attendanceSyncEventRosterCollegeKeys =
+      uniqueAttendanceEventRosterCollegeKeys([
+        ...existingEventRosterCollegeKeys,
+        ...updatedEventRosterCollegeKeys,
+      ]);
+
+    if (attendanceSyncEventRosterCollegeKeys.length) {
+      const attendanceSynced = await syncAbsencesForAttendanceEventRosterColleges(
+        client,
+        attendanceSyncEventRosterCollegeKeys,
       );
       const directUpdatedFines = await Promise.all(
         updatedRecords
@@ -3101,8 +3102,10 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
       return updateManualAttendanceRecord(client, id, input);
     }
 
-    const existingCollegeScopeKeys = existingRecord.event_id
-      ? await getAttendanceRecordCollegeScopeKeys(client, [existingRecord.id])
+    const existingEventRosterCollegeKeys = existingRecord.event_id
+      ? await getAttendanceRecordEventRosterCollegeKeys(client, [
+          existingRecord.id,
+        ])
       : [];
     const event = await findOrCreateAttendanceEvent(
       client,
@@ -3154,18 +3157,19 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
 
     const record = updatedResult.rows[0];
 
-    const updatedCollegeScopeKeys = record.event_id
-      ? await getAttendanceRecordCollegeScopeKeys(client, [record.id])
+    const updatedEventRosterCollegeKeys = record.event_id
+      ? await getAttendanceRecordEventRosterCollegeKeys(client, [record.id])
       : [];
-    const attendanceSyncCollegeKeys = uniqueTextValues([
-      ...existingCollegeScopeKeys,
-      ...updatedCollegeScopeKeys,
-    ]);
+    const attendanceSyncEventRosterCollegeKeys =
+      uniqueAttendanceEventRosterCollegeKeys([
+        ...existingEventRosterCollegeKeys,
+        ...updatedEventRosterCollegeKeys,
+      ]);
 
-    if (attendanceSyncCollegeKeys.length) {
-      const attendanceSynced = await syncAbsencesForAttendanceCollegeScopes(
+    if (attendanceSyncEventRosterCollegeKeys.length) {
+      const attendanceSynced = await syncAbsencesForAttendanceEventRosterColleges(
         client,
-        attendanceSyncCollegeKeys,
+        attendanceSyncEventRosterCollegeKeys,
       );
       const directUpdatedFine = !record.event_id
         ? await syncFineForAttendanceRecord(client, record)
@@ -3206,8 +3210,8 @@ export async function deleteAttendanceRecord(id: string) {
     const record = existingResult.rows[0];
 
     if (record) {
-      const collegeScopeKeys = record.event_id
-        ? await getAttendanceRecordCollegeScopeKeys(client, [record.id])
+      const eventRosterCollegeKeys = record.event_id
+        ? await getAttendanceRecordEventRosterCollegeKeys(client, [record.id])
         : [];
 
       await client.query("DELETE FROM fines WHERE attendance_record_id = $1", [
@@ -3216,7 +3220,10 @@ export async function deleteAttendanceRecord(id: string) {
       await client.query("DELETE FROM attendance_records WHERE id = $1", [id]);
 
       if (record.event_id) {
-        await syncAbsencesForAttendanceCollegeScopes(client, collegeScopeKeys);
+        await syncAbsencesForAttendanceEventRosterColleges(
+          client,
+          eventRosterCollegeKeys,
+        );
       }
 
       return record;
@@ -3262,12 +3269,14 @@ export async function deleteAttendanceImport(importId: string) {
       throw createValidationError("Attendance import not found.", 404);
     }
 
-    const collegeScopeKeys = await getAttendanceImportCollegeScopeKeys(client, [
-      importId,
-    ]);
+    const eventRosterCollegeKeys =
+      await getAttendanceImportEventRosterCollegeKeys(client, [importId]);
 
     await deleteAttendanceImportRecords(client, [importId]);
-    await syncAbsencesForAttendanceCollegeScopes(client, collegeScopeKeys);
+    await syncAbsencesForAttendanceEventRosterColleges(
+      client,
+      eventRosterCollegeKeys,
+    );
 
     return importRecord;
   });
@@ -3312,13 +3321,14 @@ export async function deleteAttendanceImportsByIds(
       };
     }
 
-    const collegeScopeKeys = await getAttendanceImportCollegeScopeKeys(
-      client,
-      idsToDelete,
-    );
+    const eventRosterCollegeKeys =
+      await getAttendanceImportEventRosterCollegeKeys(client, idsToDelete);
 
     await deleteAttendanceImportRecords(client, idsToDelete);
-    await syncAbsencesForAttendanceCollegeScopes(client, collegeScopeKeys);
+    await syncAbsencesForAttendanceEventRosterColleges(
+      client,
+      eventRosterCollegeKeys,
+    );
 
     return {
       deletedCount: deletedImports.length,
@@ -3358,13 +3368,14 @@ export async function deleteAttendanceImports(
       };
     }
 
-    const collegeScopeKeys = await getAttendanceImportCollegeScopeKeys(
-      client,
-      importIds,
-    );
+    const eventRosterCollegeKeys =
+      await getAttendanceImportEventRosterCollegeKeys(client, importIds);
 
     await deleteAttendanceImportRecords(client, importIds);
-    await syncAbsencesForAttendanceCollegeScopes(client, collegeScopeKeys);
+    await syncAbsencesForAttendanceEventRosterColleges(
+      client,
+      eventRosterCollegeKeys,
+    );
 
     return {
       deletedCount: deletedImports.length,
@@ -3556,9 +3567,8 @@ export async function deleteAttendanceEvent(id: string) {
     if (!existing)
       throw createValidationError("Attendance event not found.", 404);
 
-    const collegeScopeKeys = await getAttendanceEventCollegeScopeKeys(client, [
-      id,
-    ]);
+    const eventRosterCollegeKeys =
+      await getAttendanceEventRosterCollegeKeys(client, [id]);
 
     await client.query(
       `
@@ -3578,7 +3588,10 @@ export async function deleteAttendanceEvent(id: string) {
     );
     await client.query("DELETE FROM attendance_events WHERE id = $1", [id]);
     await resequenceAttendanceEvents(client, existing.school_year_id);
-    await syncAbsencesForAttendanceCollegeScopes(client, collegeScopeKeys);
+    await syncAbsencesForAttendanceEventRosterColleges(
+      client,
+      eventRosterCollegeKeys,
+    );
 
     return existing;
   });
@@ -3840,6 +3853,7 @@ async function refreshCalculationResultsWithClient(
   const result = await client.query<CalculationResultRecord>(
     `
       WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
+      ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
       imported_records AS (
         SELECT
           ar.school_year_id,
@@ -3953,6 +3967,15 @@ async function refreshCalculationResultsWithClient(
           event_key
         FROM imported_records
         WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
+      ), imported_event_roster_scope AS (
+        SELECT DISTINCT
+          roster.school_year_id,
+          roster.event_id,
+          roster.college_key
+        FROM event_roster_scope roster
+        JOIN imported_event_scope scope
+          ON scope.school_year_id IS NOT DISTINCT FROM roster.school_year_id
+          AND scope.event_key = roster.event_id::TEXT
       ), imported_event_participation AS (
         SELECT
           ep.school_year_id,
@@ -3982,16 +4005,50 @@ async function refreshCalculationResultsWithClient(
           COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS attended_events
         FROM event_attendance
         GROUP BY school_year_id, normalized_student_id
-      ), expected_event_totals AS (
-        SELECT
-          school_year_id,
-          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS expected_events
-        FROM event_attendance
-        GROUP BY school_year_id
       ), student_keys AS (
         SELECT school_year_id, normalized_student_id FROM imported_totals
         UNION
         SELECT school_year_id, normalized_student_id FROM manual_totals
+      ), student_event_scope AS (
+        SELECT
+          keys.school_year_id,
+          keys.normalized_student_id,
+          LOWER(TRIM(COALESCE(
+            NULLIF(imported.college, ''),
+            NULLIF(manual.college, ''),
+            ''
+          ))) AS college_key
+        FROM student_keys keys
+        LEFT JOIN imported_totals imported
+          ON imported.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+          AND imported.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN manual_totals manual
+          ON manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+          AND manual.normalized_student_id = keys.normalized_student_id
+      ), expected_event_totals AS (
+        SELECT
+          student.school_year_id,
+          student.normalized_student_id,
+          COUNT(DISTINCT roster.event_id)::INT AS expected_events
+        FROM student_event_scope student
+        LEFT JOIN imported_event_roster_scope roster
+          ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
+          AND roster.college_key = student.college_key
+        GROUP BY student.school_year_id, student.normalized_student_id
+      ), expected_attended_event_totals AS (
+        SELECT
+          student.school_year_id,
+          student.normalized_student_id,
+          COUNT(DISTINCT attended.event_key)::INT AS attended_expected_events
+        FROM student_event_scope student
+        LEFT JOIN imported_event_roster_scope roster
+          ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
+          AND roster.college_key = student.college_key
+        LEFT JOIN event_attendance attended
+          ON attended.school_year_id IS NOT DISTINCT FROM student.school_year_id
+          AND attended.normalized_student_id = student.normalized_student_id
+          AND attended.event_key = roster.event_id::TEXT
+        GROUP BY student.school_year_id, student.normalized_student_id
       ), merged AS (
         SELECT
           keys.school_year_id,
@@ -4008,8 +4065,7 @@ async function refreshCalculationResultsWithClient(
             COALESCE(imported.imported_absences, 0),
             GREATEST(
               COALESCE(expected.expected_events, 0) -
-                COALESCE(attended.attended_events, 0) -
-                COALESCE(manual.manual_absences, 0),
+                COALESCE(expected_attended.attended_expected_events, 0),
               0
             )
           )::INT AS imported_absences,
@@ -4019,8 +4075,7 @@ async function refreshCalculationResultsWithClient(
               COALESCE(imported.imported_absences, 0),
               GREATEST(
                 COALESCE(expected.expected_events, 0) -
-                  COALESCE(attended.attended_events, 0) -
-                  COALESCE(manual.manual_absences, 0),
+                  COALESCE(expected_attended.attended_expected_events, 0),
                 0
               )
             ) + COALESCE(manual.manual_absences, 0)
@@ -4049,6 +4104,10 @@ async function refreshCalculationResultsWithClient(
           AND attended.normalized_student_id = keys.normalized_student_id
         LEFT JOIN expected_event_totals expected
           ON expected.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+          AND expected.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN expected_attended_event_totals expected_attended
+          ON expected_attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+          AND expected_attended.normalized_student_id = keys.normalized_student_id
       ), matched AS (
         SELECT
           merged.*,
@@ -4348,6 +4407,7 @@ async function refreshAttendanceFinalResultsWithClient(
   const result = await client.query<AttendanceFinalResultRecord>(
     `
       WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
+      ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
       imported_records AS (
         SELECT
           ar.school_year_id,
@@ -4460,16 +4520,50 @@ async function refreshAttendanceFinalResultsWithClient(
           COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS attended_events
         FROM event_attendance
         GROUP BY school_year_id, normalized_student_id
-      ), expected_event_totals AS (
-        SELECT
-          school_year_id,
-          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS expected_events
-        FROM event_attendance
-        GROUP BY school_year_id
       ), student_keys AS (
         SELECT school_year_id, normalized_student_id FROM imported_totals
         UNION
         SELECT school_year_id, normalized_student_id FROM manual_totals
+      ), student_event_scope AS (
+        SELECT
+          keys.school_year_id,
+          keys.normalized_student_id,
+          LOWER(TRIM(COALESCE(
+            NULLIF(imported.college, ''),
+            NULLIF(manual.college, ''),
+            ''
+          ))) AS college_key
+        FROM student_keys keys
+        LEFT JOIN imported_totals imported
+          ON imported.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+          AND imported.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN manual_totals manual
+          ON manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+          AND manual.normalized_student_id = keys.normalized_student_id
+      ), expected_event_totals AS (
+        SELECT
+          student.school_year_id,
+          student.normalized_student_id,
+          COUNT(DISTINCT roster.event_id)::INT AS expected_events
+        FROM student_event_scope student
+        LEFT JOIN event_roster_scope roster
+          ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
+          AND roster.college_key = student.college_key
+        GROUP BY student.school_year_id, student.normalized_student_id
+      ), expected_attended_event_totals AS (
+        SELECT
+          student.school_year_id,
+          student.normalized_student_id,
+          COUNT(DISTINCT attended.event_key)::INT AS attended_expected_events
+        FROM student_event_scope student
+        LEFT JOIN event_roster_scope roster
+          ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
+          AND roster.college_key = student.college_key
+        LEFT JOIN event_attendance attended
+          ON attended.school_year_id IS NOT DISTINCT FROM student.school_year_id
+          AND attended.normalized_student_id = student.normalized_student_id
+          AND attended.event_key = roster.event_id::TEXT
+        GROUP BY student.school_year_id, student.normalized_student_id
       ), merged AS (
         SELECT
           keys.school_year_id,
@@ -4485,8 +4579,7 @@ async function refreshAttendanceFinalResultsWithClient(
               COALESCE(imported.imported_absences, 0),
               GREATEST(
                 COALESCE(expected.expected_events, 0) -
-                  COALESCE(attended.attended_events, 0) -
-                  COALESCE(manual.manual_absences, 0),
+                  COALESCE(expected_attended.attended_expected_events, 0),
                 0
               )
             ) + COALESCE(manual.manual_absences, 0)
@@ -4511,6 +4604,10 @@ async function refreshAttendanceFinalResultsWithClient(
           AND attended.normalized_student_id = keys.normalized_student_id
         LEFT JOIN expected_event_totals expected
           ON expected.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+          AND expected.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN expected_attended_event_totals expected_attended
+          ON expected_attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+          AND expected_attended.normalized_student_id = keys.normalized_student_id
       )
       INSERT INTO attendance_final_results (
         school_year_id,
