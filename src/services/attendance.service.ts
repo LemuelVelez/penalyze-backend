@@ -278,6 +278,15 @@ function cleanOptionalText(value: unknown) {
   return text || null;
 }
 
+function normalizeAttendanceEventName(value: unknown) {
+  return cleanText(value)
+    .replace(/\s*\([^()]*\)\s*$/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 const ATTENDANCE_RECORD_SELECT = `
   ar.id,
   ar.school_year_id,
@@ -1303,6 +1312,7 @@ async function findMatchingAttendanceEventFromFile(props: {
   schoolYearId?: string;
 }) {
   const eventName = cleanText(props.metadata.eventName);
+  const normalizedEventName = normalizeAttendanceEventName(eventName);
   const eventStartAtKey = getAttendanceEventDateTimeKey(
     props.metadata.eventStartAt,
   );
@@ -1321,11 +1331,6 @@ async function findMatchingAttendanceEventFromFile(props: {
     conditions.push(`e.school_year_id = $${values.length}`);
   }
 
-  if (eventName) {
-    values.push(eventName);
-    conditions.push(`LOWER(TRIM(e.name)) = LOWER(TRIM($${values.length}))`);
-  }
-
   const result = await query<AttendanceEventRecord>(
     `
       SELECT e.*, 0::INT AS attendees_count
@@ -1339,7 +1344,16 @@ async function findMatchingAttendanceEventFromFile(props: {
 
   if (!result.rows.length) return null;
 
-  const dateMatchedEvents = result.rows.filter((event) => {
+  const nameMatchedEvents = eventName
+    ? result.rows.filter(
+        (event) =>
+          normalizeAttendanceEventName(event.name) === normalizedEventName,
+      )
+    : result.rows;
+
+  if (!nameMatchedEvents.length) return null;
+
+  const dateMatchedEvents = nameMatchedEvents.filter((event) => {
     const startMatches =
       !eventStartAtKey ||
       getAttendanceEventDateTimeKey(event.event_start_at) === eventStartAtKey;
@@ -1350,8 +1364,8 @@ async function findMatchingAttendanceEventFromFile(props: {
   });
 
   if (dateMatchedEvents.length) return dateMatchedEvents[0];
-  if (eventName) return result.rows[0];
-  return result.rows.length === 1 ? result.rows[0] : null;
+  if (eventName) return nameMatchedEvents[0];
+  return nameMatchedEvents.length === 1 ? nameMatchedEvents[0] : null;
 }
 
 async function findOrCreateAttendanceEvent(
@@ -1375,6 +1389,7 @@ async function findOrCreateAttendanceEvent(
     eventInput.schoolYearId,
     [eventInput.eventStartAt, eventInput.eventEndAt],
   );
+  const normalizedEventName = normalizeAttendanceEventName(name);
 
   const existingResult = await client.query<AttendanceEventRecord>(
     `
@@ -1383,16 +1398,19 @@ async function findOrCreateAttendanceEvent(
         COUNT(DISTINCT ar.student_id)::INT AS attendees_count
       FROM attendance_events e
       LEFT JOIN attendance_records ar ON ar.event_id = e.id
-      WHERE LOWER(TRIM(e.name)) = LOWER(TRIM($1))
-        AND e.school_year_id = $2
+      WHERE e.school_year_id = $1
       GROUP BY e.id
       ORDER BY e.created_at DESC
-      LIMIT 1
     `,
-    [name, schoolYearId],
+    [schoolYearId],
   );
 
-  if (existingResult.rows[0]) return existingResult.rows[0];
+  const existingEvent = existingResult.rows.find(
+    (event) =>
+      normalizeAttendanceEventName(event.name) === normalizedEventName,
+  );
+
+  if (existingEvent) return existingEvent;
 
   const createdResult = await client.query<AttendanceEventRecord>(
     `
