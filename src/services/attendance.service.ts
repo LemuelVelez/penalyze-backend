@@ -3733,6 +3733,24 @@ function normalizeImportIds(value: unknown) {
   ).sort((left, right) => left.localeCompare(right));
 }
 
+const ATTENDANCE_EVENT_KEY_SQL = (
+  recordAlias: "ar" | "mar",
+  eventAlias = "ae",
+) => `COALESCE(
+  ${recordAlias}.event_id::TEXT,
+  NULLIF(
+    LOWER(
+      REGEXP_REPLACE(
+        TRIM(${eventAlias}.name),
+        '[[:space:]]+',
+        ' ',
+        'g'
+      )
+    ),
+    ''
+  )
+)`;
+
 const CALCULATION_SOURCE_TYPE_ORDER: CalculationSourceType[] = [
   "imported",
   "manual",
@@ -3824,7 +3842,7 @@ async function refreshCalculationResultsWithClient(
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
           CASE
             WHEN LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($4::TEXT) THEN NULL
-            ELSE COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), ar.id::TEXT)
+            ELSE ${ATTENDANCE_EVENT_KEY_SQL("ar")}
           END AS event_key,
           GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
@@ -3880,7 +3898,7 @@ async function refreshCalculationResultsWithClient(
               mar.attendance_type = 'zero_attendance'
               OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT)
             ) THEN NULL
-            ELSE COALESCE(mar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), mar.id::TEXT)
+            ELSE ${ATTENDANCE_EVENT_KEY_SQL("mar")}
           END AS event_key,
           GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
@@ -4316,7 +4334,7 @@ async function refreshAttendanceFinalResultsWithClient(
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
           CASE
             WHEN LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($2::TEXT) THEN NULL
-            ELSE COALESCE(ar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), ar.import_id::TEXT, ar.id::TEXT)
+            ELSE ${ATTENDANCE_EVENT_KEY_SQL("ar")}
           END AS event_key,
           GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
@@ -4357,7 +4375,7 @@ async function refreshAttendanceFinalResultsWithClient(
               mar.attendance_type = 'zero_attendance'
               OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($2::TEXT)
             ) THEN NULL
-            ELSE COALESCE(mar.event_id::TEXT, NULLIF(TRIM(ae.name), ''), mar.id::TEXT)
+            ELSE ${ATTENDANCE_EVENT_KEY_SQL("mar")}
           END AS event_key,
           GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
