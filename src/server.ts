@@ -77,6 +77,11 @@ import {
 import { query } from "./lib/db";
 
 const app = express();
+const attendanceBatchUpload = attendanceUpload.fields([
+  { name: "files", maxCount: 20 },
+  { name: "file", maxCount: 20 },
+]);
+
 const PORT = Number(process.env.PORT ?? 3000);
 const DEFAULT_FRONTEND_ORIGINS = [
   "http://localhost:5173",
@@ -223,17 +228,17 @@ app.delete("/api/attendance/imports/:importId", deleteAttendanceImport);
 app.post("/api/attendance/manual", manualSave);
 app.post(
   "/api/attendance/import/preview",
-  attendanceUpload.single("file"),
+  attendanceBatchUpload,
   previewImport,
 );
 app.post(
   "/api/attendance/import/save/progress",
-  attendanceUpload.single("file"),
+  attendanceBatchUpload,
   saveImportWithProgress,
 );
 app.post(
   "/api/attendance/import/save",
-  attendanceUpload.single("file"),
+  attendanceBatchUpload,
   saveImport,
 );
 app.put("/api/attendance/bulk", updateAttendanceRecordsBulk);
