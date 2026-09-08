@@ -1659,8 +1659,17 @@ function getAttendanceRecordSortTime(record: AttendanceRecord) {
 
 const ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL =
   getAttendanceRecordCollegeScopeSql("ar");
-const ATTENDANCE_ATTENDED_RECORD_COLLEGE_SCOPE_SQL =
-  getAttendanceRecordCollegeScopeSql("attended");
+const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
+  event_participation AS (
+    SELECT DISTINCT
+      ar.school_year_id,
+      ar.event_id,
+      LOWER(TRIM(ar.student_id)) AS normalized_student_id
+    FROM attendance_records ar
+    WHERE ar.event_id IS NOT NULL
+      AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
+  )
+`;
 const ATTENDANCE_ABSENCE_SYNC_LOCK_SQL =
   "SELECT pg_advisory_xact_lock(hashtext('penalyze.attendance_absence_sync')::bigint)";
 
@@ -1839,7 +1848,8 @@ async function syncAbsencesForStudents(
 
   const updatedResult = await client.query<AttendanceRecordWithAbsenceScope>(
     `
-      WITH college_event_scope AS (
+      WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
+      college_event_scope AS (
         SELECT DISTINCT
           ar.event_id,
           ar.school_year_id,
@@ -1870,11 +1880,10 @@ async function syncAbsencesForStudents(
         LEFT JOIN college_event_scope ces
           ON ces.college_key = ss.college_key
          AND ces.school_year_id IS NOT DISTINCT FROM ss.school_year_id
-        LEFT JOIN attendance_records attended
-          ON LOWER(TRIM(attended.student_id)) = ss.student_key
+        LEFT JOIN event_participation attended
+          ON attended.normalized_student_id = ss.student_key
           AND attended.event_id = ces.event_id
           AND attended.school_year_id IS NOT DISTINCT FROM ss.school_year_id
-          AND ${ATTENDANCE_ATTENDED_RECORD_COLLEGE_SCOPE_SQL} = ss.college_key
         GROUP BY ss.student_key, ss.college_key, ss.school_year_id
       ),
       target_records AS (
@@ -3830,7 +3839,8 @@ async function refreshCalculationResultsWithClient(
 
   const result = await client.query<CalculationResultRecord>(
     `
-      WITH imported_records AS (
+      WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
+      imported_records AS (
         SELECT
           ar.school_year_id,
           ar.import_id,
@@ -3937,13 +3947,27 @@ async function refreshCalculationResultsWithClient(
           MAX(updated_at) AS source_updated_at
         FROM manual_records
         GROUP BY school_year_id, normalized_student_id
-      ), event_attendance AS (
-        SELECT
+      ), imported_event_scope AS (
+        SELECT DISTINCT
           school_year_id,
-          LOWER(TRIM(student_id)) AS normalized_student_id,
           event_key
         FROM imported_records
         WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
+      ), imported_event_participation AS (
+        SELECT
+          ep.school_year_id,
+          ep.normalized_student_id,
+          ep.event_id::TEXT AS event_key
+        FROM event_participation ep
+        JOIN imported_event_scope scope
+          ON scope.school_year_id IS NOT DISTINCT FROM ep.school_year_id
+          AND scope.event_key = ep.event_id::TEXT
+      ), event_attendance AS (
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          event_key
+        FROM imported_event_participation
         UNION
         SELECT
           school_year_id,
@@ -4323,7 +4347,8 @@ async function refreshAttendanceFinalResultsWithClient(
 
   const result = await client.query<AttendanceFinalResultRecord>(
     `
-      WITH imported_records AS (
+      WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
+      imported_records AS (
         SELECT
           ar.school_year_id,
           ar.student_id,
@@ -4400,13 +4425,27 @@ async function refreshAttendanceFinalResultsWithClient(
           MAX(updated_at) AS source_updated_at
         FROM manual_records
         GROUP BY school_year_id, normalized_student_id
-      ), event_attendance AS (
-        SELECT
+      ), imported_event_scope AS (
+        SELECT DISTINCT
           school_year_id,
-          LOWER(TRIM(student_id)) AS normalized_student_id,
           event_key
         FROM imported_records
         WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
+      ), imported_event_participation AS (
+        SELECT
+          ep.school_year_id,
+          ep.normalized_student_id,
+          ep.event_id::TEXT AS event_key
+        FROM event_participation ep
+        JOIN imported_event_scope scope
+          ON scope.school_year_id IS NOT DISTINCT FROM ep.school_year_id
+          AND scope.event_key = ep.event_id::TEXT
+      ), event_attendance AS (
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          event_key
+        FROM imported_event_participation
         UNION
         SELECT
           school_year_id,
