@@ -3,6 +3,7 @@ import { PoolClient } from "pg";
 
 import {
   ACCEPTED_ATTENDANCE_EXTENSIONS,
+  AttendanceDetectedEventMetadata,
   AttendanceEventRecord,
   AttendanceFinalResultRecord,
   AttendanceImportProgress,
@@ -213,6 +214,47 @@ const HEADER_ALIASES = {
   remarks: ["remarks", "remark", "notes", "note", "comment", "comments"],
 } as const;
 
+type AttendanceMetadataKey = keyof AttendanceDetectedEventMetadata;
+
+const ATTENDANCE_METADATA_ALIASES: Record<
+  AttendanceMetadataKey,
+  readonly string[]
+> = {
+  eventName: ["event", "event name", "activity", "activity name"],
+  eventStartAt: [
+    "start",
+    "start date/time",
+    "start datetime",
+    "start date time",
+    "event start",
+    "event start at",
+    "event start date",
+    "event start date time",
+    "start date",
+    "date start",
+  ],
+  eventEndAt: [
+    "end",
+    "end date/time",
+    "end datetime",
+    "end date time",
+    "event end",
+    "event end at",
+    "event end date",
+    "event end date time",
+    "end date",
+    "date end",
+  ],
+  schoolYearLabel: [
+    "s.y.",
+    "s.y",
+    "sy",
+    "school year",
+    "schoolyear",
+    "academic year",
+  ],
+};
+
 function normalizeHeader(value: unknown) {
   return String(value ?? "")
     .replace(/^\uFEFF/, "")
@@ -274,6 +316,154 @@ function parseExcelSerialDate(value: string) {
   const date = new Date(milliseconds);
 
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function createEmptyDetectedAttendanceEvent(): AttendanceDetectedEventMetadata {
+  return {
+    eventName: null,
+    eventStartAt: null,
+    eventEndAt: null,
+    schoolYearLabel: null,
+  };
+}
+
+function getAttendanceMetadataKey(value: unknown): AttendanceMetadataKey | "" {
+  const normalizedValue = normalizeHeader(value).replace(/[.:]+$/, "");
+
+  for (const [key, aliases] of Object.entries(
+    ATTENDANCE_METADATA_ALIASES,
+  ) as [AttendanceMetadataKey, readonly string[]][]) {
+    if (
+      aliases.some(
+        (alias) => normalizeHeader(alias).replace(/[.:]+$/, "") === normalizedValue,
+      )
+    ) {
+      return key;
+    }
+  }
+
+  return "";
+}
+
+function setDetectedAttendanceEventValue(
+  metadata: AttendanceDetectedEventMetadata,
+  key: AttendanceMetadataKey,
+  value: unknown,
+) {
+  if (metadata[key] || !cleanText(value)) return;
+
+  if (key === "eventStartAt" || key === "eventEndAt") {
+    const normalized = normalizeOptionalTimestamp(
+      value,
+      key === "eventStartAt" ? "Event start at" : "Event end at",
+    );
+
+    if (!normalized.error && normalized.value) {
+      metadata[key] = normalized.value;
+    }
+    return;
+  }
+
+  metadata[key] = cleanText(value);
+}
+
+function mergeDetectedAttendanceEvents(
+  primary: AttendanceDetectedEventMetadata,
+  fallback: AttendanceDetectedEventMetadata,
+): AttendanceDetectedEventMetadata {
+  return {
+    eventName: primary.eventName || fallback.eventName,
+    eventStartAt: primary.eventStartAt || fallback.eventStartAt,
+    eventEndAt: primary.eventEndAt || fallback.eventEndAt,
+    schoolYearLabel: primary.schoolYearLabel || fallback.schoolYearLabel,
+  };
+}
+
+function getDetectedAttendanceEventFromRows(
+  rows: ParsedAttendanceRow[],
+): AttendanceDetectedEventMetadata {
+  const metadata = createEmptyDetectedAttendanceEvent();
+  const metadataRow =
+    rows.find(
+      (row) =>
+        row.errors.length === 0 &&
+        (row.eventName || row.eventStartAt || row.eventEndAt),
+    ) ?? rows.find((row) => row.eventName || row.eventStartAt || row.eventEndAt);
+
+  if (!metadataRow) return metadata;
+
+  metadata.eventName = cleanOptionalText(metadataRow.eventName);
+  metadata.eventStartAt = cleanOptionalText(metadataRow.eventStartAt);
+  metadata.eventEndAt = cleanOptionalText(metadataRow.eventEndAt);
+  return metadata;
+}
+
+function findAttendanceStudentHeaderRowIndex(rows: unknown[][]) {
+  return rows.findIndex((row) => {
+    const headers = row.map(normalizeHeader).filter(Boolean);
+    return hasAttendanceStudentHeaders(headers);
+  });
+}
+
+function detectAttendanceWorksheetMetadata(
+  rows: unknown[][],
+  studentHeaderRowIndex: number,
+) {
+  const metadata = createEmptyDetectedAttendanceEvent();
+  const metadataRowCount =
+    studentHeaderRowIndex >= 0
+      ? studentHeaderRowIndex
+      : Math.min(rows.length, 80);
+
+  for (let rowIndex = 0; rowIndex < metadataRowCount; rowIndex += 1) {
+    const row = rows[rowIndex] ?? [];
+    const nextRow = rows[rowIndex + 1] ?? [];
+    const rowKeys = row.map(getAttendanceMetadataKey);
+
+    row.forEach((cell, cellIndex) => {
+      const cellText = cleanText(cell);
+      const keyValueMatch = cellText.match(/^([^:=]+?)\s*[:=]\s*(.+)$/);
+
+      if (keyValueMatch) {
+        const inlineKey = getAttendanceMetadataKey(keyValueMatch[1]);
+        if (inlineKey) {
+          setDetectedAttendanceEventValue(
+            metadata,
+            inlineKey,
+            keyValueMatch[2],
+          );
+          return;
+        }
+      }
+
+      const key = rowKeys[cellIndex];
+      if (!key) return;
+
+      const adjacentValue = row[cellIndex + 1];
+      if (
+        cleanText(adjacentValue) &&
+        !getAttendanceMetadataKey(adjacentValue)
+      ) {
+        setDetectedAttendanceEventValue(metadata, key, adjacentValue);
+      }
+    });
+
+    rowKeys.forEach((key, cellIndex) => {
+      if (!key) return;
+
+      const valueBelow = nextRow[cellIndex];
+      if (cleanText(valueBelow) && !getAttendanceMetadataKey(valueBelow)) {
+        setDetectedAttendanceEventValue(metadata, key, valueBelow);
+      }
+    });
+  }
+
+  return metadata;
+}
+
+function getFileNameWithoutExtension(fileName: string) {
+  const extension = path.extname(fileName || "");
+  return path.basename(fileName || "", extension).trim();
 }
 
 function getFileExtension(fileName: string) {
@@ -447,10 +637,13 @@ function buildPreview(
   fileName: string,
   fileType: string,
   rawRows: RawImportRow[] | ParsedAttendanceRow[],
+  detectedEvent: AttendanceDetectedEventMetadata =
+    createEmptyDetectedAttendanceEvent(),
 ): AttendancePreviewResult {
   const rows = normalizeImportRows(rawRows);
   const rowsValid = rows.filter((row) => row.errors.length === 0).length;
   const rowsInvalid = rows.length - rowsValid;
+  const rowDetectedEvent = getDetectedAttendanceEventFromRows(rows);
 
   return {
     fileName,
@@ -459,6 +652,10 @@ function buildPreview(
     rowsValid,
     rowsInvalid,
     rows,
+    detectedEvent: mergeDetectedAttendanceEvents(
+      detectedEvent,
+      rowDetectedEvent,
+    ),
   };
 }
 
@@ -516,15 +713,31 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
   const workbook = XLSX.read(file.buffer, { type: "buffer", cellDates: false });
   const sheetNames = workbook.SheetNames ?? [];
 
-  if (!sheetNames.length) return [];
+  if (!sheetNames.length) {
+    return {
+      rawRows: [] as RawImportRow[],
+      detectedEvent: createEmptyDetectedAttendanceEvent(),
+    };
+  }
 
   const parsedSheets = sheetNames
     .map((sheetName: string) => {
       const worksheet = workbook.Sheets[sheetName];
+      const worksheetRows = XLSX.utils.sheet_to_json(worksheet, {
+        header: 1,
+        defval: "",
+        raw: true,
+        blankrows: false,
+      }) as unknown[][];
+      const studentHeaderRowIndex =
+        findAttendanceStudentHeaderRowIndex(worksheetRows);
       const rows = XLSX.utils.sheet_to_json(worksheet, {
         defval: "",
         raw: false,
         blankrows: false,
+        ...(studentHeaderRowIndex >= 0
+          ? { range: studentHeaderRowIndex }
+          : {}),
       }) as RawImportRow[];
 
       return {
@@ -532,6 +745,10 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
         priority: getAttendanceSheetPriority(sheetName),
         score: scoreAttendanceSheetRows(sheetName, rows),
         rows,
+        detectedEvent: detectAttendanceWorksheetMetadata(
+          worksheetRows,
+          studentHeaderRowIndex,
+        ),
       };
     })
     .filter(
@@ -548,17 +765,48 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
   if (!parsedSheets.length) {
     const firstSheetName = sheetNames[0];
     const worksheet = workbook.Sheets[firstSheetName];
-    return XLSX.utils.sheet_to_json(worksheet, {
+    const worksheetRows = XLSX.utils.sheet_to_json(worksheet, {
+      header: 1,
       defval: "",
-      raw: false,
+      raw: true,
       blankrows: false,
-    }) as RawImportRow[];
+    }) as unknown[][];
+    const studentHeaderRowIndex =
+      findAttendanceStudentHeaderRowIndex(worksheetRows);
+
+    return {
+      rawRows: XLSX.utils.sheet_to_json(worksheet, {
+        defval: "",
+        raw: false,
+        blankrows: false,
+        ...(studentHeaderRowIndex >= 0
+          ? { range: studentHeaderRowIndex }
+          : {}),
+      }) as RawImportRow[],
+      detectedEvent: detectAttendanceWorksheetMetadata(
+        worksheetRows,
+        studentHeaderRowIndex,
+      ),
+    };
   }
 
   const bestPriority = parsedSheets[0].priority;
-  return parsedSheets
-    .filter((sheet: { priority: number }) => sheet.priority === bestPriority)
-    .flatMap((sheet: { rows: RawImportRow[] }) => sheet.rows);
+  const selectedSheets = parsedSheets.filter(
+    (sheet: { priority: number }) => sheet.priority === bestPriority,
+  );
+
+  return {
+    rawRows: selectedSheets.flatMap(
+      (sheet: { rows: RawImportRow[] }) => sheet.rows,
+    ),
+    detectedEvent: selectedSheets.reduce(
+      (
+        metadata: AttendanceDetectedEventMetadata,
+        sheet: { detectedEvent: AttendanceDetectedEventMetadata },
+      ) => mergeDetectedAttendanceEvents(metadata, sheet.detectedEvent),
+      createEmptyDetectedAttendanceEvent(),
+    ),
+  };
 }
 
 async function parseFileToRawRows(file: UploadedAttendanceFile) {
@@ -820,6 +1068,68 @@ async function resolveSchoolYearId(
   return (await ensureSchoolYearForDate(client, dateValues)).id;
 }
 
+function normalizeAttendanceMetadataIdentity(value: unknown) {
+  return cleanText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getSchoolYearMetadataLabels(schoolYear: SchoolYearRecord) {
+  const semesterLabel =
+    schoolYear.semester === "second_semester"
+      ? "Second Semester"
+      : "First Semester";
+
+  return [
+    schoolYear.id,
+    schoolYear.name,
+    `${schoolYear.name} / ${semesterLabel}`,
+    `${schoolYear.name} ${semesterLabel}`,
+  ];
+}
+
+async function findSchoolYearIdFromAttendanceMetadata(value: unknown) {
+  const label = cleanText(value);
+  if (!label) return "";
+
+  const result = await query<SchoolYearRecord>(
+    `
+      SELECT *
+      FROM school_years
+      ORDER BY is_active DESC, starts_at DESC, semester ASC
+    `,
+  );
+  const normalizedLabel = normalizeAttendanceMetadataIdentity(label);
+  const exactMatch = result.rows.find((schoolYear) =>
+    getSchoolYearMetadataLabels(schoolYear).some(
+      (candidate) =>
+        normalizeAttendanceMetadataIdentity(candidate) === normalizedLabel,
+    ),
+  );
+
+  if (exactMatch) return exactMatch.id;
+
+  const years = label.match(/\d{4}/g) ?? [];
+  if (!years.length) return "";
+
+  const requestedSemester = normalizedLabel.includes("second")
+    ? "second_semester"
+    : normalizedLabel.includes("first")
+      ? "first_semester"
+      : "";
+  const yearMatches = result.rows.filter((schoolYear) => {
+    const normalizedName = schoolYear.name.toLowerCase();
+    return (
+      years.every((year) => normalizedName.includes(year)) &&
+      (!requestedSemester || schoolYear.semester === requestedSemester)
+    );
+  });
+
+  return yearMatches.length === 1 ? yearMatches[0].id : "";
+}
+
 async function getNextAttendanceEventOrder(
   client: PoolClient,
   schoolYearId: string | null,
@@ -979,6 +1289,69 @@ async function getAttendanceEventById(client: PoolClient, id: string) {
   );
 
   return result.rows[0] ?? null;
+}
+
+function getAttendanceEventDateTimeKey(value: unknown) {
+  const normalized = normalizeOptionalTimestamp(value);
+  return normalized.error || !normalized.value
+    ? ""
+    : normalized.value.slice(0, 16);
+}
+
+async function findMatchingAttendanceEventFromFile(props: {
+  metadata: AttendanceDetectedEventMetadata;
+  schoolYearId?: string;
+}) {
+  const eventName = cleanText(props.metadata.eventName);
+  const eventStartAtKey = getAttendanceEventDateTimeKey(
+    props.metadata.eventStartAt,
+  );
+  const eventEndAtKey = getAttendanceEventDateTimeKey(props.metadata.eventEndAt);
+
+  if (!eventName && !eventStartAtKey && !eventEndAtKey) return null;
+  if (!props.schoolYearId && eventName && !eventStartAtKey && !eventEndAtKey) {
+    return null;
+  }
+
+  const conditions: string[] = [];
+  const values: unknown[] = [];
+
+  if (props.schoolYearId) {
+    values.push(props.schoolYearId);
+    conditions.push(`e.school_year_id = $${values.length}`);
+  }
+
+  if (eventName) {
+    values.push(eventName);
+    conditions.push(`LOWER(TRIM(e.name)) = LOWER(TRIM($${values.length}))`);
+  }
+
+  const result = await query<AttendanceEventRecord>(
+    `
+      SELECT e.*, 0::INT AS attendees_count
+      FROM attendance_events e
+      ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+      ORDER BY e.event_order ASC NULLS LAST, e.created_at DESC
+      LIMIT 500
+    `,
+    values,
+  );
+
+  if (!result.rows.length) return null;
+
+  const dateMatchedEvents = result.rows.filter((event) => {
+    const startMatches =
+      !eventStartAtKey ||
+      getAttendanceEventDateTimeKey(event.event_start_at) === eventStartAtKey;
+    const endMatches =
+      !eventEndAtKey ||
+      getAttendanceEventDateTimeKey(event.event_end_at) === eventEndAtKey;
+    return startMatches && endMatches;
+  });
+
+  if (dateMatchedEvents.length) return dateMatchedEvents[0];
+  if (eventName) return result.rows[0];
+  return result.rows.length === 1 ? result.rows[0] : null;
 }
 
 async function findOrCreateAttendanceEvent(
@@ -1788,16 +2161,25 @@ export async function previewAttendanceFile(
   file: UploadedAttendanceFile,
 ): Promise<AttendancePreviewResult> {
   if (!file?.buffer?.length) {
-    throw new Error("Please upload a valid Excel, CSV, or TXT file.");
+    throw createValidationError("Please upload a valid .xlsx file.");
   }
 
   const extension = getFileExtension(file.originalname);
-  const rawRows = await parseFileToRawRows(file);
-  return buildPreview(
+  const parsedFile = await parseFileToRawRows(file);
+  const preview = buildPreview(
     file.originalname,
     extension.replace(".", "") || file.mimetype || "unknown",
-    rawRows,
+    parsedFile.rawRows,
+    parsedFile.detectedEvent,
   );
+
+  if (!preview.rowsValid) {
+    throw createValidationError(
+      "No parseable attendance rows were found in the uploaded .xlsx file.",
+    );
+  }
+
+  return preview;
 }
 
 export async function saveAttendanceRows(
@@ -1821,6 +2203,25 @@ export async function saveAttendanceRows(
     input.rows,
   );
   const validRows = preview.rows.filter((row) => row.errors.length === 0);
+
+  if (!validRows.length) {
+    throw createValidationError(
+      "No parseable attendance rows were found in the uploaded .xlsx file.",
+    );
+  }
+
+  const fallbackEventName = getFileNameWithoutExtension(input.fileName ?? "");
+  const hasExplicitOrRowEventContext = Boolean(
+    cleanText(input.eventId) ||
+    cleanText(input.eventName) ||
+    cleanText(input.resumeImportId) ||
+    validRows.some((row) => row.eventName),
+  );
+
+  if (!hasExplicitOrRowEventContext && fallbackEventName) {
+    input = { ...input, eventName: fallbackEventName };
+  }
+
   const hasEventContext = Boolean(
     cleanText(input.eventId) ||
     cleanText(input.eventName) ||
@@ -1830,7 +2231,7 @@ export async function saveAttendanceRows(
 
   if (!hasEventContext) {
     throw createValidationError(
-      "Event name is required when saving an uploaded attendance file.",
+      "Unable to determine an event for this attendance import.",
     );
   }
 
@@ -2074,9 +2475,47 @@ export async function saveAttendanceFile(
     totalRows: preview.rows.length,
   });
 
+  const hasRequestedEventContext = Boolean(
+    cleanText(options.eventId) || cleanText(options.eventName),
+  );
+  let resolvedOptions = options;
+
+  if (!hasRequestedEventContext) {
+    const detectedSchoolYearId = cleanText(options.schoolYearId)
+      ? cleanText(options.schoolYearId)
+      : await findSchoolYearIdFromAttendanceMetadata(
+          preview.detectedEvent.schoolYearLabel,
+        );
+    const matchedEvent = await findMatchingAttendanceEventFromFile({
+      metadata: preview.detectedEvent,
+      schoolYearId: detectedSchoolYearId || undefined,
+    });
+    const fallbackEventName = getFileNameWithoutExtension(file.originalname);
+
+    resolvedOptions = {
+      ...options,
+      schoolYearId:
+        detectedSchoolYearId || matchedEvent?.school_year_id || undefined,
+      eventId: matchedEvent?.id || undefined,
+      eventName:
+        preview.detectedEvent.eventName ||
+        matchedEvent?.name ||
+        fallbackEventName ||
+        undefined,
+      eventStartAt:
+        preview.detectedEvent.eventStartAt ||
+        cleanOptionalText(matchedEvent?.event_start_at) ||
+        undefined,
+      eventEndAt:
+        preview.detectedEvent.eventEndAt ||
+        cleanOptionalText(matchedEvent?.event_end_at) ||
+        undefined,
+    };
+  }
+
   return saveAttendanceRows({
-    ...options,
-    onProgress: onProgress ?? options.onProgress,
+    ...resolvedOptions,
+    onProgress: onProgress ?? resolvedOptions.onProgress,
     fileName: preview.fileName,
     fileType: preview.fileType,
     rows: preview.rows,

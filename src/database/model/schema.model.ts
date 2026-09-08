@@ -290,6 +290,13 @@ export type ParsedAttendanceRow = AttendanceImportInput & {
   raw: Record<string, unknown>;
 };
 
+export type AttendanceDetectedEventMetadata = {
+  eventName: string | null;
+  eventStartAt: string | null;
+  eventEndAt: string | null;
+  schoolYearLabel: string | null;
+};
+
 export type AttendancePreviewResult = {
   fileName: string;
   fileType: string;
@@ -297,6 +304,7 @@ export type AttendancePreviewResult = {
   rowsValid: number;
   rowsInvalid: number;
   rows: ParsedAttendanceRow[];
+  detectedEvent: AttendanceDetectedEventMetadata;
 };
 
 export type AttendanceImportProgress = {
