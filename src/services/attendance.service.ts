@@ -5395,15 +5395,6 @@ async function refreshCalculationResultsWithClient(
 
   await client.query(
     `
-      DELETE FROM calculation_results
-      WHERE ($1::uuid IS NULL OR school_year_id = $1::uuid)
-        AND calculation_scope_key = $2::TEXT
-    `,
-    [schoolYearId, calculationScopeKey],
-  );
-
-  const result = await client.query<CalculationResultRecord>(
-    `
       WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
       ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
       imported_records AS (
@@ -5452,7 +5443,7 @@ async function refreshCalculationResultsWithClient(
           MAX(college) AS college,
           MAX(program) AS program,
           MAX(institution) AS institution,
-          ARRAY_AGG(DISTINCT import_id) FILTER (WHERE import_id IS NOT NULL) AS import_ids,
+          ARRAY_AGG(DISTINCT import_id ORDER BY import_id) FILTER (WHERE import_id IS NOT NULL) AS import_ids,
           COUNT(DISTINCT event_key)::INT AS attended_events,
           GREATEST(0, MAX(no_of_absences))::INT AS imported_absences,
           COUNT(*)::INT AS imported_record_count,
@@ -5675,7 +5666,7 @@ async function refreshCalculationResultsWithClient(
           LIMIT 1
         ) penalty ON merged.total_absences > 0
       )
-      INSERT INTO calculation_results (
+      INSERT INTO calculation_results AS existing (
         school_year_id,
         calculation_scope_key,
         import_ids,
@@ -5727,6 +5718,7 @@ async function refreshCalculationResultsWithClient(
       FROM matched
       ON CONFLICT (school_year_id, calculation_scope_key, (LOWER(TRIM(student_id))))
       DO UPDATE SET
+        student_id = EXCLUDED.student_id,
         import_ids = EXCLUDED.import_ids,
         name = EXCLUDED.name,
         year_level = EXCLUDED.year_level,
@@ -5745,6 +5737,43 @@ async function refreshCalculationResultsWithClient(
         source_updated_at = EXCLUDED.source_updated_at,
         calculated_at = NOW(),
         updated_at = NOW()
+      WHERE (
+        existing.student_id,
+        existing.import_ids,
+        existing.name,
+        existing.year_level,
+        existing.college,
+        existing.program,
+        existing.institution,
+        existing.attended_events,
+        existing.imported_absences,
+        existing.manual_absences,
+        existing.total_absences,
+        existing.attendance_status,
+        existing.penalty_id,
+        existing.prescribed_penalty,
+        existing.source_record_count,
+        existing.latest_scanned_at,
+        existing.source_updated_at
+      ) IS DISTINCT FROM (
+        EXCLUDED.student_id,
+        EXCLUDED.import_ids,
+        EXCLUDED.name,
+        EXCLUDED.year_level,
+        EXCLUDED.college,
+        EXCLUDED.program,
+        EXCLUDED.institution,
+        EXCLUDED.attended_events,
+        EXCLUDED.imported_absences,
+        EXCLUDED.manual_absences,
+        EXCLUDED.total_absences,
+        EXCLUDED.attendance_status,
+        EXCLUDED.penalty_id,
+        EXCLUDED.prescribed_penalty,
+        EXCLUDED.source_record_count,
+        EXCLUDED.latest_scanned_at,
+        EXCLUDED.source_updated_at
+      )
       RETURNING *
     `,
     [
@@ -5758,7 +5787,87 @@ async function refreshCalculationResultsWithClient(
     ],
   );
 
-  return result.rows;
+  await client.query(
+    `
+      DELETE FROM calculation_results cr
+      WHERE ($1::uuid IS NULL OR cr.school_year_id = $1::uuid)
+        AND cr.calculation_scope_key = $2::TEXT
+        AND NOT (
+          (
+            $5::BOOLEAN
+            AND EXISTS (
+              SELECT 1
+              FROM attendance_records ar
+              WHERE ar.deleted_at IS NULL
+                AND ar.school_year_id IS NOT DISTINCT FROM cr.school_year_id
+                AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM(cr.student_id))
+                AND ar.import_id IS NOT NULL
+                AND (
+                  CARDINALITY($3::uuid[]) = 0
+                  OR ar.import_id = ANY($3::uuid[])
+                )
+            )
+          )
+          OR (
+            $7::BOOLEAN
+            AND EXISTS (
+              SELECT 1
+              FROM attendance_records ar
+              WHERE ar.deleted_at IS NULL
+                AND ar.school_year_id IS NOT DISTINCT FROM cr.school_year_id
+                AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM(cr.student_id))
+                AND LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($4::TEXT)
+            )
+          )
+          OR (
+            $6::BOOLEAN
+            AND EXISTS (
+              SELECT 1
+              FROM manual_attendance_records mar
+              WHERE mar.school_year_id IS NOT DISTINCT FROM cr.school_year_id
+                AND LOWER(TRIM(mar.student_id)) = LOWER(TRIM(cr.student_id))
+                AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+                AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($4::TEXT)
+            )
+          )
+          OR (
+            $7::BOOLEAN
+            AND EXISTS (
+              SELECT 1
+              FROM manual_attendance_records mar
+              WHERE mar.school_year_id IS NOT DISTINCT FROM cr.school_year_id
+                AND LOWER(TRIM(mar.student_id)) = LOWER(TRIM(cr.student_id))
+                AND (
+                  mar.attendance_type = 'zero_attendance'
+                  OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT)
+                )
+            )
+          )
+        )
+    `,
+    [
+      schoolYearId,
+      calculationScopeKey,
+      importIds,
+      ZERO_ATTENDANCE_REMARK,
+      sourceFlags.includeImported,
+      sourceFlags.includeManual,
+      sourceFlags.includeZeroAttendance,
+    ],
+  );
+
+  const currentResult = await client.query<CalculationResultRecord>(
+    `
+      SELECT *
+      FROM calculation_results cr
+      WHERE ($1::uuid IS NULL OR cr.school_year_id = $1::uuid)
+        AND cr.calculation_scope_key = $2::TEXT
+      ORDER BY LOWER(TRIM(cr.student_id)), cr.created_at
+    `,
+    [schoolYearId, calculationScopeKey],
+  );
+
+  return currentResult.rows;
 }
 
 export async function previewCalculationResults(
@@ -5990,14 +6099,6 @@ async function refreshAttendanceFinalResultsWithClient(
 
   await client.query(
     `
-      DELETE FROM attendance_final_results afr
-      WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
-    `,
-    [schoolYearId],
-  );
-
-  const result = await client.query<AttendanceFinalResultRecord>(
-    `
       WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
       ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
       imported_records AS (
@@ -6201,46 +6302,142 @@ async function refreshAttendanceFinalResultsWithClient(
         LEFT JOIN expected_attended_event_totals expected_attended
           ON expected_attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
           AND expected_attended.normalized_student_id = keys.normalized_student_id
-      )
-      INSERT INTO attendance_final_results (
-        school_year_id,
-        import_id,
-        student_id,
-        name,
-        year_level,
-        college,
-        program,
-        institution,
-        attended_events,
-        total_absences,
-        attendance_status,
-        latest_scanned_at,
-        source_updated_at
+      ), candidates AS (
+        SELECT
+          school_year_id,
+          student_id,
+          name,
+          NULLIF(year_level, '') AS year_level,
+          NULLIF(college, '') AS college,
+          NULLIF(program, '') AS program,
+          NULLIF(institution, '') AS institution,
+          attended_events,
+          total_absences,
+          CASE
+            WHEN total_absences <= 0 THEN 'perfect_attendance'
+            ELSE 'with_absences'
+          END AS attendance_status,
+          NULLIF(latest_scanned_at, '-infinity'::timestamptz) AS latest_scanned_at,
+          NULLIF(source_updated_at, '-infinity'::timestamptz) AS source_updated_at
+        FROM merged
+      ), updated AS (
+        UPDATE attendance_final_results AS existing
+        SET
+          student_id = candidate.student_id,
+          name = candidate.name,
+          year_level = candidate.year_level,
+          college = candidate.college,
+          program = candidate.program,
+          institution = candidate.institution,
+          attended_events = candidate.attended_events,
+          total_absences = candidate.total_absences,
+          attendance_status = candidate.attendance_status,
+          latest_scanned_at = candidate.latest_scanned_at,
+          source_updated_at = candidate.source_updated_at,
+          updated_at = NOW()
+        FROM candidates candidate
+        WHERE existing.import_id IS NULL
+          AND existing.school_year_id IS NOT DISTINCT FROM candidate.school_year_id
+          AND LOWER(TRIM(existing.student_id)) = LOWER(TRIM(candidate.student_id))
+          AND (
+            existing.student_id,
+            existing.name,
+            existing.year_level,
+            existing.college,
+            existing.program,
+            existing.institution,
+            existing.attended_events,
+            existing.total_absences,
+            existing.attendance_status,
+            existing.latest_scanned_at,
+            existing.source_updated_at
+          ) IS DISTINCT FROM (
+            candidate.student_id,
+            candidate.name,
+            candidate.year_level,
+            candidate.college,
+            candidate.program,
+            candidate.institution,
+            candidate.attended_events,
+            candidate.total_absences,
+            candidate.attendance_status,
+            candidate.latest_scanned_at,
+            candidate.source_updated_at
+          )
+        RETURNING existing.id
+      ), inserted AS (
+        INSERT INTO attendance_final_results (
+          school_year_id,
+          import_id,
+          student_id,
+          name,
+          year_level,
+          college,
+          program,
+          institution,
+          attended_events,
+          total_absences,
+          attendance_status,
+          latest_scanned_at,
+          source_updated_at
+        )
+        SELECT
+          candidate.school_year_id,
+          NULL::uuid,
+          candidate.student_id,
+          candidate.name,
+          candidate.year_level,
+          candidate.college,
+          candidate.program,
+          candidate.institution,
+          candidate.attended_events,
+          candidate.total_absences,
+          candidate.attendance_status,
+          candidate.latest_scanned_at,
+          candidate.source_updated_at
+        FROM candidates candidate
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM attendance_final_results existing
+          WHERE existing.import_id IS NULL
+            AND existing.school_year_id IS NOT DISTINCT FROM candidate.school_year_id
+            AND LOWER(TRIM(existing.student_id)) = LOWER(TRIM(candidate.student_id))
+        )
+        RETURNING id
+      ), deleted AS (
+        DELETE FROM attendance_final_results AS existing
+        WHERE ($1::uuid IS NULL OR existing.school_year_id = $1::uuid)
+          AND (
+            existing.import_id IS NOT NULL
+            OR NOT EXISTS (
+              SELECT 1
+              FROM candidates candidate
+              WHERE existing.school_year_id IS NOT DISTINCT FROM candidate.school_year_id
+                AND LOWER(TRIM(existing.student_id)) = LOWER(TRIM(candidate.student_id))
+            )
+          )
+        RETURNING existing.id
       )
       SELECT
-        school_year_id,
-        NULL::uuid AS import_id,
-        student_id,
-        name,
-        NULLIF(year_level, ''),
-        NULLIF(college, ''),
-        NULLIF(program, ''),
-        NULLIF(institution, ''),
-        attended_events,
-        total_absences,
-        CASE
-          WHEN total_absences <= 0 THEN 'perfect_attendance'
-          ELSE 'with_absences'
-        END AS attendance_status,
-        NULLIF(latest_scanned_at, '-infinity'::timestamptz),
-        NULLIF(source_updated_at, '-infinity'::timestamptz)
-      FROM merged
-      RETURNING *
+        (SELECT COUNT(*)::INT FROM updated) AS updated_count,
+        (SELECT COUNT(*)::INT FROM inserted) AS inserted_count,
+        (SELECT COUNT(*)::INT FROM deleted) AS deleted_count
     `,
     [schoolYearId, ZERO_ATTENDANCE_REMARK],
   );
 
-  return result.rows;
+  const currentResult = await client.query<AttendanceFinalResultRecord>(
+    `
+      SELECT *
+      FROM attendance_final_results afr
+      WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
+        AND afr.import_id IS NULL
+      ORDER BY LOWER(TRIM(afr.student_id)), afr.created_at
+    `,
+    [schoolYearId],
+  );
+
+  return currentResult.rows;
 }
 
 async function refreshPenaltyResultsForSchoolYearWithClient(
@@ -6295,6 +6492,7 @@ async function refreshPenaltyResultsForSchoolYearWithClient(
       FROM totals
       ON CONFLICT (school_year_id, (LOWER(TRIM(student_id))))
       DO UPDATE SET
+        student_id = EXCLUDED.student_id,
         name = EXCLUDED.name,
         no_of_absences = EXCLUDED.no_of_absences,
         penalty_id = EXCLUDED.penalty_id,
@@ -6302,6 +6500,23 @@ async function refreshPenaltyResultsForSchoolYearWithClient(
         source_table = EXCLUDED.source_table,
         source_record_id = EXCLUDED.source_record_id,
         updated_at = NOW()
+      WHERE (
+        penalty_results.student_id,
+        penalty_results.name,
+        penalty_results.no_of_absences,
+        penalty_results.penalty_id,
+        penalty_results.prescribed_penalty,
+        penalty_results.source_table,
+        penalty_results.source_record_id
+      ) IS DISTINCT FROM (
+        EXCLUDED.student_id,
+        EXCLUDED.name,
+        EXCLUDED.no_of_absences,
+        EXCLUDED.penalty_id,
+        EXCLUDED.prescribed_penalty,
+        EXCLUDED.source_table,
+        EXCLUDED.source_record_id
+      )
       RETURNING *
     `,
     [schoolYearId ?? null],
