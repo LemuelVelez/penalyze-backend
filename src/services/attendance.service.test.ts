@@ -13,7 +13,7 @@ const fixturePath = path.resolve(
   "src/services/__fixtures__/attendance-import-reconciliation.xlsx",
 );
 
-test("attendance import reports invalid, merged, case-insensitive duplicate, and conflicting rows", async () => {
+test("attendance import reports invalid rows and merges duplicate Student IDs even when names differ", async () => {
   const preview = await previewAttendanceFileBase({
     originalname: path.basename(fixturePath),
     mimetype:
@@ -37,9 +37,8 @@ test("attendance import reports invalid, merged, case-insensitive duplicate, and
     rows: validRows,
   });
 
-  assert.equal(mergeResult.rows.length, 3);
-  assert.equal(mergeResult.mergedRows.length, 2);
-  assert.equal(mergeResult.conflictInvalidRows.length, 2);
+  assert.equal(mergeResult.rows.length, 4);
+  assert.equal(mergeResult.mergedRows.length, 3);
 
   const exactDuplicate = mergeResult.mergedRows.find(
     (row) => row.studentId.toLowerCase() === "tc-001",
@@ -51,22 +50,17 @@ test("attendance import reports invalid, merged, case-insensitive duplicate, and
   );
   assert.deepEqual(caseInsensitiveDuplicate?.sourceRowNumbers, [4, 5]);
 
-  assert.deepEqual(
-    mergeResult.conflictInvalidRows.map((row) => row.rowNumber),
-    [8, 9],
+  const nameMismatchDuplicate = mergeResult.mergedRows.find(
+    (row) => row.studentId.toLowerCase() === "tc-005",
   );
-  assert.ok(
-    mergeResult.conflictInvalidRows.every((row) =>
-      row.errors.some((error) => error.includes("Conflicting names share Student ID")),
-    ),
-  );
+  assert.deepEqual(nameMismatchDuplicate?.sourceRowNumbers, [8, 9]);
+  assert.deepEqual(nameMismatchDuplicate?.names, ["Dana Cruz", "Eve Cruz"]);
 
   const mergedAwayRows = mergeResult.mergedRows.reduce(
     (total, row) => total + row.sourceRowNumbers.length - 1,
     0,
   );
-  const reportedInvalidRows =
-    preview.rowsInvalid + mergeResult.conflictInvalidRows.length;
+  const reportedInvalidRows = preview.rowsInvalid;
 
   assert.equal(
     mergeResult.rows.length + mergedAwayRows + reportedInvalidRows,

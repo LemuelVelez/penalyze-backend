@@ -1085,7 +1085,6 @@ function getAttendanceRowMergeKey(
 type AttendanceRowMergeResult = {
   rows: ParsedAttendanceRow[];
   mergedRows: AttendanceImportReconciliation["rowsMerged"];
-  conflictInvalidRows: AttendanceImportReconciliation["rowsInvalid"];
 };
 
 export function mergeAttendanceImportRowsByStudentAndEvent(
@@ -1101,7 +1100,6 @@ export function mergeAttendanceImportRowsByStudentAndEvent(
 
   const outputRows: ParsedAttendanceRow[] = [];
   const mergedRows: AttendanceImportReconciliation["rowsMerged"] = [];
-  const conflictInvalidRows: AttendanceImportReconciliation["rowsInvalid"] = [];
 
   groupedRows.forEach((group, key) => {
     const names = Array.from(
@@ -1110,24 +1108,6 @@ export function mergeAttendanceImportRowsByStudentAndEvent(
     const sourceRowNumbers = group
       .map((row) => row.rowNumber)
       .sort((a, b) => a - b);
-    const normalizedNames = new Set(
-      names.map((name) => normalizeHeader(name)).filter(Boolean),
-    );
-    const conflict = normalizedNames.size > 1;
-
-    if (conflict) {
-      group.forEach((row) => {
-        conflictInvalidRows.push({
-          rowNumber: row.rowNumber,
-          studentId: row.studentId,
-          name: row.name,
-          errors: [
-            `Conflicting names share Student ID ${row.studentId} for the same event. Review source rows ${sourceRowNumbers.join(", ")}.`,
-          ],
-        });
-      });
-      return;
-    }
 
     if (group.length > 1) {
       mergedRows.push({
@@ -1170,7 +1150,7 @@ export function mergeAttendanceImportRowsByStudentAndEvent(
     outputRows.push(merged);
   });
 
-  return { rows: outputRows, mergedRows, conflictInvalidRows };
+  return { rows: outputRows, mergedRows };
 }
 
 function createValidationError(message: string, statusCode = 400) {
@@ -2866,17 +2846,6 @@ async function saveAttendanceRowsWithClient(
     }));
   const mergeResult = mergeAttendanceImportRowsByStudentAndEvent(validRows, input);
   const rowsToSave = mergeResult.rows;
-  if (mergeResult.conflictInvalidRows.length) {
-    await client.query(
-      `
-        UPDATE attendance_imports
-        SET rows_valid = GREATEST(0, rows_valid - $2),
-            rows_invalid = rows_invalid + $2
-        WHERE id = $1
-      `,
-      [importId, mergeResult.conflictInvalidRows.length],
-    );
-  }
   const stageCounts = {
     parsed: preview.rowsTotal,
     normalized: preview.rows.length,
@@ -2991,7 +2960,7 @@ async function saveAttendanceRowsWithClient(
   };
   const reconciliation: AttendanceImportReconciliation = {
     rowsInSource: preview.rowsTotal,
-    rowsInvalid: [...validationInvalidRows, ...mergeResult.conflictInvalidRows].sort(
+    rowsInvalid: validationInvalidRows.sort(
       (left, right) => left.rowNumber - right.rowNumber,
     ),
     rowsMerged: mergeResult.mergedRows,
