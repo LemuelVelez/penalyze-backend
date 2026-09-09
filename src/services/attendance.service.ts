@@ -24,6 +24,10 @@ import {
   normalizeAttendanceEventIdentityName,
   scoreAttendanceEventIdentity,
 } from "./attendance-event-identity";
+import {
+  getAttendanceFinalResultVisibilitySql,
+  getAttendanceRecordVisibilitySql,
+} from "./attendance-result-visibility";
 
 const ZERO_ATTENDANCE_REMARK =
   "Zero attendance registration from landing page.";
@@ -1924,7 +1928,7 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
       ar.event_id,
       LOWER(TRIM(ar.student_id)) AS normalized_student_id
     FROM attendance_records ar
-    WHERE ar.deleted_at IS NULL
+    WHERE ${getAttendanceRecordVisibilitySql("ar")}
       AND ar.event_id IS NOT NULL
       AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
   )
@@ -1936,7 +1940,7 @@ const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
       ar.event_id,
       ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
     FROM attendance_records ar
-    WHERE ar.deleted_at IS NULL
+    WHERE ${getAttendanceRecordVisibilitySql("ar")}
       AND ar.event_id IS NOT NULL
   )
 `;
@@ -2396,44 +2400,13 @@ async function deleteAttendanceImportRecords(
   const uniqueImportIds = uniqueCleanTextValues(importIds);
   if (!uniqueImportIds.length) return;
 
-  const finalResultIdsResult = await client.query<{ id: string }>(
-    `
-      SELECT id
-      FROM attendance_final_results
-      WHERE import_id = ANY($1::uuid[])
-    `,
-    [uniqueImportIds],
-  );
-  const finalResultIds = finalResultIdsResult.rows.map((row) => row.id);
+  await lockAttendanceAbsenceSync(client);
 
-  const calculationResultIdsResult = await client.query<{ id: string }>(
-    `
-      SELECT id
-      FROM calculation_results
-      WHERE import_ids && $1::uuid[]
-    `,
-    [uniqueImportIds],
+  const context = await getAttendanceImportVisibilityContext(
+    client,
+    uniqueImportIds,
+    true,
   );
-  const calculationResultIds = calculationResultIdsResult.rows.map(
-    (row) => row.id,
-  );
-
-  if (finalResultIds.length || calculationResultIds.length) {
-    await client.query(
-      `
-        DELETE FROM penalty_results
-        WHERE (
-            source_table = 'attendance_final_results'
-            AND source_record_id::TEXT = ANY($1::TEXT[])
-          )
-          OR (
-            source_table = 'calculation_results'
-            AND source_record_id::TEXT = ANY($2::TEXT[])
-          )
-      `,
-      [finalResultIds, calculationResultIds],
-    );
-  }
 
   await client.query(
     `
@@ -2469,6 +2442,8 @@ async function deleteAttendanceImportRecords(
     "DELETE FROM attendance_imports WHERE id = ANY($1::uuid[])",
     [uniqueImportIds],
   );
+
+  await recomputeAttendanceAfterImportVisibilityChange(client, context);
 }
 
 async function previewAttendanceFileBase(
@@ -5218,7 +5193,7 @@ export async function listAttendanceRecords(
   schoolYearId?: string,
   importIds: string[] = [],
 ) {
-  const clauses: string[] = ["ar.deleted_at IS NULL"];
+  const clauses: string[] = [getAttendanceRecordVisibilitySql("ar")];
   const params: unknown[] = [];
 
   if (studentId) {
@@ -6184,7 +6159,7 @@ async function refreshAttendanceFinalResultsWithClient(
         FROM attendance_records ar
         LEFT JOIN attendance_events ae ON ae.id = ar.event_id
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
-        WHERE ar.deleted_at IS NULL
+        WHERE ${getAttendanceRecordVisibilitySql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
       ), imported_totals AS (
         SELECT
@@ -6504,11 +6479,12 @@ async function refreshAttendanceFinalResultsWithClient(
   return currentResult.rows;
 }
 
-async function refreshPenaltyResultsForSchoolYearWithClient(
+export async function refreshPenaltyResultsForSchoolYearWithClient(
   client: PoolClient,
   schoolYearId?: string,
   _calculationScopeKey?: string,
 ) {
+  const visibleFinalResultSql = getAttendanceFinalResultVisibilitySql("afr");
   const result = await client.query<PenaltyResultRecord>(
     `
       WITH totals AS (
@@ -6531,6 +6507,7 @@ async function refreshPenaltyResultsForSchoolYearWithClient(
         ) penalty ON afr.total_absences > 0
         WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
           AND afr.total_absences > 0
+          AND ${visibleFinalResultSql}
       )
       INSERT INTO penalty_results (
         school_year_id,
@@ -6589,18 +6566,55 @@ async function refreshPenaltyResultsForSchoolYearWithClient(
   await client.query(
     `
       DELETE FROM penalty_results pr
-      WHERE ($1::uuid IS NULL OR pr.school_year_id = $1::uuid)
-        AND pr.source_table = 'attendance_final_results'
-        AND NOT EXISTS (
-          SELECT 1
-          FROM attendance_final_results afr
-          WHERE afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
-            AND LOWER(TRIM(afr.student_id)) = LOWER(TRIM(pr.student_id))
-            AND afr.total_absences > 0
-        )
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM attendance_final_results afr
+        WHERE afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
+          AND LOWER(TRIM(afr.student_id)) = LOWER(TRIM(pr.student_id))
+          AND afr.total_absences > 0
+          AND ${visibleFinalResultSql}
+      )
     `,
-    [schoolYearId ?? null],
   );
+
+  const unresolved = await client.query<{
+    id: string;
+    school_year_id: string | null;
+    student_id: string;
+    source_table: string | null;
+  }>(
+    `
+      SELECT
+        pr.id,
+        pr.school_year_id,
+        pr.student_id,
+        pr.source_table
+      FROM penalty_results pr
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM attendance_final_results afr
+        WHERE afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
+          AND LOWER(TRIM(afr.student_id)) = LOWER(TRIM(pr.student_id))
+          AND afr.total_absences > 0
+          AND ${visibleFinalResultSql}
+      )
+      ORDER BY pr.updated_at DESC, pr.id
+      LIMIT 10
+    `,
+  );
+
+  if (unresolved.rows.length) {
+    const sample = unresolved.rows
+      .map(
+        (row) =>
+          `${row.student_id} [${row.school_year_id ?? "NULL"}] ${row.source_table ?? "unknown"}`,
+      )
+      .join(", ");
+
+    throw new Error(
+      `Penalty result reconciliation invariant failed: penalty result(s) have no visible backing final result. ${sample}`,
+    );
+  }
 
   return result.rows;
 }
@@ -6621,7 +6635,7 @@ export async function refreshAttendanceFinalResults(
 export async function listAttendanceFinalResults(
   options: AttendanceFinalResultsFilter = {},
 ) {
-  const clauses: string[] = ["(afr.import_id IS NULL OR ai.id IS NOT NULL)"];
+  const clauses: string[] = [getAttendanceFinalResultVisibilitySql("afr")];
   const params: unknown[] = [];
 
   if (options.schoolYearId) {

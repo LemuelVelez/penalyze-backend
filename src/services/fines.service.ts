@@ -8,8 +8,15 @@ import {
   StudentRecord,
 } from "../database/model/schema.model";
 import { DEFAULT_PENALTIES } from "../database/seeder/penalties.seeder";
-import { query } from "../lib/db";
-import { refreshCalculationResults } from "./attendance.service";
+import { query, withTransaction } from "../lib/db";
+import {
+  getAttendanceFinalResultVisibilitySql,
+  getAttendanceRecordVisibilitySql,
+} from "./attendance-result-visibility";
+import {
+  refreshCalculationResults,
+  refreshPenaltyResultsForSchoolYearWithClient,
+} from "./attendance.service";
 
 export const ZERO_ATTENDANCE_REMARK =
   "Zero attendance registration from landing page.";
@@ -457,7 +464,9 @@ export async function listFines(
         ae.event_end_at AS attendance_event_end_at,
         ar.remarks AS attendance_remarks
       FROM fines f
-      LEFT JOIN attendance_records ar ON ar.id = f.attendance_record_id AND ar.deleted_at IS NULL
+      LEFT JOIN attendance_records ar
+        ON ar.id = f.attendance_record_id
+        AND ${getAttendanceRecordVisibilitySql("ar")}
       LEFT JOIN attendance_events ae ON ae.id = ar.event_id
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY
@@ -482,7 +491,7 @@ async function getAttendanceEventCount(
       SELECT COUNT(DISTINCT ar.event_id)::INT AS total
       FROM attendance_records ar
       WHERE ar.event_id IS NOT NULL
-        AND ar.deleted_at IS NULL
+        AND ${getAttendanceRecordVisibilitySql("ar")}
         AND ar.school_year_id = $2::uuid
         AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1::TEXT
     `,
@@ -738,7 +747,7 @@ export async function updateFineStatus(id: string, status: FineStatus) {
               SELECT 1
               FROM attendance_records active_record
               WHERE active_record.id = fines.attendance_record_id
-                AND active_record.deleted_at IS NULL
+                AND ${getAttendanceRecordVisibilitySql("active_record")}
             )
           )
         RETURNING *
@@ -749,7 +758,9 @@ export async function updateFineStatus(id: string, status: FineStatus) {
         ar.event_id AS attendance_event_id,
         ar.remarks AS attendance_remarks
       FROM updated
-      LEFT JOIN attendance_records ar ON ar.id = updated.attendance_record_id AND ar.deleted_at IS NULL
+      LEFT JOIN attendance_records ar
+        ON ar.id = updated.attendance_record_id
+        AND ${getAttendanceRecordVisibilitySql("ar")}
     `,
     [id, status],
   );
@@ -775,7 +786,7 @@ export async function getFineSummary(schoolYearId?: string) {
           SELECT 1
           FROM attendance_records ar
           WHERE ar.id = f.attendance_record_id
-            AND ar.deleted_at IS NULL
+            AND ${getAttendanceRecordVisibilitySql("ar")}
         )
       )
       ${schoolYearId ? "AND f.school_year_id = $1" : ""}
@@ -832,16 +843,11 @@ export async function listPenaltyResults(
       WHERE current_result.school_year_id IS NOT DISTINCT FROM pr.school_year_id
         AND LOWER(TRIM(current_result.student_id)) = LOWER(TRIM(pr.student_id))
         AND current_result.total_absences > 0
+        AND ${getAttendanceFinalResultVisibilitySql("current_result")}
     )`,
     `(
       pr.source_table <> 'attendance_final_results'
-      OR afr.import_id IS NULL
-      OR EXISTS (
-        SELECT 1
-        FROM attendance_imports active_import
-        WHERE active_import.id = afr.import_id
-          AND active_import.deleted_at IS NULL
-      )
+      OR ${getAttendanceFinalResultVisibilitySql("afr")}
     )`,
     `(
       pr.source_table <> 'calculation_results'
@@ -932,84 +938,11 @@ export async function refreshPenaltyResults(
     importIds?: string[];
   } = {},
 ) {
-  const schoolYearId = cleanOptionalText(options.schoolYearId);
+  const schoolYearId = cleanOptionalText(options.schoolYearId) ?? undefined;
 
-  const result = await query<PenaltyResultRecord>(
-    `
-      WITH totals AS (
-        SELECT
-          afr.school_year_id,
-          afr.student_id,
-          afr.name,
-          afr.total_absences::INT AS no_of_absences,
-          penalty.id AS penalty_id,
-          COALESCE(penalty.prescribed_penalty, 'No prescribed penalty configured.') AS prescribed_penalty,
-          'attendance_final_results'::TEXT AS source_table,
-          afr.id AS source_record_id
-        FROM attendance_final_results afr
-        LEFT JOIN LATERAL (
-          SELECT id, prescribed_penalty
-          FROM penalties
-          WHERE no_of_absences <= afr.total_absences
-          ORDER BY no_of_absences DESC
-          LIMIT 1
-        ) penalty ON afr.total_absences > 0
-        WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
-          AND afr.total_absences > 0
-      )
-      INSERT INTO penalty_results (
-        school_year_id,
-        student_id,
-        name,
-        no_of_absences,
-        penalty_id,
-        prescribed_penalty,
-        status,
-        source_table,
-        source_record_id
-      )
-      SELECT
-        school_year_id,
-        student_id,
-        name,
-        no_of_absences,
-        penalty_id,
-        prescribed_penalty,
-        'unpaid',
-        source_table,
-        source_record_id
-      FROM totals
-      ON CONFLICT (school_year_id, (LOWER(TRIM(student_id))))
-      DO UPDATE SET
-        name = EXCLUDED.name,
-        no_of_absences = EXCLUDED.no_of_absences,
-        penalty_id = EXCLUDED.penalty_id,
-        prescribed_penalty = EXCLUDED.prescribed_penalty,
-        source_table = EXCLUDED.source_table,
-        source_record_id = EXCLUDED.source_record_id,
-        updated_at = NOW()
-      RETURNING *
-    `,
-    [schoolYearId],
+  return withTransaction((client) =>
+    refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId),
   );
-
-  await query(
-    `
-      DELETE FROM penalty_results pr
-      WHERE ($1::uuid IS NULL OR pr.school_year_id = $1::uuid)
-        AND pr.source_table = 'attendance_final_results'
-        AND NOT EXISTS (
-          SELECT 1
-          FROM attendance_final_results afr
-          WHERE afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
-            AND LOWER(TRIM(afr.student_id)) = LOWER(TRIM(pr.student_id))
-            AND afr.total_absences > 0
-        )
-    `,
-    [schoolYearId],
-  );
-
-  return result.rows;
 }
 
 export async function updatePenaltyResultStatus(
