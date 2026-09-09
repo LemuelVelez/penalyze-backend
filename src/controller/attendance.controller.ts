@@ -9,6 +9,7 @@ import {
   deleteAttendanceImport,
   deleteAttendanceImports,
   getAttendanceImportDeleteImpact,
+  getAttendanceEventMergeImpact,
   purgeAttendanceImport,
   restoreAttendanceImport,
   deleteCalculationResultsByIds,
@@ -19,17 +20,19 @@ import {
   deleteManualAttendanceRecordsBySchoolYear,
   getAttendanceImport,
   listAttendanceEvents,
+  listAttendanceEventDuplicateGroups,
   listAttendanceFinalResults,
   listCalculationResults,
   listAttendanceImports,
   listAttendanceRecords,
   listManualAttendanceRecords,
-  previewAttendanceFile,
+  previewAttendanceFiles,
   refreshAttendanceFinalResults,
   refreshCalculationResults,
-  saveAttendanceFile,
+  saveAttendanceFiles,
   saveAttendanceRows,
   saveManualAttendanceRecord,
+  mergeAttendanceEvents,
   updateAttendanceEvent,
   updateAttendanceRecord,
   updateAttendanceRecords as updateAttendanceRecordsService,
@@ -73,7 +76,7 @@ export const attendanceUpload = multer({
       return;
     }
 
-    const error = new Error("Unsupported file. Please upload an .xlsx file.") as Error & {
+    const error = new Error("Unsupported file. Please upload an .xlsx or .csv file.") as Error & {
       statusCode?: number;
     };
     error.statusCode = 400;
@@ -184,6 +187,17 @@ function getUploadedFiles(req: Request) {
   return uploadedFiles;
 }
 
+function parseOptionalBoolean(value: unknown) {
+  if (value === true || value === "true" || value === "1") return true;
+  if (value === false || value === "false" || value === "0") return false;
+  return undefined;
+}
+
+function parseOptionalIndex(value: unknown) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
 function getEventPayload(req: Request) {
   return {
     schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
@@ -193,6 +207,11 @@ function getEventPayload(req: Request) {
     eventEndAt: req.body?.eventEndAt,
     eventDescription: req.body?.eventDescription,
     resumeImportId: req.body?.resumeImportId,
+    mergeIntoEventId: req.body?.mergeIntoEventId,
+    mergeIntoBatchIndex: parseOptionalIndex(req.body?.mergeIntoBatchIndex),
+    forceCreateEvent: parseOptionalBoolean(req.body?.forceCreateEvent),
+    keepEventName: req.body?.keepEventName,
+    keepEventSchedule: req.body?.keepEventSchedule,
   };
 }
 
@@ -240,32 +259,17 @@ function getEventPayloadForFile(
     eventDescription:
       filePayload.eventDescription ?? commonPayload.eventDescription,
     resumeImportId: filePayload.resumeImportId ?? commonPayload.resumeImportId,
-  };
-}
-
-type AttendanceBatchFileResult = {
-  fileName: string;
-  status: "saved" | "failed";
-  error: string | null;
-  result: Awaited<ReturnType<typeof saveAttendanceFile>> | null;
-};
-
-function buildAttendanceBatchResult(files: AttendanceBatchFileResult[]) {
-  const savedFiles = files.filter((file) => file.status === "saved");
-  const failedFiles = files.length - savedFiles.length;
-
-  return {
-    files,
-    filesSaved: savedFiles.length,
-    filesFailed: failedFiles,
-    recordsSaved: savedFiles.reduce(
-      (total, file) => total + (file.result?.savedRecords.length ?? 0),
-      0,
-    ),
-    finesCreated: savedFiles.reduce(
-      (total, file) => total + (file.result?.createdFines.length ?? 0),
-      0,
-    ),
+    mergeIntoEventId:
+      filePayload.mergeIntoEventId ?? commonPayload.mergeIntoEventId,
+    mergeIntoBatchIndex:
+      parseOptionalIndex(filePayload.mergeIntoBatchIndex) ??
+      commonPayload.mergeIntoBatchIndex,
+    forceCreateEvent:
+      parseOptionalBoolean(filePayload.forceCreateEvent) ??
+      commonPayload.forceCreateEvent,
+    keepEventName: filePayload.keepEventName ?? commonPayload.keepEventName,
+    keepEventSchedule:
+      filePayload.keepEventSchedule ?? commonPayload.keepEventSchedule,
   };
 }
 
@@ -308,6 +312,78 @@ export async function events(req: Request, res: Response, next: NextFunction) {
     const records = await listAttendanceEvents(limit, offset, schoolYearId);
 
     res.json({ data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function eventDuplicateGroups(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const schoolYearId = req.query.schoolYearId
+      ? String(req.query.schoolYearId).trim()
+      : undefined;
+    const groups = await listAttendanceEventDuplicateGroups(schoolYearId);
+    res.json({ data: groups });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function eventMergeImpact(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const targetEventId = String(
+      req.body?.targetEventId ?? req.query.targetEventId ?? "",
+    ).trim();
+    const sourceEventIds = parseRecordIds(
+      req.body?.sourceEventIds ?? req.query.sourceEventIds,
+    );
+    if (!targetEventId || !sourceEventIds.length) {
+      res.status(400).json({
+        message: "Target event ID and at least one source event ID are required.",
+      });
+      return;
+    }
+    const impact = await getAttendanceEventMergeImpact(
+      targetEventId,
+      sourceEventIds,
+    );
+    res.json({ data: impact });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function mergeEvents(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const targetEventId = String(req.body?.targetEventId ?? "").trim();
+    const sourceEventIds = parseRecordIds(req.body?.sourceEventIds);
+    if (!targetEventId || !sourceEventIds.length) {
+      res.status(400).json({
+        message: "Target event ID and at least one source event ID are required.",
+      });
+      return;
+    }
+    const result = await mergeAttendanceEvents({
+      targetEventId,
+      sourceEventIds,
+      mergedBy: getAuthenticatedUserId(req),
+      targetName: req.body?.targetName,
+      targetEventStartAt: req.body?.targetEventStartAt,
+      targetEventEndAt: req.body?.targetEventEndAt,
+    });
+    res.json({ message: "Attendance events merged successfully.", data: result });
   } catch (error) {
     next(error);
   }
@@ -477,9 +553,7 @@ export async function previewImport(
       return;
     }
 
-    const previews = await Promise.all(
-      files.map((file) => previewAttendanceFile(file)),
-    );
+    const previews = await previewAttendanceFiles(files);
     res.json({ message: "Files read successfully.", data: previews });
   } catch (error) {
     next(error);
@@ -495,36 +569,17 @@ export async function saveImport(
     const files = getUploadedFiles(req);
 
     if (files.length) {
-      const fileResults: AttendanceBatchFileResult[] = [];
-
-      for (const [index, file] of files.entries()) {
-        try {
-          const result = await saveAttendanceFile(
-            file,
-            {
-              ...getEventPayloadForFile(req, file, index),
-              uploadedBy: getAuthenticatedUserId(req),
-            },
-          );
-          fileResults.push({
-            fileName: file.originalname,
-            status: "saved",
-            error: null,
-            result,
-          });
-        } catch (error) {
-          fileResults.push({
-            fileName: file.originalname,
-            status: "failed",
-            error: getErrorMessage(error, "Unable to save attendance import."),
-            result: null,
-          });
-        }
-      }
+      const fileOptions = files.map((file, index) => ({
+        ...getEventPayloadForFile(req, file, index),
+        index,
+        fileName: file.originalname,
+        uploadedBy: getAuthenticatedUserId(req),
+      }));
+      const result = await saveAttendanceFiles(files, fileOptions);
 
       res.status(201).json({
         message: "Attendance import batch completed.",
-        data: buildAttendanceBatchResult(fileResults),
+        data: result,
       });
       return;
     }
@@ -589,95 +644,30 @@ export async function saveImportWithProgress(
       clientCancelled || res.destroyed || res.writableEnded;
 
     if (files.length) {
-      const fileResults: AttendanceBatchFileResult[] = [];
-      let completedRows = 0;
-      let completedSavedRecords = 0;
-      let completedFines = 0;
-
-      for (const [index, file] of files.entries()) {
-        if (isCancelled()) {
-          throw Object.assign(new Error("Attendance import was cancelled."), {
-            statusCode: 499,
-          });
-        }
-
-        const onProgress = (progress: AttendanceImportProgress) => {
+      const fileOptions = files.map((file, index) => ({
+        ...getEventPayloadForFile(req, file, index),
+        index,
+        fileName: file.originalname,
+        uploadedBy: getAuthenticatedUserId(req),
+        isCancelled,
+      }));
+      const result = await saveAttendanceFiles(
+        files,
+        fileOptions,
+        (progress) => {
           if (isCancelled()) {
             throw Object.assign(new Error("Attendance import was cancelled."), {
               statusCode: 499,
             });
           }
-
-          const batchPercent = Math.round(
-            ((index + progress.percent / 100) / files.length) * 100,
-          );
-          writeProgressStreamMessage(res, {
-            type: "progress",
-            progress: {
-              ...progress,
-              percent: Math.max(0, Math.min(100, batchPercent)),
-              message: `${file.originalname}: ${progress.message}`,
-              processedRows: completedRows + progress.processedRows,
-              totalRows: completedRows + progress.totalRows,
-              savedRecords: completedSavedRecords + progress.savedRecords,
-              createdFines: completedFines + progress.createdFines,
-            },
-          });
-        };
-
-        try {
-          const result = await saveAttendanceFile(
-            file,
-            {
-              ...getEventPayloadForFile(req, file, index),
-              uploadedBy: getAuthenticatedUserId(req),
-              isCancelled,
-            },
-            onProgress,
-          );
-          fileResults.push({
-            fileName: file.originalname,
-            status: "saved",
-            error: null,
-            result,
-          });
-          completedRows += result.rowsTotal;
-          completedSavedRecords += result.savedRecords.length;
-          completedFines += result.createdFines.length;
-        } catch (error) {
-          if (isCancelled() || (error as any)?.statusCode === 499) {
-            throw error;
-          }
-
-          fileResults.push({
-            fileName: file.originalname,
-            status: "failed",
-            error: getErrorMessage(error, "Unable to save attendance import."),
-            result: null,
-          });
-        }
-
-        writeProgressStreamMessage(res, {
-          type: "progress",
-          progress: {
-            stage: index === files.length - 1 ? "completed" : "preparing",
-            percent: Math.round(((index + 1) / files.length) * 100),
-            message:
-              index === files.length - 1
-                ? "Attendance import batch completed."
-                : `Finished ${file.originalname}. Preparing next file...`,
-            processedRows: completedRows,
-            totalRows: completedRows,
-            savedRecords: completedSavedRecords,
-            createdFines: completedFines,
-          },
-        });
-      }
+          writeProgressStreamMessage(res, { type: "progress", progress });
+        },
+      );
 
       writeProgressStreamMessage(res, {
         type: "success",
         message: "Attendance import batch completed.",
-        data: buildAttendanceBatchResult(fileResults),
+        data: result,
       });
       res.end();
       return;

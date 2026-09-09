@@ -30,6 +30,9 @@ import {
   deleteManualRecords as deleteAttendanceManualRecords,
   deleteRecord as deleteAttendanceRecord,
   events as attendanceEvents,
+  eventDuplicateGroups as attendanceEventDuplicateGroups,
+  eventMergeImpact as attendanceEventMergeImpact,
+  mergeEvents as mergeAttendanceEvents,
   finalResults as attendanceFinalResults,
   imports as attendanceImports,
   importDeleteImpact as attendanceImportDeleteImpact,
@@ -201,6 +204,23 @@ app.patch(
 );
 
 app.get("/api/attendance/events", attendanceEvents);
+app.get(
+  "/api/attendance/events/duplicates",
+  requireAuth,
+  attendanceEventDuplicateGroups,
+);
+app.post(
+  "/api/attendance/events/merge-impact",
+  requireAuth,
+  requireAdmin,
+  attendanceEventMergeImpact,
+);
+app.post(
+  "/api/attendance/events/merge",
+  requireAuth,
+  requireAdmin,
+  mergeAttendanceEvents,
+);
 app.post("/api/attendance/events", saveAttendanceEvent);
 app.put("/api/attendance/events/:eventId", updateAttendanceEvent);
 app.patch("/api/attendance/events/:eventId", updateAttendanceEvent);

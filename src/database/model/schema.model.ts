@@ -10,6 +10,7 @@ export const TABLES = {
   manualAttendanceRecords: "manual_attendance_records",
   attendanceRequests: "attendance_requests",
   attendanceRequestEvents: "attendance_request_events",
+  attendanceEventMerges: "attendance_event_merges",
   penalties: "penalties",
   penaltyResults: "penalty_results",
   fines: "fines",
@@ -73,6 +74,19 @@ export type AttendanceEventRecord = {
   event_order: number;
   created_at: Date;
   updated_at: Date;
+};
+
+
+export type AttendanceEventMergeLogRecord = {
+  id: string;
+  school_year_id: string | null;
+  target_event_id: string | null;
+  source_event_id: string;
+  target_snapshot: Record<string, unknown>;
+  source_snapshot: Record<string, unknown>;
+  moved_counts: Record<string, number>;
+  merged_by: string | null;
+  created_at: Date | string;
 };
 
 export type AttendanceImportRecord = {
@@ -305,11 +319,25 @@ export type ParsedAttendanceRow = AttendanceImportInput & {
   raw: Record<string, unknown>;
 };
 
+export type AttendanceEventMergeCandidate = {
+  source: "existing" | "batch";
+  eventId: string | null;
+  batchFileIndex: number | null;
+  eventName: string;
+  eventStartAt: Date | string | null;
+  eventEndAt: Date | string | null;
+  attendeesCount: number;
+  score: number;
+  confidence: "high" | "medium" | "low";
+  reasons: string[];
+};
+
 export type AttendanceDetectedEventMetadata = {
   eventName: string | null;
   eventStartAt: string | null;
   eventEndAt: string | null;
   schoolYearLabel: string | null;
+  mergeCandidates?: AttendanceEventMergeCandidate[];
 };
 
 export type AttendancePreviewResult = {
@@ -341,5 +369,6 @@ export type SavedAttendanceImportResult = AttendancePreviewResult & {
 
 export const ACCEPTED_ATTENDANCE_EXTENSIONS = [
   ".xlsx",
+  ".csv",
 ] as const;
 export const REQUIRED_ATTENDANCE_FIELDS = ["studentId", "name"] as const;

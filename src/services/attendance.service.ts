@@ -5,6 +5,7 @@ import {
   ACCEPTED_ATTENDANCE_EXTENSIONS,
   AttendanceDetectedEventMetadata,
   AttendanceEventRecord,
+  AttendanceEventMergeCandidate,
   AttendanceFinalResultRecord,
   AttendanceImportProgress,
   AttendanceImportRecord,
@@ -19,6 +20,10 @@ import {
   SchoolYearRecord,
 } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
+import {
+  normalizeAttendanceEventIdentityName,
+  scoreAttendanceEventIdentity,
+} from "./attendance-event-identity";
 
 const ZERO_ATTENDANCE_REMARK =
   "Zero attendance registration from landing page.";
@@ -45,6 +50,11 @@ type SaveRowsInput = {
   eventDate?: string;
   eventDescription?: string;
   resumeImportId?: string;
+  forceCreateEvent?: boolean;
+  mergeIntoEventId?: string;
+  mergeIntoBatchIndex?: number;
+  keepEventName?: "existing" | "incoming";
+  keepEventSchedule?: "existing" | "incoming";
   fileName?: string;
   fileType?: string;
   rows: RawImportRow[] | ParsedAttendanceRow[];
@@ -253,7 +263,10 @@ const HEADER_ALIASES = {
   remarks: ["remarks", "remark", "notes", "note", "comment", "comments"],
 } as const;
 
-type AttendanceMetadataKey = keyof AttendanceDetectedEventMetadata;
+type AttendanceMetadataKey = Exclude<
+  keyof AttendanceDetectedEventMetadata,
+  "mergeCandidates"
+>;
 
 const ATTENDANCE_METADATA_ALIASES: Record<
   AttendanceMetadataKey,
@@ -412,6 +425,7 @@ function createEmptyDetectedAttendanceEvent(): AttendanceDetectedEventMetadata {
     eventStartAt: null,
     eventEndAt: null,
     schoolYearLabel: null,
+    mergeCandidates: [],
   };
 }
 
@@ -464,6 +478,9 @@ function mergeDetectedAttendanceEvents(
     eventStartAt: primary.eventStartAt || fallback.eventStartAt,
     eventEndAt: primary.eventEndAt || fallback.eventEndAt,
     schoolYearLabel: primary.schoolYearLabel || fallback.schoolYearLabel,
+    mergeCandidates: primary.mergeCandidates?.length
+      ? primary.mergeCandidates
+      : fallback.mergeCandidates ?? [],
   };
 }
 
@@ -562,7 +579,7 @@ function ensureSupportedFile(fileName: string) {
   const extension = getFileExtension(fileName);
 
   if (!ACCEPTED_ATTENDANCE_EXTENSIONS.includes(extension as any)) {
-    throw new Error("Unsupported file. Please upload an .xlsx file.");
+    throw new Error("Unsupported file. Please upload an .xlsx or .csv file.");
   }
 
   return extension;
@@ -897,9 +914,113 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
   };
 }
 
+function parseScannerBarcodePayload(value: unknown) {
+  const text = String(value ?? "").replace(/\r/g, "").trim();
+  if (!text || !/student\s*id\s*:/i.test(text)) return null;
+
+  const fields = new Map<string, string>();
+  text.split("\n").forEach((line) => {
+    const match = line.match(/^\s*([^:]+?)\s*:\s*(.*?)\s*$/);
+    if (!match) return;
+    fields.set(normalizeHeader(match[1]), cleanText(match[2]));
+  });
+
+  const studentId = fields.get("student id") ?? "";
+  const name = fields.get("name") ?? "";
+  if (!studentId || !name) return null;
+
+  return {
+    "Student ID": studentId,
+    Name: name,
+    "Year Level": fields.get("year level") ?? "",
+    College: fields.get("college") ?? "",
+    Program: fields.get("program") ?? "",
+    Institution: fields.get("institution") ?? "",
+  } as RawImportRow;
+}
+
+function getScannerEventNameFromFileName(fileName: string) {
+  const baseName = getFileNameWithoutExtension(fileName)
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/\battendance\b/gi, " ")
+    .replace(/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/gi, " ")
+    .replace(/\b20\d{2}\b/g, " ")
+    .replace(/\b\d{1,2}\b/g, " ")
+    .replace(/[,._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return baseName || getFileNameWithoutExtension(fileName);
+}
+
+function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
+  const headers = getRawImportRowHeaders(rows);
+  const isScannerExport =
+    headers.includes("barcode") &&
+    headers.includes("format") &&
+    headers.includes("scan date");
+
+  if (!isScannerExport) return null;
+
+  const transformedRows: RawImportRow[] = [];
+  const scanTimes: string[] = [];
+
+  rows.forEach((row) => {
+    const format = cleanText(getByAliases(row, ["format"]));
+    const type = cleanText(getByAliases(row, ["type"]));
+    if (format && format.toLowerCase() !== "qr_code") return;
+    if (type && type.toLowerCase() !== "text") return;
+
+    const parsedPayload = parseScannerBarcodePayload(
+      getByAliases(row, ["barcode"]),
+    );
+    if (!parsedPayload) return;
+
+    const scannedAt = normalizeOptionalTimestamp(
+      getByAliases(row, ["scan date"]),
+      "Scanned at",
+    );
+    if (!scannedAt.error && scannedAt.value) scanTimes.push(scannedAt.value);
+
+    transformedRows.push({
+      ...parsedPayload,
+      "Scanned At": scannedAt.value ?? "",
+    });
+  });
+
+  const orderedTimes = scanTimes
+    .map((value) => new Date(value))
+    .filter((value) => !Number.isNaN(value.getTime()))
+    .sort((left, right) => left.getTime() - right.getTime());
+  const firstScan = orderedTimes[0] ?? null;
+  const lastScan = orderedTimes[orderedTimes.length - 1] ?? null;
+  const schoolYear = firstScan ? getSchoolYearRangeFromDate(firstScan) : null;
+
+  return {
+    rawRows: transformedRows,
+    detectedEvent: {
+      eventName: getScannerEventNameFromFileName(fileName),
+      eventStartAt: firstScan?.toISOString() ?? null,
+      eventEndAt: lastScan?.toISOString() ?? null,
+      schoolYearLabel: schoolYear?.name ?? null,
+      mergeCandidates: [],
+    } satisfies AttendanceDetectedEventMetadata,
+  };
+}
+
 async function parseFileToRawRows(file: UploadedAttendanceFile) {
-  ensureSupportedFile(file.originalname);
-  return parseExcelFile(file);
+  const extension = ensureSupportedFile(file.originalname);
+  const parsed = await parseExcelFile(file);
+
+  if (extension === ".csv") {
+    const scannerExport = transformScannerExportRows(
+      file.originalname,
+      parsed.rawRows,
+    );
+    if (scannerExport) return scannerExport;
+  }
+
+  return parsed;
 }
 
 function getParsedAttendanceRowTime(row: ParsedAttendanceRow) {
@@ -979,10 +1100,14 @@ function normalizeOptionalTimestamp(value: unknown, label = "Date and time") {
   const text = cleanText(value);
   if (!text) return { value: null as string | null, error: "" };
 
-  const serialDate = isNumericDateCandidate(text)
+  const numericValue = isNumericDateCandidate(text) ? Number(text) : NaN;
+  const unixDate = Number.isFinite(numericValue) && numericValue >= 1_000_000_000
+    ? new Date(numericValue >= 100_000_000_000 ? numericValue : numericValue * 1000)
+    : null;
+  const serialDate = !unixDate && isNumericDateCandidate(text)
     ? parseExcelSerialDate(text)
     : null;
-  const date = serialDate ?? new Date(text);
+  const date = unixDate ?? serialDate ?? new Date(text);
 
   if (Number.isNaN(date.getTime())) {
     return {
@@ -1379,72 +1504,74 @@ async function getAttendanceEventById(client: PoolClient, id: string) {
   return result.rows[0] ?? null;
 }
 
-function getAttendanceEventDateTimeKey(value: unknown) {
-  const normalized = normalizeOptionalTimestamp(value);
-  return normalized.error || !normalized.value
-    ? ""
-    : normalized.value.slice(0, 16);
+function toAttendanceEventMergeCandidate(
+  event: AttendanceEventRecord,
+  match: ReturnType<typeof scoreAttendanceEventIdentity>,
+): AttendanceEventMergeCandidate {
+  return {
+    source: "existing",
+    eventId: event.id,
+    batchFileIndex: null,
+    eventName: event.name,
+    eventStartAt: event.event_start_at,
+    eventEndAt: event.event_end_at,
+    attendeesCount: Number(event.attendees_count ?? 0),
+    score: match.score,
+    confidence: match.confidence,
+    reasons: match.reasons,
+  };
 }
 
-async function findMatchingAttendanceEventFromFile(props: {
+async function rankAttendanceEventCandidates(props: {
   metadata: AttendanceDetectedEventMetadata;
   schoolYearId?: string;
+  client?: PoolClient;
 }) {
-  const eventName = cleanText(props.metadata.eventName);
-  const normalizedEventName = normalizeAttendanceEventName(eventName);
-  const eventStartAtKey = getAttendanceEventDateTimeKey(
-    props.metadata.eventStartAt,
-  );
-  const eventEndAtKey = getAttendanceEventDateTimeKey(props.metadata.eventEndAt);
-
-  if (!eventName && !eventStartAtKey && !eventEndAtKey) return null;
-  if (!props.schoolYearId && eventName && !eventStartAtKey && !eventEndAtKey) {
-    return null;
+  const incomingName = cleanText(props.metadata.eventName);
+  if (!incomingName || !props.schoolYearId) {
+    return [] as AttendanceEventMergeCandidate[];
   }
 
-  const conditions: string[] = [];
-  const values: unknown[] = [];
+  const values: unknown[] = [props.schoolYearId];
+  const conditions: string[] = ["e.school_year_id = $1"];
 
-  if (props.schoolYearId) {
-    values.push(props.schoolYearId);
-    conditions.push(`e.school_year_id = $${values.length}`);
-  }
+  const sql = `
+    SELECT
+      e.*,
+      COUNT(DISTINCT ar.student_id)::INT AS attendees_count
+    FROM attendance_events e
+    LEFT JOIN attendance_records ar
+      ON ar.event_id = e.id
+     AND ar.deleted_at IS NULL
+    ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
+    GROUP BY e.id
+    ORDER BY e.event_order ASC NULLS LAST, e.created_at DESC
+    LIMIT 500
+  `;
+  const result = props.client
+    ? await props.client.query<AttendanceEventRecord>(sql, values)
+    : await query<AttendanceEventRecord>(sql, values);
 
-  const result = await query<AttendanceEventRecord>(
-    `
-      SELECT e.*, 0::INT AS attendees_count
-      FROM attendance_events e
-      ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
-      ORDER BY e.event_order ASC NULLS LAST, e.created_at DESC
-      LIMIT 500
-    `,
-    values,
-  );
-
-  if (!result.rows.length) return null;
-
-  const nameMatchedEvents = eventName
-    ? result.rows.filter(
-        (event) =>
-          normalizeAttendanceEventName(event.name) === normalizedEventName,
-      )
-    : result.rows;
-
-  if (!nameMatchedEvents.length) return null;
-
-  const dateMatchedEvents = nameMatchedEvents.filter((event) => {
-    const startMatches =
-      !eventStartAtKey ||
-      getAttendanceEventDateTimeKey(event.event_start_at) === eventStartAtKey;
-    const endMatches =
-      !eventEndAtKey ||
-      getAttendanceEventDateTimeKey(event.event_end_at) === eventEndAtKey;
-    return startMatches && endMatches;
-  });
-
-  if (dateMatchedEvents.length) return dateMatchedEvents[0];
-  if (eventName) return nameMatchedEvents[0];
-  return nameMatchedEvents.length === 1 ? nameMatchedEvents[0] : null;
+  return result.rows
+    .map((event) => ({
+      event,
+      match: scoreAttendanceEventIdentity(
+        {
+          name: props.metadata.eventName,
+          startAt: props.metadata.eventStartAt,
+          endAt: props.metadata.eventEndAt,
+        },
+        {
+          name: event.name,
+          startAt: event.event_start_at,
+          endAt: event.event_end_at,
+        },
+      ),
+    }))
+    .filter(({ match }) => match.score >= 0.58)
+    .sort((left, right) => right.match.score - left.match.score)
+    .slice(0, 5)
+    .map(({ event, match }) => toAttendanceEventMergeCandidate(event, match));
 }
 
 async function findOrCreateAttendanceEvent(
@@ -1468,7 +1595,7 @@ async function findOrCreateAttendanceEvent(
     eventInput.schoolYearId,
     [eventInput.eventStartAt, eventInput.eventEndAt],
   );
-  const normalizedEventName = normalizeAttendanceEventName(name);
+  const forceCreateEvent = Boolean((input as SaveRowsInput).forceCreateEvent);
 
   const existingResult = await client.query<AttendanceEventRecord>(
     `
@@ -1484,10 +1611,30 @@ async function findOrCreateAttendanceEvent(
     [schoolYearId],
   );
 
-  const existingEvent = existingResult.rows.find(
-    (event) =>
-      normalizeAttendanceEventName(event.name) === normalizedEventName,
-  );
+  const incomingIdentityName = normalizeAttendanceEventIdentityName(name);
+  const rankedExistingEvents = existingResult.rows
+    .map((event) => ({
+      event,
+      match: scoreAttendanceEventIdentity(
+        {
+          name,
+          startAt: eventInput.eventStartAt,
+          endAt: eventInput.eventEndAt,
+        },
+        {
+          name: event.name,
+          startAt: event.event_start_at,
+          endAt: event.event_end_at,
+        },
+      ),
+    }))
+    .sort((left, right) => right.match.score - left.match.score);
+  const existingEvent = forceCreateEvent
+    ? null
+    : rankedExistingEvents.find(({ event, match }) =>
+        normalizeAttendanceEventIdentityName(event.name) === incomingIdentityName ||
+        match.score >= 0.94,
+      )?.event ?? null;
 
   if (existingEvent) return existingEvent;
 
@@ -1518,6 +1665,29 @@ async function findOrCreateAttendanceEvent(
 }
 
 async function upsertStudent(client: PoolClient, row: ParsedAttendanceRow) {
+  const updated = await client.query(
+    `
+      UPDATE students
+      SET name = $2,
+          year_level = COALESCE(NULLIF($3, ''), year_level),
+          college = COALESCE(NULLIF($4, ''), college),
+          program = COALESCE(NULLIF($5, ''), program),
+          institution = COALESCE(NULLIF($6, ''), institution),
+          updated_at = NOW()
+      WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+    `,
+    [
+      row.studentId,
+      row.name,
+      row.yearLevel ?? "",
+      row.college ?? "",
+      row.program ?? "",
+      row.institution ?? "",
+    ],
+  );
+
+  if (updated.rowCount) return;
+
   await client.query(
     `
       INSERT INTO students (student_id, name, year_level, college, program, institution)
@@ -1727,7 +1897,13 @@ function getAttendanceRecordEventRosterCollegeSql(recordAlias: string) {
         LIMIT 1
       ),
       NULLIF(TRIM(${recordAlias}.college), ''),
-      ''
+      CASE
+        WHEN NULLIF(TRIM(${recordAlias}.program), '') IS NOT NULL
+          THEN 'program:' || LOWER(TRIM(${recordAlias}.program))
+        WHEN NULLIF(TRIM(${recordAlias}.institution), '') IS NOT NULL
+          THEN 'institution:' || LOWER(TRIM(${recordAlias}.institution))
+        ELSE 'student:' || LOWER(TRIM(${recordAlias}.student_id))
+      END
     )))
   `;
 }
@@ -2277,11 +2453,11 @@ async function deleteAttendanceImportRecords(
   );
 }
 
-export async function previewAttendanceFile(
+async function previewAttendanceFileBase(
   file: UploadedAttendanceFile,
 ): Promise<AttendancePreviewResult> {
   if (!file?.buffer?.length) {
-    throw createValidationError("Please upload a valid .xlsx file.");
+    throw createValidationError("Please upload a valid .xlsx or .csv file.");
   }
 
   const extension = getFileExtension(file.originalname);
@@ -2295,28 +2471,141 @@ export async function previewAttendanceFile(
 
   if (!preview.rowsValid) {
     throw createValidationError(
-      "No parseable attendance rows were found in the uploaded .xlsx file.",
+      "No parseable attendance rows were found in the uploaded attendance file.",
     );
   }
 
   return preview;
 }
 
-export async function saveAttendanceRows(
-  input: SaveRowsInput,
-): Promise<SavedAttendanceImportResult> {
-  assertAttendanceImportNotCancelled(input);
+async function findSchoolYearIdForAttendancePreview(
+  preview: AttendancePreviewResult,
+) {
+  const metadataSchoolYearId = await findSchoolYearIdFromAttendanceMetadata(
+    preview.detectedEvent.schoolYearLabel,
+  );
+  if (metadataSchoolYearId) return metadataSchoolYearId;
 
-  await emitAttendanceImportProgress(input.onProgress, {
-    stage: "validating",
-    percent: 10,
-    message: input.resumeImportId
-      ? "Validating remaining attendance rows..."
-      : "Validating attendance rows...",
-    processedRows: 0,
-    totalRows: Array.isArray(input.rows) ? input.rows.length : 0,
-  });
+  const timestamp =
+    preview.detectedEvent.eventStartAt ||
+    preview.detectedEvent.eventEndAt ||
+    preview.rows.find((row) => row.scannedAt)?.scannedAt;
+  if (!timestamp) return "";
 
+  const normalized = normalizeOptionalTimestamp(timestamp);
+  if (normalized.error || !normalized.value) return "";
+
+  const result = await query<SchoolYearRecord>(
+    `
+      SELECT *
+      FROM school_years
+      WHERE $1::date BETWEEN starts_at AND ends_at
+      ORDER BY is_active DESC, semester ASC
+      LIMIT 1
+    `,
+    [normalized.value],
+  );
+  return result.rows[0]?.id ?? "";
+}
+
+function getBatchAttendanceCandidate(
+  preview: AttendancePreviewResult,
+  candidatePreview: AttendancePreviewResult,
+  candidateIndex: number,
+): AttendanceEventMergeCandidate | null {
+  const match = scoreAttendanceEventIdentity(
+    {
+      name: preview.detectedEvent.eventName,
+      startAt: preview.detectedEvent.eventStartAt,
+      endAt: preview.detectedEvent.eventEndAt,
+    },
+    {
+      name: candidatePreview.detectedEvent.eventName,
+      startAt: candidatePreview.detectedEvent.eventStartAt,
+      endAt: candidatePreview.detectedEvent.eventEndAt,
+    },
+  );
+  if (match.score < 0.58) return null;
+
+  const attendeesCount = new Set(
+    candidatePreview.rows
+      .filter((row) => !row.errors.length)
+      .map((row) => cleanText(row.studentId).toLowerCase())
+      .filter(Boolean),
+  ).size;
+
+  return {
+    source: "batch",
+    eventId: null,
+    batchFileIndex: candidateIndex,
+    eventName:
+      cleanText(candidatePreview.detectedEvent.eventName) ||
+      getFileNameWithoutExtension(candidatePreview.fileName),
+    eventStartAt: candidatePreview.detectedEvent.eventStartAt,
+    eventEndAt: candidatePreview.detectedEvent.eventEndAt,
+    attendeesCount,
+    score: match.score,
+    confidence: match.confidence,
+    reasons: match.reasons,
+  };
+}
+
+export async function previewAttendanceFiles(
+  files: UploadedAttendanceFile[],
+): Promise<AttendancePreviewResult[]> {
+  const previews = await Promise.all(files.map(previewAttendanceFileBase));
+  const schoolYearIds = await Promise.all(
+    previews.map(findSchoolYearIdForAttendancePreview),
+  );
+
+  await Promise.all(
+    previews.map(async (preview, index) => {
+      const existingCandidates = await rankAttendanceEventCandidates({
+        metadata: preview.detectedEvent,
+        schoolYearId: schoolYearIds[index] || undefined,
+      });
+      const batchCandidates = previews
+        .map((candidatePreview, candidateIndex) => {
+          if (candidateIndex === index) return null;
+          const currentSchoolYearId = schoolYearIds[index];
+          const candidateSchoolYearId = schoolYearIds[candidateIndex];
+          if (
+            currentSchoolYearId &&
+            candidateSchoolYearId &&
+            currentSchoolYearId !== candidateSchoolYearId
+          ) {
+            return null;
+          }
+          return getBatchAttendanceCandidate(
+            preview,
+            candidatePreview,
+            candidateIndex,
+          );
+        })
+        .filter(
+          (candidate): candidate is AttendanceEventMergeCandidate =>
+            Boolean(candidate),
+        );
+
+      preview.detectedEvent.mergeCandidates = [
+        ...existingCandidates,
+        ...batchCandidates,
+      ]
+        .sort((left, right) => right.score - left.score)
+        .slice(0, 8);
+    }),
+  );
+
+  return previews;
+}
+
+export async function previewAttendanceFile(
+  file: UploadedAttendanceFile,
+): Promise<AttendancePreviewResult> {
+  return (await previewAttendanceFiles([file]))[0];
+}
+
+function prepareAttendanceRowsForSave(input: SaveRowsInput) {
   const preview = buildPreview(
     input.fileName ?? "manual-import",
     input.fileType ?? "json",
@@ -2326,7 +2615,7 @@ export async function saveAttendanceRows(
 
   if (!validRows.length) {
     throw createValidationError(
-      "No parseable attendance rows were found in the uploaded .xlsx file.",
+      "No parseable attendance rows were found in the uploaded attendance file.",
     );
   }
 
@@ -2337,15 +2626,14 @@ export async function saveAttendanceRows(
     cleanText(input.resumeImportId) ||
     validRows.some((row) => row.eventName),
   );
-
-  if (!hasExplicitOrRowEventContext && fallbackEventName) {
-    input = { ...input, eventName: fallbackEventName };
-  }
-
+  const resolvedInput =
+    !hasExplicitOrRowEventContext && fallbackEventName
+      ? { ...input, eventName: fallbackEventName }
+      : input;
   const hasEventContext = Boolean(
-    cleanText(input.eventId) ||
-    cleanText(input.eventName) ||
-    cleanText(input.resumeImportId) ||
+    cleanText(resolvedInput.eventId) ||
+    cleanText(resolvedInput.eventName) ||
+    cleanText(resolvedInput.resumeImportId) ||
     validRows.some((row) => row.eventName),
   );
 
@@ -2355,221 +2643,262 @@ export async function saveAttendanceRows(
     );
   }
 
-  const result = await withTransaction(async (client) => {
+  return { input: resolvedInput, preview, validRows };
+}
+
+async function saveAttendanceRowsWithClient(
+  client: PoolClient,
+  originalInput: SaveRowsInput,
+  suppliedPreview?: AttendancePreviewResult,
+): Promise<SavedAttendanceImportResult> {
+  assertAttendanceImportNotCancelled(originalInput);
+  const prepared = suppliedPreview
+    ? {
+        input: originalInput,
+        preview: suppliedPreview,
+        validRows: suppliedPreview.rows.filter((row) => !row.errors.length),
+      }
+    : prepareAttendanceRowsForSave(originalInput);
+  let input = prepared.input;
+  const preview = prepared.preview;
+  const validRows = prepared.validRows;
+
+  if (!validRows.length) {
+    throw createValidationError(
+      "No parseable attendance rows were found in the uploaded attendance file.",
+    );
+  }
+
+  const fallbackEventName = getFileNameWithoutExtension(input.fileName ?? "");
+  if (
+    !cleanText(input.eventId) &&
+    !cleanText(input.eventName) &&
+    !validRows.some((row) => row.eventName) &&
+    fallbackEventName
+  ) {
+    input = { ...input, eventName: fallbackEventName };
+  }
+
+  const existingImport = input.resumeImportId
+    ? await getAttendanceImportById(client, input.resumeImportId)
+    : null;
+
+  if (input.resumeImportId && !existingImport) {
+    throw createValidationError(
+      "The resumable attendance import could not be found. Please start the import again.",
+      404,
+    );
+  }
+
+  const defaultEvent =
+    cleanText(input.eventId) || cleanText(input.eventName)
+      ? await findOrCreateAttendanceEvent(client, input)
+      : existingImport?.event_id
+        ? await getAttendanceEventById(client, existingImport.event_id)
+        : null;
+  const resolvedSchoolYearId =
+    defaultEvent?.school_year_id ??
+    (await resolveSchoolYearId(client, input.schoolYearId, [
+      input.eventStartAt,
+      input.eventEndAt,
+      validRows.find((row) => row.scannedAt)?.scannedAt,
+    ]));
+
+  if (!existingImport) {
+    const duplicateImport = await findDuplicateAttendanceImport(client, {
+      fileName: preview.fileName,
+      schoolYearId: resolvedSchoolYearId,
+      eventId: defaultEvent?.id ?? input.eventId,
+      eventName: defaultEvent?.name ?? input.eventName,
+    });
+
+    if (duplicateImport) {
+      throw createValidationError(
+        `The attendance file "${preview.fileName}" has already been uploaded for this event. Delete the existing uploaded file before uploading it again.`,
+        409,
+      );
+    }
+  }
+
+  const importRecord = existingImport
+    ? (
+        await client.query<AttendanceImportRecord>(
+          `
+            UPDATE attendance_imports
+            SET
+              school_year_id = COALESCE(school_year_id, $6),
+              event_id = COALESCE(event_id, $2),
+              event_name_snapshot = COALESCE(NULLIF(event_name_snapshot, ''), NULLIF($7, '')),
+              uploaded_by = COALESCE(uploaded_by, $8::uuid),
+              rows_total = rows_total + $3,
+              rows_valid = rows_valid + $4,
+              rows_invalid = rows_invalid + $5,
+              status = 'saved'
+            WHERE id = $1
+              AND deleted_at IS NULL
+            RETURNING *
+          `,
+          [
+            existingImport.id,
+            defaultEvent?.id ?? null,
+            preview.rowsTotal,
+            preview.rowsValid,
+            preview.rowsInvalid,
+            resolvedSchoolYearId,
+            defaultEvent?.name ?? input.eventName ?? null,
+            cleanText(input.uploadedBy) || null,
+          ],
+        )
+      ).rows[0]
+    : (
+        await client.query<AttendanceImportRecord>(
+          `
+            INSERT INTO attendance_imports (
+              school_year_id,
+              event_id,
+              event_name_snapshot,
+              uploaded_by,
+              file_name,
+              file_type,
+              rows_total,
+              rows_valid,
+              rows_invalid,
+              status
+            )
+            VALUES ($1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, 'saved')
+            RETURNING *
+          `,
+          [
+            resolvedSchoolYearId,
+            defaultEvent?.id ?? null,
+            defaultEvent?.name ?? input.eventName ?? null,
+            cleanText(input.uploadedBy) || null,
+            preview.fileName,
+            preview.fileType,
+            preview.rowsTotal,
+            preview.rowsValid,
+            preview.rowsInvalid,
+          ],
+        )
+      ).rows[0];
+
+  const importId = importRecord.id;
+  const savedRecordIds: string[] = [];
+  const rowsToSave = mergeAttendanceImportRowsByStudentAndEvent(validRows, input);
+
+  await emitAttendanceImportProgress(input.onProgress, {
+    stage: "saving",
+    percent: 25,
+    message: input.resumeImportId
+      ? "Saving remaining attendance records..."
+      : "Saving attendance records...",
+    processedRows: 0,
+    totalRows: rowsToSave.length,
+    savedRecords: 0,
+  });
+
+  for (const [index, row] of rowsToSave.entries()) {
     assertAttendanceImportNotCancelled(input);
 
-    const existingImport = input.resumeImportId
-      ? await getAttendanceImportById(client, input.resumeImportId)
-      : null;
+    const event = row.eventName && !defaultEvent
+      ? await findOrCreateAttendanceEvent(
+          client,
+          {
+            ...input,
+            eventName: row.eventName,
+            eventStartAt: row.eventStartAt ?? input.eventStartAt,
+            eventEndAt: row.eventEndAt ?? input.eventEndAt,
+          },
+          row.eventName,
+        )
+      : defaultEvent;
 
-    if (input.resumeImportId && !existingImport) {
+    if (!event) {
       throw createValidationError(
-        "The resumable attendance import could not be found. Please start the import again.",
-        404,
+        "Event name is required when saving an uploaded attendance file.",
       );
     }
 
-    const defaultEvent =
-      cleanText(input.eventId) || cleanText(input.eventName)
-        ? await findOrCreateAttendanceEvent(client, input)
-        : existingImport?.event_id
-          ? await getAttendanceEventById(client, existingImport.event_id)
-          : null;
-    const resolvedSchoolYearId =
-      defaultEvent?.school_year_id ??
-      (await resolveSchoolYearId(client, input.schoolYearId, [
-        input.eventStartAt,
-        input.eventEndAt,
-      ]));
-
-    if (!existingImport) {
-      const duplicateImport = await findDuplicateAttendanceImport(client, {
-        fileName: preview.fileName,
-        schoolYearId: resolvedSchoolYearId,
-        eventId: defaultEvent?.id ?? input.eventId,
-        eventName: defaultEvent?.name ?? input.eventName,
-      });
-
-      if (duplicateImport) {
-        throw createValidationError(
-          `The attendance file "${preview.fileName}" has already been uploaded for this event. Delete the existing uploaded file before uploading it again.`,
-          409,
-        );
-      }
-    }
-
-    const importRecord = existingImport
-      ? (
-          await client.query<AttendanceImportRecord>(
-            `
-              UPDATE attendance_imports
-              SET
-                school_year_id = COALESCE(school_year_id, $6),
-                event_id = COALESCE(event_id, $2),
-                event_name_snapshot = COALESCE(NULLIF(event_name_snapshot, ''), NULLIF($7, '')),
-                uploaded_by = COALESCE(uploaded_by, $8::uuid),
-                rows_total = rows_total + $3,
-                rows_valid = rows_valid + $4,
-                rows_invalid = rows_invalid + $5,
-                status = 'saved'
-              WHERE id = $1
-                AND deleted_at IS NULL
-              RETURNING *
-            `,
-            [
-              existingImport.id,
-              defaultEvent?.id ?? null,
-              preview.rowsTotal,
-              preview.rowsValid,
-              preview.rowsInvalid,
-              resolvedSchoolYearId,
-              defaultEvent?.name ?? input.eventName ?? null,
-              cleanText(input.uploadedBy) || null,
-            ],
-          )
-        ).rows[0]
-      : (
-          await client.query<AttendanceImportRecord>(
-            `
-              INSERT INTO attendance_imports (
-                school_year_id,
-                event_id,
-                event_name_snapshot,
-                uploaded_by,
-                file_name,
-                file_type,
-                rows_total,
-                rows_valid,
-                rows_invalid,
-                status
-              )
-              VALUES ($1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, 'saved')
-              RETURNING *
-            `,
-            [
-              resolvedSchoolYearId,
-              defaultEvent?.id ?? null,
-              defaultEvent?.name ?? input.eventName ?? null,
-              cleanText(input.uploadedBy) || null,
-              preview.fileName,
-              preview.fileType,
-              preview.rowsTotal,
-              preview.rowsValid,
-              preview.rowsInvalid,
-            ],
-          )
-        ).rows[0];
-
-    const importId = importRecord.id;
-    const savedRecordIds: string[] = [];
-    const rowsToSave = mergeAttendanceImportRowsByStudentAndEvent(
-      validRows,
-      input,
+    await upsertStudent(client, row);
+    const record = await insertAttendanceRecord(
+      client,
+      importId,
+      event.id,
+      event.school_year_id ?? importRecord.school_year_id,
+      row,
     );
+    savedRecordIds.push(record.id);
 
     await emitAttendanceImportProgress(input.onProgress, {
       stage: "saving",
-      percent: 25,
+      percent: getAttendanceRowSaveProgressPercent(index + 1, rowsToSave.length),
       message: input.resumeImportId
         ? "Saving remaining attendance records..."
         : "Saving attendance records...",
-      processedRows: 0,
-      totalRows: rowsToSave.length,
-      savedRecords: 0,
-    });
-
-    for (const [index, row] of rowsToSave.entries()) {
-      assertAttendanceImportNotCancelled(input);
-
-      const event = row.eventName
-        ? await findOrCreateAttendanceEvent(
-            client,
-            {
-              ...input,
-              eventName: row.eventName,
-              eventStartAt: row.eventStartAt ?? input.eventStartAt,
-              eventEndAt: row.eventEndAt ?? input.eventEndAt,
-            },
-            row.eventName,
-          )
-        : defaultEvent;
-
-      if (!event) {
-        throw createValidationError(
-          "Event name is required when saving an uploaded attendance file.",
-        );
-      }
-
-      await upsertStudent(client, row);
-      const record = await insertAttendanceRecord(
-        client,
-        importId,
-        event.id,
-        event.school_year_id ?? importRecord.school_year_id,
-        row,
-      );
-      savedRecordIds.push(record.id);
-
-      await emitAttendanceImportProgress(input.onProgress, {
-        stage: "saving",
-        percent: getAttendanceRowSaveProgressPercent(
-          index + 1,
-          rowsToSave.length,
-        ),
-        message: input.resumeImportId
-          ? "Saving remaining attendance records..."
-          : "Saving attendance records...",
-        processedRows: index + 1,
-        totalRows: rowsToSave.length,
-        savedRecords: savedRecordIds.length,
-      });
-    }
-
-    assertAttendanceImportNotCancelled(input);
-
-    await emitAttendanceImportProgress(input.onProgress, {
-      stage: "syncing",
-      percent: 90,
-      message: "Syncing absences and fines...",
-      processedRows: rowsToSave.length,
+      processedRows: index + 1,
       totalRows: rowsToSave.length,
       savedRecords: savedRecordIds.length,
     });
+  }
 
-    const synced = await syncAbsencesForAttendanceRecordIds(
-      client,
-      savedRecordIds,
-    );
-    const savedRecords = await listRecordsByIds(client, savedRecordIds);
-
-    await refreshAttendanceFinalResultsWithClient(client, {
-      schoolYearId: importRecord.school_year_id ?? undefined,
-      importId,
-    });
-
-    await refreshPenaltyResultsForSchoolYearWithClient(
-      client,
-      importRecord.school_year_id ?? undefined,
-    );
-
-    await emitAttendanceImportProgress(input.onProgress, {
-      stage: "syncing",
-      percent: 96,
-      message: "Finalizing attendance import...",
-      processedRows: rowsToSave.length,
-      totalRows: rowsToSave.length,
-      savedRecords: savedRecords.length,
-      createdFines: synced.fines.length,
-    });
-
-    return {
-      ...preview,
-      importId,
-      event: defaultEvent,
-      savedRecords,
-      createdFines: synced.fines,
-    };
+  assertAttendanceImportNotCancelled(input);
+  await emitAttendanceImportProgress(input.onProgress, {
+    stage: "syncing",
+    percent: 90,
+    message: "Syncing absences and fines...",
+    processedRows: rowsToSave.length,
+    totalRows: rowsToSave.length,
+    savedRecords: savedRecordIds.length,
   });
+
+  const synced = await syncAbsencesForAttendanceRecordIds(client, savedRecordIds);
+  const savedRecords = await listRecordsByIds(client, savedRecordIds);
+  const schoolYearId = importRecord.school_year_id ?? undefined;
+
+  await refreshAttendanceFinalResultsWithClient(client, {
+    schoolYearId,
+    importId,
+  });
+  await refreshCalculationResultsWithClient(client, { schoolYearId });
+  await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
+
+  await emitAttendanceImportProgress(input.onProgress, {
+    stage: "syncing",
+    percent: 96,
+    message: "Finalizing attendance import...",
+    processedRows: rowsToSave.length,
+    totalRows: rowsToSave.length,
+    savedRecords: savedRecords.length,
+    createdFines: synced.fines.length,
+  });
+
+  return {
+    ...preview,
+    importId,
+    event: defaultEvent,
+    savedRecords,
+    createdFines: synced.fines,
+  };
+}
+
+export async function saveAttendanceRows(
+  input: SaveRowsInput,
+): Promise<SavedAttendanceImportResult> {
+  assertAttendanceImportNotCancelled(input);
+  await emitAttendanceImportProgress(input.onProgress, {
+    stage: "validating",
+    percent: 10,
+    message: input.resumeImportId
+      ? "Validating remaining attendance rows..."
+      : "Validating attendance rows...",
+    processedRows: 0,
+    totalRows: Array.isArray(input.rows) ? input.rows.length : 0,
+  });
+
+  const prepared = prepareAttendanceRowsForSave(input);
+  const result = await withTransaction((client) =>
+    saveAttendanceRowsWithClient(client, prepared.input, prepared.preview),
+  );
 
   await emitAttendanceImportProgress(input.onProgress, {
     stage: "completed",
@@ -2582,8 +2911,230 @@ export async function saveAttendanceRows(
     savedRecords: result.savedRecords.length,
     createdFines: result.createdFines.length,
   });
-
   return result;
+}
+
+export type AttendanceFileSaveOption = Omit<
+  SaveRowsInput,
+  "rows" | "fileName" | "fileType" | "onProgress"
+> & {
+  index?: number;
+  fileName?: string;
+};
+
+export type AttendanceBatchSaveResult = {
+  files: Array<{
+    fileName: string;
+    status: "saved";
+    error: null;
+    result: SavedAttendanceImportResult;
+  }>;
+  filesSaved: number;
+  filesFailed: number;
+  recordsSaved: number;
+  finesCreated: number;
+};
+
+function hasUnresolvedAttendanceMergeCandidate(
+  preview: AttendancePreviewResult,
+  index: number,
+  option: AttendanceFileSaveOption,
+) {
+  if (
+    option.forceCreateEvent ||
+    cleanText(option.eventId) ||
+    cleanText(option.mergeIntoEventId) ||
+    Number.isInteger(option.mergeIntoBatchIndex)
+  ) {
+    return false;
+  }
+
+  return Boolean(
+    preview.detectedEvent.mergeCandidates?.some(
+      (candidate) =>
+        candidate.confidence !== "low" &&
+        (candidate.source === "existing" ||
+          (candidate.source === "batch" &&
+            candidate.batchFileIndex !== null &&
+            candidate.batchFileIndex < index)),
+    ),
+  );
+}
+
+async function applyAttendanceMergeMetadataChoice(
+  client: PoolClient,
+  event: AttendanceEventRecord,
+  preview: AttendancePreviewResult,
+  option: AttendanceFileSaveOption,
+) {
+  const incomingName = cleanText(preview.detectedEvent.eventName);
+  const incomingStartAt = preview.detectedEvent.eventStartAt;
+  const incomingEndAt = preview.detectedEvent.eventEndAt;
+  const keepIncomingName = option.keepEventName === "incoming" && incomingName;
+  const keepIncomingSchedule = option.keepEventSchedule === "incoming";
+
+  if (!keepIncomingName && !keepIncomingSchedule) return event;
+
+  const result = await client.query<AttendanceEventRecord>(
+    `
+      UPDATE attendance_events
+      SET name = CASE WHEN $2::BOOLEAN THEN $3 ELSE name END,
+          event_start_at = CASE WHEN $4::BOOLEAN THEN $5::timestamptz ELSE event_start_at END,
+          event_end_at = CASE WHEN $4::BOOLEAN THEN $6::timestamptz ELSE event_end_at END,
+          updated_at = NOW()
+      WHERE id = $1
+      RETURNING *, 0::INT AS attendees_count
+    `,
+    [
+      event.id,
+      Boolean(keepIncomingName),
+      incomingName || event.name,
+      keepIncomingSchedule,
+      incomingStartAt,
+      incomingEndAt,
+    ],
+  );
+  return result.rows[0] ?? event;
+}
+
+export async function saveAttendanceFiles(
+  files: UploadedAttendanceFile[],
+  fileOptions: AttendanceFileSaveOption[] = [],
+  onProgress?: AttendanceImportProgressCallback,
+): Promise<AttendanceBatchSaveResult> {
+  if (!files.length) {
+    throw createValidationError("Please upload at least one attendance file.");
+  }
+
+  const previews = await previewAttendanceFiles(files);
+  const options = files.map((file, index) => {
+    const matching = fileOptions.find(
+      (option) =>
+        option.index === index ||
+        (cleanText(option.fileName) && cleanText(option.fileName) === file.originalname),
+    );
+    return matching ?? {};
+  });
+
+  previews.forEach((preview, index) => {
+    if (hasUnresolvedAttendanceMergeCandidate(preview, index, options[index])) {
+      throw createValidationError(
+        `The event detected in "${preview.fileName}" looks like an existing or earlier batch event. Confirm whether to merge it or create a separate event before saving.`,
+        409,
+      );
+    }
+  });
+
+  return withTransaction(async (client) => {
+    await lockAttendanceAbsenceSync(client);
+    const savedEvents = new Map<number, AttendanceEventRecord>();
+    const savedFiles: AttendanceBatchSaveResult["files"] = [];
+
+    for (const [index, file] of files.entries()) {
+      const preview = previews[index];
+      const option = options[index];
+      const detectedSchoolYearId =
+        cleanText(option.schoolYearId) ||
+        (await findSchoolYearIdForAttendancePreview(preview));
+      const earlierBatchEvent = Number.isInteger(option.mergeIntoBatchIndex)
+        ? savedEvents.get(Number(option.mergeIntoBatchIndex)) ?? null
+        : null;
+
+      if (Number.isInteger(option.mergeIntoBatchIndex) && !earlierBatchEvent) {
+        throw createValidationError(
+          `The merge target for "${file.originalname}" must be an earlier file in the same batch.`,
+        );
+      }
+
+      let selectedEvent: AttendanceEventRecord | null = null;
+      if (cleanText(option.mergeIntoEventId)) {
+        selectedEvent = await getAttendanceEventById(
+          client,
+          cleanText(option.mergeIntoEventId),
+        );
+        if (!selectedEvent) {
+          throw createValidationError("Selected merge event was not found.", 404);
+        }
+      } else if (earlierBatchEvent) {
+        selectedEvent = earlierBatchEvent;
+      } else if (cleanText(option.eventId)) {
+        selectedEvent = await getAttendanceEventById(client, cleanText(option.eventId));
+        if (!selectedEvent) {
+          throw createValidationError("Selected attendance event was not found.", 404);
+        }
+      }
+
+      if (selectedEvent) {
+        selectedEvent = await applyAttendanceMergeMetadataChoice(
+          client,
+          selectedEvent,
+          preview,
+          option,
+        );
+      }
+
+      const input: SaveRowsInput = {
+        ...option,
+        uploadedBy: option.uploadedBy,
+        schoolYearId:
+          (selectedEvent?.school_year_id ?? detectedSchoolYearId) || undefined,
+        eventId: selectedEvent?.id || undefined,
+        eventName:
+          selectedEvent?.name ||
+          cleanText(option.eventName) ||
+          cleanText(preview.detectedEvent.eventName) ||
+          getFileNameWithoutExtension(file.originalname),
+        eventStartAt:
+          selectedEvent?.event_start_at
+            ? cleanText(selectedEvent.event_start_at)
+            : option.eventStartAt || preview.detectedEvent.eventStartAt || undefined,
+        eventEndAt:
+          selectedEvent?.event_end_at
+            ? cleanText(selectedEvent.event_end_at)
+            : option.eventEndAt || preview.detectedEvent.eventEndAt || undefined,
+        forceCreateEvent: Boolean(option.forceCreateEvent && !selectedEvent),
+        fileName: preview.fileName,
+        fileType: preview.fileType,
+        rows: preview.rows,
+        isCancelled: option.isCancelled,
+        onProgress: onProgress
+          ? async (progress) => {
+              const percent = Math.round(
+                ((index + progress.percent / 100) / files.length) * 100,
+              );
+              await onProgress({
+                ...progress,
+                percent,
+                message: `${file.originalname}: ${progress.message}`,
+              });
+            }
+          : undefined,
+      };
+
+      const result = await saveAttendanceRowsWithClient(client, input, preview);
+      if (result.event) savedEvents.set(index, result.event);
+      savedFiles.push({
+        fileName: file.originalname,
+        status: "saved",
+        error: null,
+        result,
+      });
+    }
+
+    return {
+      files: savedFiles,
+      filesSaved: savedFiles.length,
+      filesFailed: 0,
+      recordsSaved: savedFiles.reduce(
+        (total, item) => total + item.result.savedRecords.length,
+        0,
+      ),
+      finesCreated: savedFiles.reduce(
+        (total, item) => total + item.result.createdFines.length,
+        0,
+      ),
+    };
+  });
 }
 
 export async function saveAttendanceFile(
@@ -2591,73 +3142,12 @@ export async function saveAttendanceFile(
   options: Omit<SaveRowsInput, "rows" | "fileName" | "fileType"> = {},
   onProgress?: AttendanceImportProgressCallback,
 ): Promise<SavedAttendanceImportResult> {
-  assertAttendanceImportNotCancelled(options);
-
-  await emitAttendanceImportProgress(onProgress ?? options.onProgress, {
-    stage: "parsing",
-    percent: 5,
-    message: "Reading uploaded attendance file...",
-    processedRows: 0,
-    totalRows: 0,
-  });
-
-  const preview = await previewAttendanceFile(file);
-
-  assertAttendanceImportNotCancelled(options);
-
-  await emitAttendanceImportProgress(onProgress ?? options.onProgress, {
-    stage: "validating",
-    percent: 15,
-    message: "Preparing parsed attendance rows...",
-    processedRows: 0,
-    totalRows: preview.rows.length,
-  });
-
-  const hasRequestedEventContext = Boolean(
-    cleanText(options.eventId) || cleanText(options.eventName),
+  const batch = await saveAttendanceFiles(
+    [file],
+    [{ ...options, index: 0, fileName: file.originalname }],
+    onProgress ?? options.onProgress,
   );
-  let resolvedOptions = options;
-
-  if (!hasRequestedEventContext) {
-    const detectedSchoolYearId = cleanText(options.schoolYearId)
-      ? cleanText(options.schoolYearId)
-      : await findSchoolYearIdFromAttendanceMetadata(
-          preview.detectedEvent.schoolYearLabel,
-        );
-    const matchedEvent = await findMatchingAttendanceEventFromFile({
-      metadata: preview.detectedEvent,
-      schoolYearId: detectedSchoolYearId || undefined,
-    });
-    const fallbackEventName = getFileNameWithoutExtension(file.originalname);
-
-    resolvedOptions = {
-      ...options,
-      schoolYearId:
-        detectedSchoolYearId || matchedEvent?.school_year_id || undefined,
-      eventId: matchedEvent?.id || undefined,
-      eventName:
-        preview.detectedEvent.eventName ||
-        matchedEvent?.name ||
-        fallbackEventName ||
-        undefined,
-      eventStartAt:
-        preview.detectedEvent.eventStartAt ||
-        cleanOptionalText(matchedEvent?.event_start_at) ||
-        undefined,
-      eventEndAt:
-        preview.detectedEvent.eventEndAt ||
-        cleanOptionalText(matchedEvent?.event_end_at) ||
-        undefined,
-    };
-  }
-
-  return saveAttendanceRows({
-    ...resolvedOptions,
-    onProgress: onProgress ?? resolvedOptions.onProgress,
-    fileName: preview.fileName,
-    fileType: preview.fileType,
-    rows: preview.rows,
-  });
+  return batch.files[0].result;
 }
 
 function getManualAttendanceType(input: RawImportRow) {
@@ -3264,7 +3754,6 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
           remarks = NULLIF($12, ''),
           updated_at = NOW()
         WHERE id = $1
-          AND deleted_at IS NULL
         RETURNING *
       `,
       [
@@ -4119,6 +4608,310 @@ export async function getAttendanceImportDeleteImpact(
   });
 }
 
+export type AttendanceEventDuplicateGroup = {
+  schoolYearId: string | null;
+  score: number;
+  confidence: "high" | "medium" | "low";
+  reasons: string[];
+  events: AttendanceEventRecord[];
+};
+
+export type AttendanceEventMergeImpact = {
+  targetEvent: AttendanceEventRecord;
+  sourceEvents: AttendanceEventRecord[];
+  movedCounts: {
+    attendanceRecords: number;
+    attendanceImports: number;
+    manualAttendanceRecords: number;
+    attendanceRequestEvents: number;
+  };
+  affectedStudents: number;
+};
+
+export async function listAttendanceEventDuplicateGroups(
+  schoolYearId?: string,
+) {
+  const events = await listAttendanceEvents(500, 0, schoolYearId);
+  const groups: AttendanceEventDuplicateGroup[] = [];
+  const paired = new Set<string>();
+
+  for (let leftIndex = 0; leftIndex < events.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < events.length; rightIndex += 1) {
+      const left = events[leftIndex];
+      const right = events[rightIndex];
+      if (left.school_year_id !== right.school_year_id) continue;
+
+      const match = scoreAttendanceEventIdentity(
+        { name: left.name, startAt: left.event_start_at, endAt: left.event_end_at },
+        { name: right.name, startAt: right.event_start_at, endAt: right.event_end_at },
+      );
+      if (match.score < 0.66) continue;
+
+      const key = [left.id, right.id].sort().join(":");
+      if (paired.has(key)) continue;
+      paired.add(key);
+      groups.push({
+        schoolYearId: left.school_year_id,
+        score: match.score,
+        confidence: match.confidence,
+        reasons: match.reasons,
+        events: [left, right],
+      });
+    }
+  }
+
+  return groups.sort((left, right) => right.score - left.score);
+}
+
+async function getAttendanceEventMergeImpactWithClient(
+  client: PoolClient,
+  targetEventId: string,
+  sourceEventIds: string[],
+): Promise<AttendanceEventMergeImpact> {
+  const targetEvent = await getAttendanceEventById(client, targetEventId);
+  if (!targetEvent) throw createValidationError("Target attendance event not found.", 404);
+
+  const sources = uniqueCleanTextValues(sourceEventIds).filter(
+    (eventId) => eventId !== targetEventId,
+  );
+  if (!sources.length) {
+    throw createValidationError("At least one source attendance event is required.");
+  }
+
+  const sourceResult = await client.query<AttendanceEventRecord>(
+    `
+      SELECT e.*,
+        COUNT(DISTINCT ar.student_id)::INT AS attendees_count
+      FROM attendance_events e
+      LEFT JOIN attendance_records ar ON ar.event_id = e.id AND ar.deleted_at IS NULL
+      WHERE e.id = ANY($1::uuid[])
+      GROUP BY e.id
+      ORDER BY e.event_order ASC NULLS LAST, e.created_at ASC
+    `,
+    [sources],
+  );
+  if (sourceResult.rows.length !== sources.length) {
+    throw createValidationError("One or more source attendance events were not found.", 404);
+  }
+  if (
+    sourceResult.rows.some(
+      (event) => event.school_year_id !== targetEvent.school_year_id,
+    )
+  ) {
+    throw createValidationError("Attendance events can only be merged within the same school year.");
+  }
+
+  const countResult = await client.query<{
+    attendance_records: number;
+    attendance_imports: number;
+    manual_attendance_records: number;
+    attendance_request_events: number;
+    affected_students: number;
+  }>(
+    `
+      SELECT
+        (SELECT COUNT(*)::INT FROM attendance_records WHERE event_id = ANY($1::uuid[])) AS attendance_records,
+        (SELECT COUNT(*)::INT FROM attendance_imports WHERE event_id = ANY($1::uuid[])) AS attendance_imports,
+        (SELECT COUNT(*)::INT FROM manual_attendance_records WHERE event_id = ANY($1::uuid[])) AS manual_attendance_records,
+        (SELECT COUNT(*)::INT FROM attendance_request_events WHERE event_id = ANY($1::uuid[])) AS attendance_request_events,
+        (SELECT COUNT(DISTINCT LOWER(TRIM(student_id)))::INT
+          FROM attendance_records
+          WHERE event_id = ANY($2::uuid[]) AND deleted_at IS NULL) AS affected_students
+    `,
+    [sources, [targetEventId, ...sources]],
+  );
+  const counts = countResult.rows[0];
+
+  return {
+    targetEvent,
+    sourceEvents: sourceResult.rows,
+    movedCounts: {
+      attendanceRecords: Number(counts?.attendance_records ?? 0),
+      attendanceImports: Number(counts?.attendance_imports ?? 0),
+      manualAttendanceRecords: Number(counts?.manual_attendance_records ?? 0),
+      attendanceRequestEvents: Number(counts?.attendance_request_events ?? 0),
+    },
+    affectedStudents: Number(counts?.affected_students ?? 0),
+  };
+}
+
+export async function getAttendanceEventMergeImpact(
+  targetEventId: string,
+  sourceEventIds: string[],
+) {
+  return withTransaction((client) =>
+    getAttendanceEventMergeImpactWithClient(client, targetEventId, sourceEventIds),
+  );
+}
+
+export async function mergeAttendanceEvents(input: {
+  targetEventId: string;
+  sourceEventIds: string[];
+  mergedBy?: string;
+  targetName?: string;
+  targetEventStartAt?: string | null;
+  targetEventEndAt?: string | null;
+}) {
+  return withTransaction(async (client) => {
+    await lockAttendanceAbsenceSync(client);
+    const impact = await getAttendanceEventMergeImpactWithClient(
+      client,
+      cleanText(input.targetEventId),
+      input.sourceEventIds,
+    );
+    const sourceIds = impact.sourceEvents.map((event) => event.id);
+    const allEventIds = [impact.targetEvent.id, ...sourceIds];
+    const studentResult = await client.query<{ student_id: string }>(
+      `
+        SELECT DISTINCT student_id
+        FROM attendance_records
+        WHERE event_id = ANY($1::uuid[])
+          AND deleted_at IS NULL
+      `,
+      [allEventIds],
+    );
+    const rosterCollegeKeys = await getAttendanceEventRosterCollegeKeys(
+      client,
+      allEventIds,
+    );
+
+    const targetName = cleanText(input.targetName) || impact.targetEvent.name;
+    const targetStartAt =
+      input.targetEventStartAt === undefined
+        ? impact.targetEvent.event_start_at
+        : input.targetEventStartAt;
+    const targetEndAt =
+      input.targetEventEndAt === undefined
+        ? impact.targetEvent.event_end_at
+        : input.targetEventEndAt;
+
+    await client.query(
+      `
+        UPDATE attendance_events
+        SET name = $2,
+            event_start_at = $3::timestamptz,
+            event_end_at = $4::timestamptz,
+            updated_at = NOW()
+        WHERE id = $1
+      `,
+      [impact.targetEvent.id, targetName, targetStartAt, targetEndAt],
+    );
+
+    for (const sourceEvent of impact.sourceEvents) {
+      const sourceCounts = await client.query<{
+        attendance_records: number;
+        attendance_imports: number;
+        manual_attendance_records: number;
+        attendance_request_events: number;
+      }>(
+        `
+          SELECT
+            (SELECT COUNT(*)::INT FROM attendance_records WHERE event_id = $1) AS attendance_records,
+            (SELECT COUNT(*)::INT FROM attendance_imports WHERE event_id = $1) AS attendance_imports,
+            (SELECT COUNT(*)::INT FROM manual_attendance_records WHERE event_id = $1) AS manual_attendance_records,
+            (SELECT COUNT(*)::INT FROM attendance_request_events WHERE event_id = $1) AS attendance_request_events
+        `,
+        [sourceEvent.id],
+      );
+      const moved = sourceCounts.rows[0];
+      await client.query(
+        `
+          INSERT INTO attendance_event_merges (
+            school_year_id,
+            target_event_id,
+            source_event_id,
+            target_snapshot,
+            source_snapshot,
+            moved_counts,
+            merged_by
+          )
+          VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7::uuid)
+        `,
+        [
+          impact.targetEvent.school_year_id,
+          impact.targetEvent.id,
+          sourceEvent.id,
+          JSON.stringify({ ...impact.targetEvent, name: targetName, event_start_at: targetStartAt, event_end_at: targetEndAt }),
+          JSON.stringify(sourceEvent),
+          JSON.stringify({
+            attendanceRecords: Number(moved?.attendance_records ?? 0),
+            attendanceImports: Number(moved?.attendance_imports ?? 0),
+            manualAttendanceRecords: Number(moved?.manual_attendance_records ?? 0),
+            attendanceRequestEvents: Number(moved?.attendance_request_events ?? 0),
+          }),
+          cleanText(input.mergedBy) || null,
+        ],
+      );
+    }
+
+    await client.query(
+      `UPDATE attendance_records SET event_id = $1, updated_at = NOW() WHERE event_id = ANY($2::uuid[])`,
+      [impact.targetEvent.id, sourceIds],
+    );
+    await client.query(
+      `
+        UPDATE attendance_imports
+        SET event_id = $1,
+            event_name_snapshot = COALESCE(NULLIF(event_name_snapshot, ''), $3),
+            needs_reattachment = FALSE
+        WHERE event_id = ANY($2::uuid[])
+      `,
+      [impact.targetEvent.id, sourceIds, targetName],
+    );
+    await client.query(
+      `UPDATE manual_attendance_records SET event_id = $1, updated_at = NOW() WHERE event_id = ANY($2::uuid[])`,
+      [impact.targetEvent.id, sourceIds],
+    );
+    await client.query(
+      `
+        DELETE FROM attendance_request_events source
+        WHERE source.event_id = ANY($2::uuid[])
+          AND EXISTS (
+            SELECT 1
+            FROM attendance_request_events target
+            WHERE target.request_id = source.request_id
+              AND target.event_id = $1
+          )
+      `,
+      [impact.targetEvent.id, sourceIds],
+    );
+    await client.query(
+      `
+        UPDATE attendance_request_events
+        SET event_id = $1,
+            event_name = $3
+        WHERE event_id = ANY($2::uuid[])
+      `,
+      [impact.targetEvent.id, sourceIds, targetName],
+    );
+    await client.query(`DELETE FROM attendance_events WHERE id = ANY($1::uuid[])`, [sourceIds]);
+    await resequenceAttendanceEvents(client, impact.targetEvent.school_year_id);
+
+    const studentIds = uniqueCleanTextValues(
+      studentResult.rows.map((row) => row.student_id),
+    );
+    const currentScopeStudents = await getAttendanceStudentIdsByEventRosterCollegeKeys(
+      client,
+      rosterCollegeKeys,
+    );
+    await syncAbsencesForStudents(client, [
+      ...studentIds,
+      ...currentScopeStudents,
+    ]);
+    const schoolYearId = impact.targetEvent.school_year_id ?? undefined;
+    await refreshAttendanceFinalResultsWithClient(client, { schoolYearId });
+    await refreshCalculationResultsWithClient(client, { schoolYearId });
+    await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
+
+    const targetEvent = await getAttendanceEventById(client, impact.targetEvent.id);
+    return {
+      ...impact,
+      targetEvent: targetEvent ?? impact.targetEvent,
+      sourceEventIds: sourceIds,
+    };
+  });
+}
+
 export async function listAttendanceEvents(
   limit = 100,
   offset = 0,
@@ -4344,6 +5137,10 @@ export async function deleteAttendanceEvent(id: string) {
       client,
       eventRosterCollegeKeys,
     );
+    const schoolYearId = existing.school_year_id ?? undefined;
+    await refreshAttendanceFinalResultsWithClient(client, { schoolYearId });
+    await refreshCalculationResultsWithClient(client, { schoolYearId });
+    await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
 
     return existing;
   });
