@@ -88,7 +88,7 @@ async function runSeeders() {
       seeder: seedFrcAttendees,
     },
   ] as const;
-  const totalSeeders = seeders.length;
+  const totalSeeders: number = seeders.length;
 
   consoleUi.header(
     "🌱",
