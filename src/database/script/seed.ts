@@ -3,7 +3,7 @@ import "dotenv/config";
 import { seedPenalties } from "../seeder/penalties.seeder";
 import { seedUser } from "../seeder/users.seeder";
 import { seedParticipants } from "../seeder/participants.seeder";
-import { seedFrcAttendees } from "../seeder/frc-attendees.seeder";
+import { seedFrcManualAttendees } from "../seeder/frc-manual-attendees.seeder";
 import { closeDatabasePool } from "../../lib/db";
 import { consoleUi, formatDuration } from "./console-ui";
 
@@ -83,9 +83,9 @@ async function runSeeders() {
     },
     {
       icon: "🏳️",
-      label: "September 1 FRC attendees",
-      processing: "Checking bundled attendee files, resolving the event and syncing attendance",
-      seeder: seedFrcAttendees,
+      label: "September 1 FRC manual attendees",
+      processing: "Parsing bundled attendee files and syncing manual attendance only",
+      seeder: seedFrcManualAttendees,
     },
   ] as const;
   const totalSeeders: number = seeders.length;
@@ -100,7 +100,7 @@ async function runSeeders() {
   consoleUi.detail("1", "Default user account");
   consoleUi.detail("2", "Penalty configuration");
   consoleUi.detail("3", "Optional participants source from SEED_PARTICIPANTS_PATH");
-  consoleUi.detail("4", "Bundled September 1 FRC attendee data");
+  consoleUi.detail("4", "Bundled September 1 FRC attendee data as manual attendance");
 
   consoleUi.section("⚙️", "Processing seeders");
   consoleUi.info("The active line stays visible and updates elapsed time until each seeder finishes.");
@@ -156,16 +156,17 @@ async function runSeeders() {
   }
 
   if (frcAttendeesResult.alreadySeeded) {
-    consoleUi.skipped("September 1 FRC attendees are already seeded — no changes needed.");
+    consoleUi.skipped("September 1 FRC manual attendees are already seeded — no changes needed.");
   } else {
     consoleUi.success(
-      `Seeded ${frcAttendeesResult.seededImports} FRC import(s) and ${frcAttendeesResult.seededAttendanceRecords} attendance record(s).`,
+      `Created ${frcAttendeesResult.manualAttendanceRecordsCreated} manual attendance record(s) and soft-deleted ${frcAttendeesResult.legacyImportsSoftDeleted} legacy seed import(s).`,
       frcAttendeesRun.durationMs,
     );
-    consoleUi.detail("No-QR attendees inserted", frcAttendeesResult.seededNoQrAttendees);
-    if (frcAttendeesResult.skippedNoStudentId > 0) {
+    consoleUi.detail("Scanner rows parsed", frcAttendeesResult.scannerRowsParsed);
+    consoleUi.detail("No-QR rows parsed", frcAttendeesResult.noQrRowsParsed);
+    if (frcAttendeesResult.unresolvedAttendees.length > 0) {
       consoleUi.warning(
-        `Skipped ${frcAttendeesResult.skippedNoStudentId} no-QR attendee(s) without a student ID.`,
+        `Could not safely resolve ${frcAttendeesResult.unresolvedAttendees.length} attendee(s) with a missing or placeholder student ID: ${frcAttendeesResult.unresolvedAttendees.join(", ")}`,
       );
     }
   }
