@@ -93,6 +93,7 @@ const PORT = Number(process.env.PORT ?? 3000);
 const DEFAULT_FRONTEND_ORIGINS = [
   "http://localhost:5173",
   "http://localhost:8081",
+  "https://penalyze.jrmsu-tc.online",
 ];
 
 function normalizeOrigin(value: string) {
