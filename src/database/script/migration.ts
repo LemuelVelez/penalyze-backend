@@ -49,13 +49,27 @@ async function registerMigration(filename: string) {
 async function runMigrations() {
   const startedAt = Date.now();
   const migrationsDir = path.resolve(process.cwd(), "src/database/migration");
-  const files = (await fs.readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
 
   consoleUi.header(
     "🗃️",
     "DATABASE MIGRATIONS",
-    `Penalyze • ${files.length} migration file${files.length === 1 ? "" : "s"} discovered`,
+    "Penalyze • safe, ordered and transaction-wrapped schema updates",
   );
+
+  const discoveryTask = consoleUi.task("Discovering migration files", {
+    detail: migrationsDir,
+  });
+  let files: string[];
+  try {
+    files = (await fs.readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
+    discoveryTask.succeed(
+      "Migration files discovered",
+      `${files.length} SQL file${files.length === 1 ? "" : "s"}`,
+    );
+  } catch (error) {
+    discoveryTask.fail("Unable to read migration directory");
+    throw error;
+  }
 
   if (!files.length) {
     consoleUi.warning("No SQL migration files were found.");
@@ -63,19 +77,40 @@ async function runMigrations() {
     return;
   }
 
-  const tableStartedAt = Date.now();
-  await ensureMigrationsTable();
-  consoleUi.success(`Migration registry ready: ${MIGRATIONS_TABLE}`, Date.now() - tableStartedAt);
+  const registryTask = consoleUi.task("Preparing migration registry", {
+    detail: MIGRATIONS_TABLE,
+  });
+  try {
+    await ensureMigrationsTable();
+    registryTask.succeed("Migration registry ready", MIGRATIONS_TABLE);
+  } catch (error) {
+    registryTask.fail("Migration registry could not be prepared", MIGRATIONS_TABLE);
+    throw error;
+  }
 
+  consoleUi.section("🔎", "Checking migration state");
+  const stateTask = consoleUi.task("Comparing migration files with database history", {
+    detail: `0/${files.length} checked`,
+  });
   const pendingFiles: string[] = [];
   let alreadyAppliedCount = 0;
 
-  for (const file of files) {
-    if (await isMigrationApplied(file)) {
-      alreadyAppliedCount += 1;
-    } else {
-      pendingFiles.push(file);
+  try {
+    for (const [index, file] of files.entries()) {
+      stateTask.update(`Checking ${file}`, `${index + 1}/${files.length} checked`);
+      if (await isMigrationApplied(file)) {
+        alreadyAppliedCount += 1;
+      } else {
+        pendingFiles.push(file);
+      }
     }
+    stateTask.succeed(
+      "Migration state checked",
+      `${alreadyAppliedCount} applied • ${pendingFiles.length} pending`,
+    );
+  } catch (error) {
+    stateTask.fail("Unable to read migration history");
+    throw error;
   }
 
   consoleUi.summary([
@@ -94,32 +129,56 @@ async function runMigrations() {
   }
 
   consoleUi.section("🚀", "Applying pending migrations");
+  consoleUi.info("Each migration runs inside its own transaction and is registered only after success.");
 
   let appliedCount = 0;
 
   for (const [index, file] of pendingFiles.entries()) {
-    const migrationStartedAt = Date.now();
-    consoleUi.progress(index + 1, pendingFiles.length, file);
-    const sql = await fs.readFile(path.join(migrationsDir, file), "utf8");
-
-    await query("BEGIN");
+    const prefix = `[${String(index + 1).padStart(String(pendingFiles.length).length, "0")}/${pendingFiles.length}]`;
+    const migrationTask = consoleUi.task(file, {
+      prefix,
+      detail: "Reading SQL file",
+    });
 
     try {
+      const sql = await fs.readFile(path.join(migrationsDir, file), "utf8");
+      const statementCount = sql
+        .split(";")
+        .map((statement) => statement.trim())
+        .filter(Boolean).length;
+
+      migrationTask.update(file, `Opening transaction • ~${statementCount} SQL statement${statementCount === 1 ? "" : "s"}`);
+      await query("BEGIN");
+
+      migrationTask.update(file, "Executing SQL changes");
       await query(sql);
+
+      migrationTask.update(file, "Recording migration in schema_migrations");
       await registerMigration(file);
+
+      migrationTask.update(file, "Committing transaction");
       await query("COMMIT");
+
       appliedCount += 1;
-      consoleUi.success(`Applied ${file}`, Date.now() - migrationStartedAt);
+      migrationTask.succeed(file, `${statementCount} statement${statementCount === 1 ? "" : "s"} committed`);
     } catch (error) {
-      await query("ROLLBACK");
-      consoleUi.warning(`Rolled back ${file} after an error.`);
+      migrationTask.update(file, "Error detected • rolling back transaction");
+      try {
+        await query("ROLLBACK");
+        migrationTask.fail(file, "Transaction rolled back — no partial migration kept");
+      } catch (rollbackError) {
+        migrationTask.fail(file, "Migration failed and rollback also reported an error");
+        consoleUi.warning(
+          `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
       throw error;
     }
   }
 
   consoleUi.summary([
     { label: "Applied this run", value: appliedCount, tone: "success" },
-    { label: "Skipped", value: alreadyAppliedCount, tone: "info" },
+    { label: "Already applied", value: alreadyAppliedCount, tone: "info" },
     { label: "Total migrations", value: files.length, tone: "info" },
     { label: "Elapsed", value: formatDuration(Date.now() - startedAt), tone: "success" },
   ]);

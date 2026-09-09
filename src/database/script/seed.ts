@@ -14,48 +14,101 @@ type SeederRun<T> = {
   result: T;
 };
 
+type SeederDefinition<T> = {
+  icon: string;
+  label: string;
+  processing: string;
+  seeder: (onProgress: (message: string) => void) => Promise<T>;
+};
+
 async function runSeeder<T>(
   index: number,
   total: number,
-  icon: string,
-  label: string,
-  seeder: () => Promise<T>,
+  definition: SeederDefinition<T>,
 ): Promise<SeederRun<T>> {
   const startedAt = Date.now();
-  consoleUi.progress(index, total, `${icon}  ${label}`);
-  const result = await seeder();
-  const durationMs = Date.now() - startedAt;
-  consoleUi.success(`${label} finished`, durationMs);
-  return { label, icon, durationMs, result };
+  const prefix = `[${String(index).padStart(String(total).length, "0")}/${total}]`;
+  const task = consoleUi.task(`${definition.icon}  ${definition.label}`, {
+    prefix,
+    detail: definition.processing,
+  });
+
+  try {
+    const result = await definition.seeder((message) => {
+      task.update(`${definition.icon}  ${definition.label}`, message);
+    });
+    const durationMs = Date.now() - startedAt;
+    task.succeed(`${definition.icon}  ${definition.label}`, "Seeder completed without errors");
+    return {
+      label: definition.label,
+      icon: definition.icon,
+      durationMs,
+      result,
+    };
+  } catch (error) {
+    task.fail(
+      `${definition.icon}  ${definition.label}`,
+      error instanceof Error ? error.message : "Seeder failed",
+    );
+    throw error;
+  }
 }
 
 async function runSeeders() {
   const startedAt = Date.now();
-  const totalSeeders = 4;
+  const seeders = [
+    {
+      icon: "👤",
+      label: "Default user",
+      processing: "Checking account state and creating the default user only when missing",
+      seeder: async (onProgress: (message: string) => void) => {
+        onProgress("Querying the users table for the configured default account");
+        return seedUser();
+      },
+    },
+    {
+      icon: "⚖️",
+      label: "Penalties",
+      processing: "Comparing configured penalties with stored penalty rows",
+      seeder: async (onProgress: (message: string) => void) => {
+        onProgress("Querying penalty rows and inserting only missing defaults");
+        return seedPenalties();
+      },
+    },
+    {
+      icon: "🎓",
+      label: "Participants & attendance",
+      processing: "Checking source path, parsing files and syncing attendance imports",
+      seeder: seedParticipants,
+    },
+    {
+      icon: "🏳️",
+      label: "September 1 FRC attendees",
+      processing: "Checking bundled attendee files, resolving the event and syncing attendance",
+      seeder: seedFrcAttendees,
+    },
+  ] as const;
+  const totalSeeders = seeders.length;
 
   consoleUi.header(
     "🌱",
     "DATABASE SEEDERS",
-    `Penalyze • preparing ${totalSeeders} deterministic seeders`,
+    `Penalyze • ${totalSeeders} idempotent seed step${totalSeeders === 1 ? "" : "s"} • safe to run repeatedly`,
   );
-  consoleUi.section("⚙️", "Running seed pipeline");
 
-  const userRun = await runSeeder(1, totalSeeders, "👤", "Default user", seedUser);
-  const penaltiesRun = await runSeeder(2, totalSeeders, "⚖️", "Penalties", seedPenalties);
-  const participantsRun = await runSeeder(
-    3,
-    totalSeeders,
-    "🎓",
-    "Participants & attendance",
-    seedParticipants,
-  );
-  const frcAttendeesRun = await runSeeder(
-    4,
-    totalSeeders,
-    "🏳️",
-    "September 1 FRC attendees",
-    seedFrcAttendees,
-  );
+  consoleUi.section("🧭", "Seed pipeline");
+  consoleUi.detail("1", "Default user account");
+  consoleUi.detail("2", "Penalty configuration");
+  consoleUi.detail("3", "Optional participants source from SEED_PARTICIPANTS_PATH");
+  consoleUi.detail("4", "Bundled September 1 FRC attendee data");
+
+  consoleUi.section("⚙️", "Processing seeders");
+  consoleUi.info("The active line stays visible and updates elapsed time until each seeder finishes.");
+
+  const userRun = await runSeeder(1, totalSeeders, seeders[0]);
+  const penaltiesRun = await runSeeder(2, totalSeeders, seeders[1]);
+  const participantsRun = await runSeeder(3, totalSeeders, seeders[2]);
+  const frcAttendeesRun = await runSeeder(4, totalSeeders, seeders[3]);
 
   const userResult = userRun.result;
   const penaltiesResult = penaltiesRun.result;
@@ -72,13 +125,13 @@ async function runSeeders() {
   if (userResult.alreadySeeded) {
     consoleUi.skipped("Default user already exists — no changes needed.");
   } else {
-    consoleUi.success(`Created default user: ${userResult.email}`);
+    consoleUi.success(`Created default user: ${userResult.email}`, userRun.durationMs);
   }
 
   if (penaltiesResult.alreadySeeded) {
     consoleUi.skipped("Penalties are already seeded — no changes needed.");
   } else {
-    consoleUi.success(`Seeded ${penaltiesResult.seededCount} penalties.`);
+    consoleUi.success(`Seeded ${penaltiesResult.seededCount} penalties.`, penaltiesRun.durationMs);
   }
 
   if (participantsResult.skipped) {
@@ -91,12 +144,14 @@ async function runSeeders() {
     consoleUi.skipped("Participants and attendance are already seeded — no changes needed.");
   } else {
     consoleUi.success(
-      `Seeded ${participantsResult.seededImports} import(s) and ${participantsResult.seededAttendanceRecords} attendance record(s).`,
+      `Seeded ${participantsResult.seededImports} participant import(s) and ${participantsResult.seededAttendanceRecords} attendance record(s).`,
+      participantsRun.durationMs,
     );
+    if (participantsResult.sourcePath) {
+      consoleUi.detail("Source", participantsResult.sourcePath);
+    }
     if (participantsResult.seededStudentsWithoutQr > 0) {
-      consoleUi.info(
-        `Included ${participantsResult.seededStudentsWithoutQr} participant(s) recorded without a QR scan.`,
-      );
+      consoleUi.detail("No-QR participants", participantsResult.seededStudentsWithoutQr);
     }
   }
 
@@ -105,12 +160,9 @@ async function runSeeders() {
   } else {
     consoleUi.success(
       `Seeded ${frcAttendeesResult.seededImports} FRC import(s) and ${frcAttendeesResult.seededAttendanceRecords} attendance record(s).`,
+      frcAttendeesRun.durationMs,
     );
-    if (frcAttendeesResult.seededNoQrAttendees > 0) {
-      consoleUi.info(
-        `Included ${frcAttendeesResult.seededNoQrAttendees} attendee(s) from the no-QR list.`,
-      );
-    }
+    consoleUi.detail("No-QR attendees inserted", frcAttendeesResult.seededNoQrAttendees);
     if (frcAttendeesResult.skippedNoStudentId > 0) {
       consoleUi.warning(
         `Skipped ${frcAttendeesResult.skippedNoStudentId} no-QR attendee(s) without a student ID.`,

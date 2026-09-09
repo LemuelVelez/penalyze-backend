@@ -151,7 +151,10 @@ async function getExistingImports(fileNames: string[]) {
   return result.rows;
 }
 
-export async function seedParticipants(): Promise<SeederResult> {
+export async function seedParticipants(
+  onProgress?: (message: string) => void,
+): Promise<SeederResult> {
+  onProgress?.("Checking SEED_PARTICIPANTS_PATH configuration");
   const sourcePath = clean(process.env.SEED_PARTICIPANTS_PATH);
   if (!sourcePath || !fs.existsSync(sourcePath)) {
     return {
@@ -164,6 +167,7 @@ export async function seedParticipants(): Promise<SeederResult> {
     };
   }
 
+  onProgress?.("Reading participant source files");
   const entries = readSourceEntries(sourcePath);
   const attendanceEntries = entries.filter((entry) =>
     [".xlsx", ".csv"].includes(path.extname(entry.name).toLowerCase()),
@@ -177,6 +181,7 @@ export async function seedParticipants(): Promise<SeederResult> {
     ...attendanceEntries.map((entry) => path.basename(entry.name)),
     ...noQrEntries.map((entry) => path.basename(entry.name)),
   ];
+  onProgress?.(`Checking ${importFileNames.length} import file name(s) against attendance history`);
   const existingImports = await getExistingImports(importFileNames);
   const existingNames = new Set(
     existingImports.map((record) => record.file_name.trim().toLowerCase()),
@@ -207,6 +212,7 @@ export async function seedParticipants(): Promise<SeederResult> {
 
   if (missingAttendanceEntries.length) {
     const files = missingAttendanceEntries.map(toUploadedFile);
+    onProgress?.(`Previewing ${files.length} attendance file(s) and resolving event identity`);
     const previews = await previewAttendanceFiles(files);
     const existingCandidateEventId = previews
       .flatMap((preview) => preview.detectedEvent.mergeCandidates ?? [])
@@ -226,6 +232,7 @@ export async function seedParticipants(): Promise<SeederResult> {
       keepEventName: "incoming" as const,
       keepEventSchedule: index === 0 ? ("incoming" as const) : ("existing" as const),
     }));
+    onProgress?.(`Saving ${files.length} attendance import(s) in one atomic batch`);
     const batch = await saveAttendanceFiles(files, fileOptions);
     seededImports += batch.filesSaved;
     seededAttendanceRecords += batch.recordsSaved;
@@ -233,12 +240,14 @@ export async function seedParticipants(): Promise<SeederResult> {
   }
 
   if (!targetEventId) {
+    onProgress?.("Resolving the target attendance event from saved imports");
     const refreshedImports = await getExistingImports(importFileNames);
     targetEventId = refreshedImports.find((record) => record.event_id)?.event_id ?? null;
   }
 
   let seededStudentsWithoutQr = 0;
-  for (const entry of missingNoQrEntries) {
+  for (const [index, entry] of missingNoQrEntries.entries()) {
+    onProgress?.(`Processing no-QR attendee list ${index + 1}/${missingNoQrEntries.length}: ${path.basename(entry.name)}`);
     const rows = parseNoQrRows(entry);
     if (!rows.length || !targetEventId) continue;
     const result = await saveAttendanceRows({
@@ -252,6 +261,8 @@ export async function seedParticipants(): Promise<SeederResult> {
     seededAttendanceRecords += result.savedRecords.length;
     seededStudentsWithoutQr += result.savedRecords.length;
   }
+
+  onProgress?.("Participant attendance sync finished");
 
   return {
     alreadySeeded: false,

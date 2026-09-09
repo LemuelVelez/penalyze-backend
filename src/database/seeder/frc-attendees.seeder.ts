@@ -117,9 +117,13 @@ async function getExistingImports(): Promise<ExistingImport[]> {
   return result.rows;
 }
 
-export async function seedFrcAttendees(): Promise<SeedFrcAttendeesResult> {
+export async function seedFrcAttendees(
+  onProgress?: (message: string) => void,
+): Promise<SeedFrcAttendeesResult> {
+  onProgress?.("Verifying bundled September 1 FRC fixture files");
   assertFixtureFilesExist();
 
+  onProgress?.("Checking existing FRC imports and target event");
   const existingImports = await getExistingImports();
   const existingFileNames = new Set(
     existingImports.map((record) => record.file_name.trim().toLowerCase()),
@@ -145,6 +149,7 @@ export async function seedFrcAttendees(): Promise<SeedFrcAttendeesResult> {
   let seededAttendanceRecords = 0;
 
   if (missingScannerFiles.length) {
+    onProgress?.(`Reading ${missingScannerFiles.length} scanner attendance file(s)`);
     const files = missingScannerFiles.map(toUploadedFile);
     const fileOptions: AttendanceFileSaveOption[] = files.map(
       (file, index) => ({
@@ -159,6 +164,7 @@ export async function seedFrcAttendees(): Promise<SeedFrcAttendeesResult> {
       }),
     );
 
+    onProgress?.(`Saving ${files.length} scanner import(s) and merging them into one FRC event`);
     const batch = await saveAttendanceFiles(files, fileOptions);
     seededImports += batch.filesSaved;
     seededAttendanceRecords += batch.recordsSaved;
@@ -166,6 +172,7 @@ export async function seedFrcAttendees(): Promise<SeedFrcAttendeesResult> {
   }
 
   if (!targetEventId) {
+    onProgress?.("Resolving FRC event from existing import history");
     const refreshedImports = await getExistingImports();
     targetEventId =
       refreshedImports.find((record) => record.event_id)?.event_id ?? null;
@@ -175,6 +182,7 @@ export async function seedFrcAttendees(): Promise<SeedFrcAttendeesResult> {
   let skippedNoStudentId = 0;
 
   if (shouldSeedNoQr) {
+    onProgress?.("Parsing attendees recorded without QR scans");
     if (!targetEventId) {
       throw new Error(
         "Unable to resolve the September 1 Flag Raising Ceremony event for no-QR attendees.",
@@ -184,6 +192,7 @@ export async function seedFrcAttendees(): Promise<SeedFrcAttendeesResult> {
     const parsed = parseNoQrAttendees();
     skippedNoStudentId = parsed.skippedNoStudentId;
 
+    onProgress?.(`Saving ${parsed.rows.length} no-QR attendee record(s) to the FRC event`);
     const result = await saveAttendanceRows({
       eventId: targetEventId,
       eventName: FRC_EVENT_NAME,
@@ -196,6 +205,8 @@ export async function seedFrcAttendees(): Promise<SeedFrcAttendeesResult> {
     seededAttendanceRecords += result.savedRecords.length;
     seededNoQrAttendees = result.savedRecords.length;
   }
+
+  onProgress?.("FRC attendee attendance and absence sync finished");
 
   return {
     alreadySeeded: false,
