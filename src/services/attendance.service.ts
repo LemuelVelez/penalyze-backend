@@ -8,6 +8,7 @@ import {
   AttendanceEventMergeCandidate,
   AttendanceFinalResultRecord,
   AttendanceImportProgress,
+  AttendanceImportReconciliation,
   AttendanceImportRecord,
   AttendancePreviewResult,
   CalculationResultRecord,
@@ -180,6 +181,7 @@ async function emitAttendanceImportProgress(
     totalRows: Math.max(0, Math.round(progress.totalRows ?? 0)),
     savedRecords: Math.max(0, Math.round(progress.savedRecords ?? 0)),
     createdFines: Math.max(0, Math.round(progress.createdFines ?? 0)),
+    stageCounts: progress.stageCounts,
   });
 }
 
@@ -647,7 +649,9 @@ function normalizeImportRows(
   return rows.map((inputRow, index) => {
     const raw = (inputRow as ParsedAttendanceRow).raw ?? inputRow;
     const rowNumber = Number(
-      (inputRow as ParsedAttendanceRow).rowNumber ?? index + 2,
+      (inputRow as ParsedAttendanceRow).rowNumber ??
+        (raw as Record<string, unknown>).__rowNumber ??
+        index + 2,
     );
 
     const eventName = cleanText(
@@ -840,14 +844,17 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
       }) as unknown[][];
       const studentHeaderRowIndex =
         findAttendanceStudentHeaderRowIndex(worksheetRows);
-      const rows = XLSX.utils.sheet_to_json(worksheet, {
+      const rows = (XLSX.utils.sheet_to_json(worksheet, {
         defval: "",
         raw: false,
         blankrows: false,
         ...(studentHeaderRowIndex >= 0
           ? { range: studentHeaderRowIndex }
           : {}),
-      }) as RawImportRow[];
+      }) as RawImportRow[]).map((row, index) => ({
+        ...row,
+        __rowNumber: (studentHeaderRowIndex >= 0 ? studentHeaderRowIndex : 0) + index + 2,
+      }));
 
       return {
         sheetName,
@@ -884,14 +891,17 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
       findAttendanceStudentHeaderRowIndex(worksheetRows);
 
     return {
-      rawRows: XLSX.utils.sheet_to_json(worksheet, {
+      rawRows: (XLSX.utils.sheet_to_json(worksheet, {
         defval: "",
         raw: false,
         blankrows: false,
         ...(studentHeaderRowIndex >= 0
           ? { range: studentHeaderRowIndex }
           : {}),
-      }) as RawImportRow[],
+      }) as RawImportRow[]).map((row, index) => ({
+        ...row,
+        __rowNumber: (studentHeaderRowIndex >= 0 ? studentHeaderRowIndex : 0) + index + 2,
+      })),
       detectedEvent: detectAttendanceWorksheetMetadata(
         worksheetRows,
         studentHeaderRowIndex,
@@ -1072,50 +1082,95 @@ function getAttendanceRowMergeKey(
   return `${normalizeHeader(eventKey)}:${normalizeHeader(collegeKey)}:${cleanText(row.studentId).toLowerCase()}`;
 }
 
-function mergeAttendanceImportRowsByStudentAndEvent(
+type AttendanceRowMergeResult = {
+  rows: ParsedAttendanceRow[];
+  mergedRows: AttendanceImportReconciliation["rowsMerged"];
+  conflictInvalidRows: AttendanceImportReconciliation["rowsInvalid"];
+};
+
+export function mergeAttendanceImportRowsByStudentAndEvent(
   rows: ParsedAttendanceRow[],
   input: SaveRowsInput,
-) {
-  const mergedRows = new Map<string, ParsedAttendanceRow>();
+): AttendanceRowMergeResult {
+  const groupedRows = new Map<string, ParsedAttendanceRow[]>();
 
   rows.forEach((row) => {
     const key = getAttendanceRowMergeKey(row, input);
-    const current = mergedRows.get(key);
+    groupedRows.set(key, [...(groupedRows.get(key) ?? []), row]);
+  });
 
-    if (!current) {
-      mergedRows.set(key, { ...row });
+  const outputRows: ParsedAttendanceRow[] = [];
+  const mergedRows: AttendanceImportReconciliation["rowsMerged"] = [];
+  const conflictInvalidRows: AttendanceImportReconciliation["rowsInvalid"] = [];
+
+  groupedRows.forEach((group, key) => {
+    const names = Array.from(
+      new Set(group.map((row) => cleanText(row.name)).filter(Boolean)),
+    );
+    const sourceRowNumbers = group
+      .map((row) => row.rowNumber)
+      .sort((a, b) => a - b);
+    const normalizedNames = new Set(
+      names.map((name) => normalizeHeader(name)).filter(Boolean),
+    );
+    const conflict = normalizedNames.size > 1;
+
+    if (conflict) {
+      group.forEach((row) => {
+        conflictInvalidRows.push({
+          rowNumber: row.rowNumber,
+          studentId: row.studentId,
+          name: row.name,
+          errors: [
+            `Conflicting names share Student ID ${row.studentId} for the same event. Review source rows ${sourceRowNumbers.join(", ")}.`,
+          ],
+        });
+      });
       return;
     }
 
-    const currentTime = getParsedAttendanceRowTime(current);
-    const rowTime = getParsedAttendanceRowTime(row);
-    const latestRow = rowTime >= currentTime ? row : current;
-    const oldestRow = latestRow === row ? current : row;
-    const remarks = Array.from(
-      new Set([current.remarks, row.remarks].map(cleanText).filter(Boolean)),
-    ).join("; ");
+    if (group.length > 1) {
+      mergedRows.push({
+        mergeKey: key,
+        studentId: cleanText(group[0]?.studentId),
+        names,
+        sourceRowNumbers,
+      });
+    }
 
-    mergedRows.set(key, {
-      ...current,
-      eventName:
-        latestRow.eventName || oldestRow.eventName || current.eventName,
-      eventStartAt: latestRow.eventStartAt || oldestRow.eventStartAt,
-      eventEndAt: latestRow.eventEndAt || oldestRow.eventEndAt,
-      scannedAt: latestRow.scannedAt || oldestRow.scannedAt,
-      studentId: latestRow.studentId || oldestRow.studentId,
-      name: latestRow.name || oldestRow.name,
-      yearLevel: latestRow.yearLevel || oldestRow.yearLevel,
-      college: latestRow.college || oldestRow.college,
-      program: latestRow.program || oldestRow.program,
-      institution: latestRow.institution || oldestRow.institution,
-      noOfAbsences: Math.max(current.noOfAbsences ?? 0, row.noOfAbsences ?? 0),
-      remarks,
-      raw: { ...current.raw, ...row.raw },
-      errors: [],
+    let merged = { ...group[0] };
+    group.slice(1).forEach((row) => {
+      const currentTime = getParsedAttendanceRowTime(merged);
+      const rowTime = getParsedAttendanceRowTime(row);
+      const latestRow = rowTime >= currentTime ? row : merged;
+      const oldestRow = latestRow === row ? merged : row;
+      const remarks = Array.from(
+        new Set([merged.remarks, row.remarks].map(cleanText).filter(Boolean)),
+      ).join("; ");
+
+      merged = {
+        ...merged,
+        eventName: latestRow.eventName || oldestRow.eventName || merged.eventName,
+        eventStartAt: latestRow.eventStartAt || oldestRow.eventStartAt,
+        eventEndAt: latestRow.eventEndAt || oldestRow.eventEndAt,
+        scannedAt: latestRow.scannedAt || oldestRow.scannedAt,
+        studentId: latestRow.studentId || oldestRow.studentId,
+        name: latestRow.name || oldestRow.name,
+        yearLevel: latestRow.yearLevel || oldestRow.yearLevel,
+        college: latestRow.college || oldestRow.college,
+        program: latestRow.program || oldestRow.program,
+        institution: latestRow.institution || oldestRow.institution,
+        noOfAbsences: Math.max(merged.noOfAbsences ?? 0, row.noOfAbsences ?? 0),
+        remarks,
+        raw: { ...merged.raw, ...row.raw },
+        errors: [],
+      };
     });
+
+    outputRows.push(merged);
   });
 
-  return Array.from(mergedRows.values());
+  return { rows: outputRows, mergedRows, conflictInvalidRows };
 }
 
 function createValidationError(message: string, statusCode = 400) {
@@ -1915,7 +1970,7 @@ type AttendanceRecordWithEventRosterScope = AttendanceRecord & {
   attendance_school_year_id: string | null;
 };
 
-function getAttendanceRecordEventRosterCollegeSql(recordAlias: string) {
+export function getAttendanceRecordEventRosterCollegeSql(recordAlias: string) {
   return `
     LOWER(TRIM(COALESCE(
       (
@@ -1957,7 +2012,7 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
       AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
   )
 `;
-const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
+export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
   event_roster_scope AS (
     SELECT DISTINCT
       ar.school_year_id,
@@ -2470,7 +2525,7 @@ async function deleteAttendanceImportRecords(
   await recomputeAttendanceAfterImportVisibilityChange(client, context);
 }
 
-async function previewAttendanceFileBase(
+export async function previewAttendanceFileBase(
   file: UploadedAttendanceFile,
 ): Promise<AttendancePreviewResult> {
   if (!file?.buffer?.length) {
@@ -2801,7 +2856,35 @@ async function saveAttendanceRowsWithClient(
 
   const importId = importRecord.id;
   const savedRecordIds: string[] = [];
-  const rowsToSave = mergeAttendanceImportRowsByStudentAndEvent(validRows, input);
+  const validationInvalidRows: AttendanceImportReconciliation["rowsInvalid"] = preview.rows
+    .filter((row) => row.errors.length > 0)
+    .map((row) => ({
+      rowNumber: row.rowNumber,
+      studentId: row.studentId,
+      name: row.name,
+      errors: row.errors,
+    }));
+  const mergeResult = mergeAttendanceImportRowsByStudentAndEvent(validRows, input);
+  const rowsToSave = mergeResult.rows;
+  if (mergeResult.conflictInvalidRows.length) {
+    await client.query(
+      `
+        UPDATE attendance_imports
+        SET rows_valid = GREATEST(0, rows_valid - $2),
+            rows_invalid = rows_invalid + $2
+        WHERE id = $1
+      `,
+      [importId, mergeResult.conflictInvalidRows.length],
+    );
+  }
+  const stageCounts = {
+    parsed: preview.rowsTotal,
+    normalized: preview.rows.length,
+    valid: validRows.length,
+    merged: rowsToSave.length,
+    saved: 0,
+    distinctFinalResults: 0,
+  };
 
   await emitAttendanceImportProgress(input.onProgress, {
     stage: "saving",
@@ -2812,6 +2895,7 @@ async function saveAttendanceRowsWithClient(
     processedRows: 0,
     totalRows: rowsToSave.length,
     savedRecords: 0,
+    stageCounts,
   });
 
   for (const [index, row] of rowsToSave.entries()) {
@@ -2855,6 +2939,7 @@ async function saveAttendanceRowsWithClient(
       processedRows: index + 1,
       totalRows: rowsToSave.length,
       savedRecords: savedRecordIds.length,
+      stageCounts: { ...stageCounts, saved: savedRecordIds.length },
     });
   }
 
@@ -2866,6 +2951,7 @@ async function saveAttendanceRowsWithClient(
     processedRows: rowsToSave.length,
     totalRows: rowsToSave.length,
     savedRecords: savedRecordIds.length,
+    stageCounts: { ...stageCounts, saved: savedRecordIds.length },
   });
 
   const synced = await syncAbsencesForAttendanceRecordIds(client, savedRecordIds);
@@ -2879,6 +2965,40 @@ async function saveAttendanceRowsWithClient(
   await refreshCalculationResultsWithClient(client, { schoolYearId });
   await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
 
+  const normalizedStudentIds = Array.from(
+    new Set(rowsToSave.map((row) => cleanText(row.studentId).toLowerCase()).filter(Boolean)),
+  );
+  const distinctFinalResults = normalizedStudentIds.length
+    ? Number(
+        (
+          await client.query<{ count: string }>(
+            `
+              SELECT COUNT(*)::TEXT AS count
+              FROM attendance_final_results afr
+              WHERE afr.school_year_id IS NOT DISTINCT FROM $1::uuid
+                AND LOWER(TRIM(afr.student_id)) = ANY($2::text[])
+                AND ${getAttendanceFinalResultVisibilitySql("afr")}
+            `,
+            [schoolYearId ?? null, normalizedStudentIds],
+          )
+        ).rows[0]?.count ?? 0,
+      )
+    : 0;
+  const finalStageCounts = {
+    ...stageCounts,
+    saved: savedRecords.length,
+    distinctFinalResults,
+  };
+  const reconciliation: AttendanceImportReconciliation = {
+    rowsInSource: preview.rowsTotal,
+    rowsInvalid: [...validationInvalidRows, ...mergeResult.conflictInvalidRows].sort(
+      (left, right) => left.rowNumber - right.rowNumber,
+    ),
+    rowsMerged: mergeResult.mergedRows,
+    rowsSaved: savedRecords.length,
+    stageCounts: finalStageCounts,
+  };
+
   await emitAttendanceImportProgress(input.onProgress, {
     stage: "syncing",
     percent: 96,
@@ -2887,6 +3007,7 @@ async function saveAttendanceRowsWithClient(
     totalRows: rowsToSave.length,
     savedRecords: savedRecords.length,
     createdFines: synced.fines.length,
+    stageCounts: finalStageCounts,
   });
 
   return {
@@ -2895,6 +3016,7 @@ async function saveAttendanceRowsWithClient(
     event: defaultEvent,
     savedRecords,
     createdFines: synced.fines,
+    reconciliation,
   };
 }
 
@@ -2927,6 +3049,7 @@ export async function saveAttendanceRows(
     totalRows: result.savedRecords.length,
     savedRecords: result.savedRecords.length,
     createdFines: result.createdFines.length,
+    stageCounts: result.reconciliation.stageCounts,
   });
   return result;
 }

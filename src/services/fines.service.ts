@@ -14,6 +14,8 @@ import {
   getAttendanceRecordVisibilitySql,
 } from "./attendance-result-visibility";
 import {
+  ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL,
+  getAttendanceRecordEventRosterCollegeSql,
   refreshCalculationResults,
   refreshPenaltyResultsForSchoolYearWithClient,
 } from "./attendance.service";
@@ -876,7 +878,7 @@ export async function listPenaltyResults(
     clauses.push(`LOWER(TRIM(pr.student_id)) = LOWER(TRIM($${params.length}))`);
   }
 
-  params.push(options.limit ?? 100);
+  params.push(options.limit ?? 5000);
   const limitPosition = params.length;
 
   params.push(options.offset ?? 0);
@@ -886,8 +888,18 @@ export async function listPenaltyResults(
     `
       SELECT
         pr.*,
-        COALESCE(afr.college, cr.college, mar.college) AS college,
-        COALESCE(afr.program, cr.program, mar.program) AS program,
+        COALESCE(
+          NULLIF(TRIM(afr.college), ''),
+          NULLIF(TRIM(cr.college), ''),
+          NULLIF(TRIM(mar.college), ''),
+          NULLIF(TRIM(scope_student.college), '')
+        ) AS college,
+        COALESCE(
+          NULLIF(TRIM(afr.program), ''),
+          NULLIF(TRIM(cr.program), ''),
+          NULLIF(TRIM(mar.program), ''),
+          NULLIF(TRIM(scope_student.program), '')
+        ) AS program,
         COALESCE(manual_event.event_order, calculation_event.event_order) AS event_order,
         COALESCE(manual_event.event_start_at, calculation_event.event_start_at, afr.latest_scanned_at) AS event_start_at,
         COALESCE(manual_event.event_end_at, calculation_event.event_end_at, afr.latest_scanned_at) AS event_end_at
@@ -902,6 +914,12 @@ export async function listPenaltyResults(
         ON pr.source_table = 'manual_attendance_records'
         AND mar.id = pr.source_record_id
       LEFT JOIN attendance_events manual_event ON manual_event.id = mar.event_id
+      LEFT JOIN LATERAL (
+        SELECT student.college, student.program
+        FROM students student
+        WHERE LOWER(TRIM(student.student_id)) = LOWER(TRIM(pr.student_id))
+        LIMIT 1
+      ) scope_student ON TRUE
       LEFT JOIN LATERAL (
         SELECT
           MIN(ae.event_order) AS event_order,
@@ -930,6 +948,210 @@ export async function listPenaltyResults(
   );
 
   return result.rows;
+}
+
+
+export async function listPenaltyResultColleges(schoolYearId?: string) {
+  const params: unknown[] = [];
+  const clauses = [
+    `EXISTS (
+      SELECT 1
+      FROM attendance_final_results current_result
+      WHERE current_result.school_year_id IS NOT DISTINCT FROM pr.school_year_id
+        AND LOWER(TRIM(current_result.student_id)) = LOWER(TRIM(pr.student_id))
+        AND current_result.total_absences > 0
+        AND ${getAttendanceFinalResultVisibilitySql("current_result")}
+    )`,
+    `(
+      pr.source_table <> 'attendance_final_results'
+      OR ${getAttendanceFinalResultVisibilitySql("afr")}
+    )`,
+    `(
+      pr.source_table <> 'calculation_results'
+      OR NOT EXISTS (
+        SELECT 1
+        FROM attendance_imports hidden_import
+        WHERE hidden_import.id = ANY(COALESCE(cr.import_ids, ARRAY[]::uuid[]))
+          AND hidden_import.deleted_at IS NOT NULL
+      )
+    )`,
+  ];
+
+  if (schoolYearId) {
+    params.push(schoolYearId);
+    clauses.push(`pr.school_year_id = $${params.length}`);
+  }
+
+  const result = await query<{ college: string | null }>(
+    `
+      SELECT DISTINCT resolved.college
+      FROM penalty_results pr
+      LEFT JOIN attendance_final_results afr
+        ON pr.source_table = 'attendance_final_results'
+        AND afr.id = pr.source_record_id
+      LEFT JOIN calculation_results cr
+        ON pr.source_table = 'calculation_results'
+        AND cr.id = pr.source_record_id
+      LEFT JOIN manual_attendance_records mar
+        ON pr.source_table = 'manual_attendance_records'
+        AND mar.id = pr.source_record_id
+      LEFT JOIN LATERAL (
+        SELECT student.college
+        FROM students student
+        WHERE LOWER(TRIM(student.student_id)) = LOWER(TRIM(pr.student_id))
+        LIMIT 1
+      ) scope_student ON TRUE
+      CROSS JOIN LATERAL (
+        SELECT COALESCE(
+          NULLIF(TRIM(afr.college), ''),
+          NULLIF(TRIM(cr.college), ''),
+          NULLIF(TRIM(mar.college), ''),
+          NULLIF(TRIM(scope_student.college), '')
+        ) AS college
+      ) resolved
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY resolved.college ASC NULLS LAST
+    `,
+    params,
+  );
+
+  return result.rows.map((row) => row.college);
+}
+
+export type PenaltyResultAbsentEvents = {
+  studentId: string;
+  name: string;
+  college: string | null;
+  totalAbsences: number;
+  absentEvents: Array<{
+    eventId: string | null;
+    eventName: string;
+    eventOrder: number | null;
+    eventStartAt: string | null;
+    eventEndAt: string | null;
+    source: "roster" | "manual" | "imported_count";
+  }>;
+  unattributedAbsences: number;
+};
+
+export async function getPenaltyResultAbsentEvents(
+  penaltyResultId: string,
+): Promise<PenaltyResultAbsentEvents | null> {
+  const studentCollegeScopeSql = getAttendanceRecordEventRosterCollegeSql("afr");
+  const result = await query<{
+    student_id: string;
+    name: string;
+    college: string | null;
+    no_of_absences: number;
+    event_id: string | null;
+    event_name: string | null;
+    event_order: number | null;
+    event_start_at: Date | string | null;
+    event_end_at: Date | string | null;
+  }>(
+    `
+      WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
+      target AS (
+        SELECT
+          pr.school_year_id,
+          pr.student_id,
+          pr.name,
+          pr.no_of_absences,
+          COALESCE(
+            NULLIF(TRIM(afr.college), ''),
+            (
+              SELECT NULLIF(TRIM(scope_student.college), '')
+              FROM students scope_student
+              WHERE LOWER(TRIM(scope_student.student_id)) = LOWER(TRIM(pr.student_id))
+              LIMIT 1
+            )
+          ) AS college,
+          ${studentCollegeScopeSql} AS college_key
+        FROM penalty_results pr
+        JOIN attendance_final_results afr
+          ON afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
+          AND LOWER(TRIM(afr.student_id)) = LOWER(TRIM(pr.student_id))
+          AND ${getAttendanceFinalResultVisibilitySql("afr")}
+        WHERE pr.id = $1
+      ),
+      event_attendance AS (
+        SELECT DISTINCT
+          ar.school_year_id,
+          LOWER(TRIM(ar.student_id)) AS normalized_student_id,
+          ar.event_id::TEXT AS event_key
+        FROM attendance_records ar
+        WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          AND ar.event_id IS NOT NULL
+          AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
+        UNION
+        SELECT DISTINCT
+          mar.school_year_id,
+          LOWER(TRIM(mar.student_id)) AS normalized_student_id,
+          mar.event_id::TEXT AS event_key
+        FROM manual_attendance_records mar
+        WHERE mar.event_id IS NOT NULL
+          AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
+      ),
+      absent_roster AS (
+        SELECT DISTINCT roster.event_id
+        FROM target t
+        JOIN event_roster_scope roster
+          ON roster.school_year_id IS NOT DISTINCT FROM t.school_year_id
+          AND roster.college_key = t.college_key
+        LEFT JOIN event_attendance attended
+          ON attended.school_year_id IS NOT DISTINCT FROM t.school_year_id
+          AND attended.normalized_student_id = LOWER(TRIM(t.student_id))
+          AND attended.event_key = roster.event_id::TEXT
+        WHERE attended.event_key IS NULL
+      )
+      SELECT
+        t.student_id,
+        t.name,
+        t.college,
+        t.no_of_absences,
+        ae.id AS event_id,
+        ae.name AS event_name,
+        ae.event_order,
+        ae.event_start_at,
+        ae.event_end_at
+      FROM target t
+      LEFT JOIN absent_roster missing ON TRUE
+      LEFT JOIN attendance_events ae ON ae.id = missing.event_id
+      ORDER BY
+        ae.event_order ASC NULLS LAST,
+        ae.event_start_at ASC NULLS LAST,
+        ae.name ASC
+    `,
+    [penaltyResultId],
+  );
+
+  if (!result.rows.length) return null;
+
+  const first = result.rows[0];
+  const absentEvents = result.rows
+    .filter((row) => row.event_id)
+    .map((row) => ({
+      eventId: row.event_id,
+      eventName: String(row.event_name ?? "Unnamed event"),
+      eventOrder: row.event_order == null ? null : Number(row.event_order),
+      eventStartAt: row.event_start_at
+        ? new Date(row.event_start_at).toISOString()
+        : null,
+      eventEndAt: row.event_end_at
+        ? new Date(row.event_end_at).toISOString()
+        : null,
+      source: "roster" as const,
+    }));
+  const totalAbsences = Number(first.no_of_absences ?? 0);
+
+  return {
+    studentId: first.student_id,
+    name: first.name,
+    college: first.college ?? null,
+    totalAbsences,
+    absentEvents,
+    unattributedAbsences: Math.max(0, totalAbsences - absentEvents.length),
+  };
 }
 
 export async function refreshPenaltyResults(

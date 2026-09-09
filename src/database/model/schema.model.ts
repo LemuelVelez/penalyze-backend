@@ -350,6 +350,37 @@ export type AttendancePreviewResult = {
   detectedEvent: AttendanceDetectedEventMetadata;
 };
 
+export type AttendanceImportStageCounts = {
+  parsed: number;
+  normalized: number;
+  valid: number;
+  merged: number;
+  saved: number;
+  distinctFinalResults: number;
+};
+
+export type AttendanceImportInvalidRow = {
+  rowNumber: number;
+  studentId: string;
+  name: string;
+  errors: string[];
+};
+
+export type AttendanceImportMergedRow = {
+  mergeKey: string;
+  studentId: string;
+  names: string[];
+  sourceRowNumbers: number[];
+};
+
+export type AttendanceImportReconciliation = {
+  rowsInSource: number;
+  rowsInvalid: AttendanceImportInvalidRow[];
+  rowsMerged: AttendanceImportMergedRow[];
+  rowsSaved: number;
+  stageCounts: AttendanceImportStageCounts;
+};
+
 export type AttendanceImportProgress = {
   stage: AttendanceImportProgressStage;
   percent: number;
@@ -358,6 +389,7 @@ export type AttendanceImportProgress = {
   totalRows: number;
   savedRecords: number;
   createdFines: number;
+  stageCounts?: AttendanceImportStageCounts;
 };
 
 export type SavedAttendanceImportResult = AttendancePreviewResult & {
@@ -365,6 +397,7 @@ export type SavedAttendanceImportResult = AttendancePreviewResult & {
   event: AttendanceEventRecord | null;
   savedRecords: AttendanceRecord[];
   createdFines: FineRecord[];
+  reconciliation: AttendanceImportReconciliation;
 };
 
 export const ACCEPTED_ATTENDANCE_EXTENSIONS = [

@@ -6,6 +6,8 @@ import {
   deletePenaltyResultsByIds,
   deletePenaltyResultsBySchoolYear,
   getFineSummary,
+  getPenaltyResultAbsentEvents,
+  listPenaltyResultColleges,
   getPenaltyByAbsences,
   listFines,
   listPenalties,
@@ -229,11 +231,41 @@ export async function penaltyResults(req: Request, res: Response, next: NextFunc
       schoolYearId: req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined,
       status: parseFineStatus(req.query.status),
       studentId: req.query.studentId ? String(req.query.studentId).trim() : undefined,
-      limit: toPositiveInt(req.query.limit, 100),
+      limit: toPositiveInt(req.query.limit, 5000),
       offset: toPositiveInt(req.query.offset, 0),
     });
 
     res.json({ data: rows });
+  } catch (error) {
+    next(error);
+  }
+}
+
+
+export async function penaltyResultColleges(req: Request, res: Response, next: NextFunction) {
+  try {
+    const rows = await listPenaltyResultColleges(
+      req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined,
+    );
+    res.json({ data: rows });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function penaltyResultAbsentEvents(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+    if (!id) {
+      res.status(400).json({ message: "Penalty result ID is required." });
+      return;
+    }
+    const row = await getPenaltyResultAbsentEvents(id);
+    if (!row) {
+      res.status(404).json({ message: "Penalty result not found." });
+      return;
+    }
+    res.json({ data: row });
   } catch (error) {
     next(error);
   }

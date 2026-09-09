@@ -61,6 +61,8 @@ import {
   matchPenalty,
   penalties,
   penaltyResults,
+  penaltyResultAbsentEvents,
+  penaltyResultColleges,
   refreshPenaltyResultRows,
   registerZeroAttendance,
   savePenalty,
@@ -305,6 +307,8 @@ app.delete("/api/attendance/:id", deleteAttendanceRecord);
 
 app.get("/api/fines", fines);
 app.get("/api/fines/summary", summary);
+app.get("/api/fines/penalty-results/colleges", penaltyResultColleges);
+app.get("/api/fines/penalty-results/:id/absent-events", penaltyResultAbsentEvents);
 app.get("/api/fines/penalty-results", penaltyResults);
 app.delete("/api/fines/penalty-results", deletePenaltyResultRows);
 app.delete("/api/fines/penalty-results/:id", deletePenaltyResultRow);
