@@ -19,7 +19,7 @@ import {
   SavedAttendanceImportResult,
   SchoolYearRecord,
 } from "../database/model/schema.model";
-import { query, withTransaction } from "../lib/db";
+import { pool, query, withTransaction } from "../lib/db";
 import {
   normalizeAttendanceEventIdentityName,
   scoreAttendanceEventIdentity,
@@ -5759,6 +5759,37 @@ async function refreshCalculationResultsWithClient(
   );
 
   return result.rows;
+}
+
+export async function previewCalculationResults(
+  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
+) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const importIds = normalizeImportIds(options.importIds ?? []);
+    const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
+    const rows = await refreshCalculationResultsWithClient(client, {
+      schoolYearId: options.schoolYearId,
+      importIds,
+      sourceTypes,
+    });
+
+    await client.query("ROLLBACK");
+    return rows;
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackError) {
+      console.error("Failed to rollback calculation preview transaction:", rollbackError);
+    }
+
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 export async function refreshCalculationResults(

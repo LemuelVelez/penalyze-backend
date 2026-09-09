@@ -27,6 +27,7 @@ import {
   listAttendanceRecords,
   listManualAttendanceRecords,
   previewAttendanceFiles,
+  previewCalculationResults,
   refreshAttendanceFinalResults,
   refreshCalculationResults,
   saveAttendanceFiles,
@@ -821,6 +822,26 @@ export async function calculationResults(
     });
 
     res.json({ data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function previewCalculationResultRows(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const records = await previewCalculationResults({
+      schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+      importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
+      sourceTypes: parseCalculationSourceTypes(
+        req.body?.sourceTypes ?? req.body?.source_types,
+      ),
+    });
+
+    res.json({ message: "Calculation preview generated.", data: records });
   } catch (error) {
     next(error);
   }

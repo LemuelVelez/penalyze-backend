@@ -40,6 +40,7 @@ import {
   manualRecords as attendanceManualRecords,
   manualSave,
   previewImport,
+  previewCalculationResultRows as previewAttendanceCalculationResults,
   purgeImport as purgeAttendanceImport,
   refreshCalculationResultRows as refreshAttendanceCalculationResults,
   refreshFinalResults as refreshAttendanceFinalResults,
@@ -237,6 +238,10 @@ app.get("/api/attendance/calculation-results", attendanceCalculationResults);
 app.delete(
   "/api/attendance/calculation-results",
   deleteAttendanceCalculationResults,
+);
+app.post(
+  "/api/attendance/calculation-results/preview",
+  previewAttendanceCalculationResults,
 );
 app.post(
   "/api/attendance/calculation-results/refresh",
