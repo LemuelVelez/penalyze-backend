@@ -903,12 +903,36 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
   const selectedSheets = parsedSheets.filter(
     (sheet: { priority: number }) => sheet.priority === bestPriority,
   );
+  const selectedRows = selectedSheets.flatMap(
+    (sheet: { rows: RawImportRow[] }) => sheet.rows,
+  );
+  const representedStudentIds = new Set(
+    normalizeImportRows(selectedRows)
+      .filter((row) => row.errors.length === 0)
+      .map((row) => cleanText(row.studentId).toLowerCase())
+      .filter(Boolean),
+  );
+  const supplementalRows: RawImportRow[] = [];
+
+  parsedSheets
+    .filter((sheet: { priority: number }) => sheet.priority !== bestPriority)
+    .forEach((sheet: { rows: RawImportRow[] }) => {
+      const normalizedRows = normalizeImportRows(sheet.rows);
+
+      sheet.rows.forEach((row, index) => {
+        const normalizedRow = normalizedRows[index];
+        const studentId = cleanText(normalizedRow?.studentId).toLowerCase();
+
+        if (!studentId || representedStudentIds.has(studentId)) return;
+
+        supplementalRows.push(row);
+        if (!normalizedRow.errors.length) representedStudentIds.add(studentId);
+      });
+    });
 
   return {
-    rawRows: selectedSheets.flatMap(
-      (sheet: { rows: RawImportRow[] }) => sheet.rows,
-    ),
-    detectedEvent: selectedSheets.reduce(
+    rawRows: [...selectedRows, ...supplementalRows],
+    detectedEvent: parsedSheets.reduce(
       (
         metadata: AttendanceDetectedEventMetadata,
         sheet: { detectedEvent: AttendanceDetectedEventMetadata },
