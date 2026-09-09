@@ -5064,7 +5064,6 @@ export async function updateAttendanceEvent(
           event_order = $7,
           updated_at = NOW()
         WHERE id = $1
-          AND deleted_at IS NULL
         RETURNING *
       `,
       [
