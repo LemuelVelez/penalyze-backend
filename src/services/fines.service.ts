@@ -9,6 +9,7 @@ import {
 } from "../database/model/schema.model";
 import { DEFAULT_PENALTIES } from "../database/seeder/penalties.seeder";
 import { query } from "../lib/db";
+import { refreshCalculationResults } from "./attendance.service";
 
 export const ZERO_ATTENDANCE_REMARK =
   "Zero attendance registration from landing page.";
@@ -703,6 +704,8 @@ export async function registerZeroAttendanceFine(
     totalEvents > 0 ? await getPenaltyByAbsences(totalEvents) : null;
   const fine = await upsertFineForZeroAttendance(attendanceRecord, penalty);
 
+  await refreshCalculationResults({ schoolYearId });
+
   return {
     attendanceRecord,
     fine: fine
@@ -823,6 +826,13 @@ export async function listPenaltyResults(
   options: ListPenaltyResultsOptions = {},
 ) {
   const clauses: string[] = [
+    `EXISTS (
+      SELECT 1
+      FROM attendance_final_results current_result
+      WHERE current_result.school_year_id IS NOT DISTINCT FROM pr.school_year_id
+        AND LOWER(TRIM(current_result.student_id)) = LOWER(TRIM(pr.student_id))
+        AND current_result.total_absences > 0
+    )`,
     `(
       pr.source_table <> 'attendance_final_results'
       OR afr.import_id IS NULL

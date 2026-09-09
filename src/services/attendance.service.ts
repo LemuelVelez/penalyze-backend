@@ -1969,6 +1969,24 @@ function uniqueCleanTextValues(values: Array<string | null | undefined>) {
   );
 }
 
+export async function refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+  client: PoolClient,
+  schoolYearIds: Array<string | null | undefined>,
+) {
+  const hasUnscopedSchoolYear = schoolYearIds.some(
+    (schoolYearId) => !cleanText(schoolYearId),
+  );
+  const scopes: Array<string | undefined> = hasUnscopedSchoolYear
+    ? [undefined]
+    : uniqueCleanTextValues(schoolYearIds).map((schoolYearId) => schoolYearId);
+
+  for (const schoolYearId of scopes) {
+    await refreshAttendanceFinalResultsWithClient(client, { schoolYearId });
+    await refreshCalculationResultsWithClient(client, { schoolYearId });
+    await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
+  }
+}
+
 function uniqueAttendanceEventRosterCollegeKeys(
   values: Array<string | null | undefined>,
 ) {
@@ -3452,6 +3470,10 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       manualRecord,
     );
 
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
+      schoolYearId,
+    ]);
+
     return {
       event,
       manualRecord: {
@@ -3547,6 +3569,10 @@ export async function updateAttendanceRecords(
       ],
     );
     const updatedRecords = updatedResult.rows;
+    const affectedSchoolYearIds = [
+      ...existingRecords.map((record) => record.school_year_id),
+      ...updatedRecords.map((record) => record.school_year_id),
+    ];
     const updatedRecordIds = updatedRecords.map((record) => record.id);
     const updatedEventRosterCollegeKeys =
       await getAttendanceRecordEventRosterCollegeKeys(
@@ -3582,6 +3608,11 @@ export async function updateAttendanceRecords(
       );
       const records = await listRecordsByIds(client, refreshedRecordIds);
 
+      await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+        client,
+        affectedSchoolYearIds,
+      );
+
       return {
         event,
         records,
@@ -3599,6 +3630,11 @@ export async function updateAttendanceRecords(
       ),
     );
     const records = await listRecordsByIds(client, updatedRecordIds);
+
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+      client,
+      affectedSchoolYearIds,
+    );
 
     return {
       event,
@@ -3691,6 +3727,11 @@ async function updateManualAttendanceRecord(
     client,
     manualRecord,
   );
+
+  await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
+    existingRecord.school_year_id,
+    manualRecord.school_year_id,
+  ]);
 
   return {
     event,
@@ -3808,6 +3849,11 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
         syncedFines.find((item) => item.attendance_record_id === record.id) ??
         null;
 
+      await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
+        existingRecord.school_year_id,
+        record.school_year_id,
+      ]);
+
       return {
         event,
         record: updatedRecord,
@@ -3816,6 +3862,11 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
     }
 
     const fine = await syncFineForAttendanceRecord(client, record);
+
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
+      existingRecord.school_year_id,
+      record.school_year_id,
+    ]);
 
     return {
       event,
@@ -3850,6 +3901,10 @@ export async function deleteAttendanceRecord(id: string) {
         );
       }
 
+      await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
+        record.school_year_id,
+      ]);
+
       return record;
     }
 
@@ -3879,6 +3934,10 @@ export async function deleteAttendanceRecord(id: string) {
     );
     await client.query("DELETE FROM manual_attendance_records WHERE id = $1", [
       id,
+    ]);
+
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
+      manualRecord.school_year_id,
     ]);
 
     return manualRecordToAttendanceRecord(manualRecord);
@@ -5082,6 +5141,11 @@ export async function updateAttendanceEvent(
     }
 
     await resequenceAttendanceEvents(client, nextSchoolYearId);
+
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
+      existing.school_year_id,
+      nextSchoolYearId,
+    ]);
 
     return (
       (await getAttendanceEventById(client, result.rows[0].id)) ??
@@ -6713,9 +6777,11 @@ export async function deleteAttendanceFinalResultsByIds(
 
     await client.query(
       `
-        DELETE FROM penalty_results
-        WHERE source_table = 'attendance_final_results'
-          AND source_record_id::TEXT = ANY($1::TEXT[])
+        DELETE FROM penalty_results pr
+        USING attendance_final_results afr
+        WHERE afr.id = ANY($1::uuid[])
+          AND pr.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+          AND LOWER(TRIM(pr.student_id)) = LOWER(TRIM(afr.student_id))
       `,
       [recordIds],
     );
@@ -6789,6 +6855,11 @@ export async function deleteManualAttendanceRecordsByIds(
     await client.query(
       "DELETE FROM manual_attendance_records WHERE id = ANY($1::uuid[])",
       [recordIds],
+    );
+
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+      client,
+      records.map((record) => record.school_year_id),
     );
 
     return {

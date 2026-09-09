@@ -7,6 +7,9 @@ import type {
   SchoolSemester,
 } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
+import {
+  refreshDerivedAttendanceResultsForSchoolYearsWithClient,
+} from "./attendance.service";
 
 type AttendanceRequestEventInput = {
   eventId?: unknown;
@@ -529,6 +532,9 @@ export async function reviewAttendanceRequest(
         request,
         eventResult.rows,
       );
+      await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
+        request.school_year_id,
+      ]);
     }
 
     await client.query(
