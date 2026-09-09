@@ -3,6 +3,7 @@ import "dotenv/config";
 import { seedPenalties } from "../seeder/penalties.seeder";
 import { seedUser } from "../seeder/users.seeder";
 import { seedParticipants } from "../seeder/participants.seeder";
+import { seedFrcAttendees } from "../seeder/frc-attendees.seeder";
 import { closeDatabasePool } from "../../lib/db";
 import { consoleUi, formatDuration } from "./console-ui";
 
@@ -30,7 +31,7 @@ async function runSeeder<T>(
 
 async function runSeeders() {
   const startedAt = Date.now();
-  const totalSeeders = 3;
+  const totalSeeders = 4;
 
   consoleUi.header(
     "🌱",
@@ -48,12 +49,23 @@ async function runSeeders() {
     "Participants & attendance",
     seedParticipants,
   );
+  const frcAttendeesRun = await runSeeder(
+    4,
+    totalSeeders,
+    "🏳️",
+    "September 1 FRC attendees",
+    seedFrcAttendees,
+  );
 
   const userResult = userRun.result;
   const penaltiesResult = penaltiesRun.result;
   const participantsResult = participantsRun.result;
+  const frcAttendeesResult = frcAttendeesRun.result;
   const allAlreadySeeded =
-    userResult.alreadySeeded && penaltiesResult.alreadySeeded && participantsResult.alreadySeeded;
+    userResult.alreadySeeded &&
+    penaltiesResult.alreadySeeded &&
+    participantsResult.alreadySeeded &&
+    frcAttendeesResult.alreadySeeded;
 
   consoleUi.section("📋", "Seeder results");
 
@@ -88,9 +100,30 @@ async function runSeeders() {
     }
   }
 
-  const changedSeeders = [userResult, penaltiesResult, participantsResult].filter(
-    (result) => !result.alreadySeeded,
-  ).length;
+  if (frcAttendeesResult.alreadySeeded) {
+    consoleUi.skipped("September 1 FRC attendees are already seeded — no changes needed.");
+  } else {
+    consoleUi.success(
+      `Seeded ${frcAttendeesResult.seededImports} FRC import(s) and ${frcAttendeesResult.seededAttendanceRecords} attendance record(s).`,
+    );
+    if (frcAttendeesResult.seededNoQrAttendees > 0) {
+      consoleUi.info(
+        `Included ${frcAttendeesResult.seededNoQrAttendees} attendee(s) from the no-QR list.`,
+      );
+    }
+    if (frcAttendeesResult.skippedNoStudentId > 0) {
+      consoleUi.warning(
+        `Skipped ${frcAttendeesResult.skippedNoStudentId} no-QR attendee(s) without a student ID.`,
+      );
+    }
+  }
+
+  const changedSeeders = [
+    userResult,
+    penaltiesResult,
+    participantsResult,
+    frcAttendeesResult,
+  ].filter((result) => !result.alreadySeeded).length;
 
   consoleUi.summary([
     { label: "Seeders executed", value: totalSeeders, tone: "info" },
