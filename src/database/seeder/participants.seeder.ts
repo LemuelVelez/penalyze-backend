@@ -154,11 +154,6 @@ async function getExistingImports(fileNames: string[]) {
 export async function seedParticipants(): Promise<SeederResult> {
   const sourcePath = clean(process.env.SEED_PARTICIPANTS_PATH);
   if (!sourcePath || !fs.existsSync(sourcePath)) {
-    console.log(
-      sourcePath
-        ? `Participants seed skipped: source not found at ${sourcePath}.`
-        : "Participants seed skipped: SEED_PARTICIPANTS_PATH is not configured.",
-    );
     return {
       alreadySeeded: true,
       skipped: true,

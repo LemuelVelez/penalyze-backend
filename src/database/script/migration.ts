@@ -3,6 +3,7 @@ import fs from "fs/promises";
 import path from "path";
 
 import { closeDatabasePool, query } from "../../lib/db";
+import { consoleUi, formatDuration } from "./console-ui";
 
 const MIGRATIONS_TABLE = "schema_migrations";
 
@@ -28,7 +29,7 @@ async function isMigrationApplied(filename: string) {
       WHERE filename = $1
       LIMIT 1
     `,
-    [filename]
+    [filename],
   );
 
   return Boolean(result.rows[0]);
@@ -41,28 +42,64 @@ async function registerMigration(filename: string) {
       VALUES ($1)
       ON CONFLICT (filename) DO NOTHING
     `,
-    [filename]
+    [filename],
   );
 }
 
 async function runMigrations() {
+  const startedAt = Date.now();
   const migrationsDir = path.resolve(process.cwd(), "src/database/migration");
   const files = (await fs.readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
 
+  consoleUi.header(
+    "🗃️",
+    "DATABASE MIGRATIONS",
+    `Penalyze • ${files.length} migration file${files.length === 1 ? "" : "s"} discovered`,
+  );
+
   if (!files.length) {
-    console.log("No SQL migrations found.");
+    consoleUi.warning("No SQL migration files were found.");
+    consoleUi.noChanges("Nothing to migrate", Date.now() - startedAt);
     return;
   }
 
+  const tableStartedAt = Date.now();
   await ensureMigrationsTable();
+  consoleUi.success(`Migration registry ready: ${MIGRATIONS_TABLE}`, Date.now() - tableStartedAt);
 
-  let appliedCount = 0;
+  const pendingFiles: string[] = [];
+  let alreadyAppliedCount = 0;
 
   for (const file of files) {
     if (await isMigrationApplied(file)) {
-      continue;
+      alreadyAppliedCount += 1;
+    } else {
+      pendingFiles.push(file);
     }
+  }
 
+  consoleUi.summary([
+    { label: "Discovered", value: files.length, tone: "info" },
+    { label: "Already applied", value: alreadyAppliedCount, tone: "success" },
+    {
+      label: "Pending",
+      value: pendingFiles.length,
+      tone: pendingFiles.length ? "warning" : "success",
+    },
+  ]);
+
+  if (!pendingFiles.length) {
+    consoleUi.noChanges("Database schema is already up to date", Date.now() - startedAt);
+    return;
+  }
+
+  consoleUi.section("🚀", "Applying pending migrations");
+
+  let appliedCount = 0;
+
+  for (const [index, file] of pendingFiles.entries()) {
+    const migrationStartedAt = Date.now();
+    consoleUi.progress(index + 1, pendingFiles.length, file);
     const sql = await fs.readFile(path.join(migrationsDir, file), "utf8");
 
     await query("BEGIN");
@@ -72,19 +109,21 @@ async function runMigrations() {
       await registerMigration(file);
       await query("COMMIT");
       appliedCount += 1;
-      console.log(`Applied migration: ${file}`);
+      consoleUi.success(`Applied ${file}`, Date.now() - migrationStartedAt);
     } catch (error) {
       await query("ROLLBACK");
+      consoleUi.warning(`Rolled back ${file} after an error.`);
       throw error;
     }
   }
 
-  if (appliedCount === 0) {
-    console.log("No pending migrations.");
-    return;
-  }
-
-  console.log("Migrations completed.");
+  consoleUi.summary([
+    { label: "Applied this run", value: appliedCount, tone: "success" },
+    { label: "Skipped", value: alreadyAppliedCount, tone: "info" },
+    { label: "Total migrations", value: files.length, tone: "info" },
+    { label: "Elapsed", value: formatDuration(Date.now() - startedAt), tone: "success" },
+  ]);
+  consoleUi.completed("Migrations completed successfully", Date.now() - startedAt);
 }
 
 runMigrations()
@@ -92,7 +131,7 @@ runMigrations()
     await closeDatabasePool();
   })
   .catch(async (error) => {
-    console.error("Migration failed:", error);
+    consoleUi.error("Migration process failed", error);
     await closeDatabasePool();
     process.exit(1);
   });
