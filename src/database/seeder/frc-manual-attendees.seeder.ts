@@ -200,7 +200,7 @@ function parseNoQrFile(): ManualAttendee[] {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
-    .map((line) => {
+    .map<ManualAttendee | null>((line) => {
       const numberedLine = line.match(/^\d+\.\s*(.+)$/);
       if (!numberedLine) return null;
 
