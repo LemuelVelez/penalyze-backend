@@ -5,6 +5,7 @@ import { seedUser } from "../seeder/users.seeder";
 import { seedParticipants } from "../seeder/participants.seeder";
 import { seedFrcManualAttendees } from "../seeder/frc-manual-attendees.seeder";
 import { seedCafFrcManualAttendees } from "../seeder/frc-caf-manual-attendees.seeder";
+import { seedLamsFrcManualAttendees } from "../seeder/frc-lams-manual-attendees.seeder";
 import { seedManualAttendanceCcsCollege } from "../seeder/manual-attendance-ccs-college.seeder";
 import { closeDatabasePool, query } from "../../lib/db";
 import { consoleUi, formatDuration } from "./console-ui";
@@ -13,6 +14,8 @@ const DATA_SEED_HISTORY_TABLE = "data_seed_history";
 const FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-09-01-frc-manual-attendees-v1";
 const CAF_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-caf-frc-manual-attendees-v1";
 const CAF_FRC_EVENT_DATES = ["2026-08-17", "2026-08-24", "2026-09-01"] as const;
+const LAMS_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-lams-frc-manual-attendees-v1";
+const LAMS_FRC_EVENT_DATES = ["2026-08-24", "2026-09-01"] as const;
 const MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY =
   "manual-attendance-ccs-college-v1";
 
@@ -158,6 +161,40 @@ async function hasExistingCafFrcManualAttendance() {
   return Number(result.rows[0]?.event_count ?? 0) === CAF_FRC_EVENT_DATES.length;
 }
 
+async function hasExistingLamsFrcManualAttendance() {
+  const result = await query<{ event_count: string }>(
+    `
+      SELECT COUNT(*)::text AS event_count
+      FROM unnest($1::date[]) AS target(event_date)
+      WHERE EXISTS (
+        SELECT 1
+        FROM manual_attendance_records mar
+        JOIN attendance_events ae ON ae.id = mar.event_id
+        JOIN school_years sy ON sy.id = ae.school_year_id
+        WHERE sy.name = $2
+          AND sy.semester = $3
+          AND LOWER(TRIM(ae.name)) = LOWER(TRIM($4))
+          AND (
+            ae.event_date = target.event_date
+            OR timezone('Asia/Manila', ae.event_start_at)::date = target.event_date
+            OR timezone('Asia/Manila', ae.event_end_at)::date = target.event_date
+          )
+          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($5))
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+      )
+    `,
+    [
+      [...LAMS_FRC_EVENT_DATES],
+      "2026-2027",
+      "first_semester",
+      "Flag Raising Ceremony",
+      "College of Liberal Arts, Mathematics and Sciences",
+    ],
+  );
+
+  return Number(result.rows[0]?.event_count ?? 0) === LAMS_FRC_EVENT_DATES.length;
+}
+
 async function bootstrapPreviouslyAppliedOneTimeSeeders(
   seeders: readonly OneTimeSeederDefinition<unknown>[],
 ) {
@@ -240,6 +277,15 @@ async function runSeeders() {
         "Seeding the bundled Agriculture and Forestry FRC workbooks into manual attendance only once",
       seeder: seedCafFrcManualAttendees,
       bootstrapApplied: hasExistingCafFrcManualAttendance,
+    },
+    {
+      key: LAMS_FRC_MANUAL_ATTENDEES_SEED_KEY,
+      icon: "📚",
+      label: "LAMS FRC manual attendees",
+      processing:
+        "Seeding the bundled Liberal Arts, Mathematics and Sciences FRC attendance sheets into manual attendance only once",
+      seeder: seedLamsFrcManualAttendees,
+      bootstrapApplied: hasExistingLamsFrcManualAttendance,
     },
     {
       key: MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY,
@@ -338,6 +384,9 @@ async function runSeeders() {
   const cafFrcRun = oneTimeRuns.get(CAF_FRC_MANUAL_ATTENDEES_SEED_KEY) as
     | SeederRun<Awaited<ReturnType<typeof seedCafFrcManualAttendees>>>
     | undefined;
+  const lamsFrcRun = oneTimeRuns.get(LAMS_FRC_MANUAL_ATTENDEES_SEED_KEY) as
+    | SeederRun<Awaited<ReturnType<typeof seedLamsFrcManualAttendees>>>
+    | undefined;
   const ccsRun = oneTimeRuns.get(MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY) as
     | SeederRun<Awaited<ReturnType<typeof seedManualAttendanceCcsCollege>>>
     | undefined;
@@ -416,6 +465,23 @@ async function runSeeders() {
   } else {
     consoleUi.skipped(
       "CAF FRC manual-attendance seeder is already applied — it was not executed again.",
+    );
+  }
+
+  if (lamsFrcRun) {
+    const result = lamsFrcRun.result;
+    consoleUi.success(
+      `Created ${result.manualAttendanceRecordsCreated} LAMS FRC manual attendance record(s) and ${result.eventsCreated} event(s).`,
+      lamsFrcRun.durationMs,
+    );
+    if (result.unresolvedAttendees.length > 0) {
+      consoleUi.warning(
+        `Could not safely resolve ${result.unresolvedAttendees.length} LAMS attendee(s): ${result.unresolvedAttendees.join(", ")}`,
+      );
+    }
+  } else {
+    consoleUi.skipped(
+      "LAMS FRC manual-attendance seeder is already applied — it was not executed again.",
     );
   }
 
