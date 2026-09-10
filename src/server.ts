@@ -79,6 +79,7 @@ import {
   activate as activateSchoolYear,
   assignCurrent as assignCurrentSchoolYearRecords,
   deleteRecords as deleteSchoolYearRecords,
+  deleteImpact as schoolYearDeleteImpact,
   index as schoolYears,
   remove as deleteSchoolYear,
   save as saveSchoolYear,
@@ -199,6 +200,7 @@ app.patch(
   "/api/school-years/:id/assign-current",
   assignCurrentSchoolYearRecords,
 );
+app.get("/api/school-years/:id/delete-impact", schoolYearDeleteImpact);
 app.delete("/api/school-years/:id/records", deleteSchoolYearRecords);
 app.patch("/api/school-years/:id/activate", activateSchoolYear);
 app.patch("/api/school-years/:id", updateSchoolYear);

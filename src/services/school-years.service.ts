@@ -34,6 +34,18 @@ export type TransferSchoolYearRecordsResult = {
   penaltyResultsUpdated?: number;
 };
 
+export type SchoolYearDeleteImpact = {
+  schoolYear: SchoolYearRecord;
+  events: number;
+  imports: number;
+  attendanceRecords: number;
+  fines: number;
+  finalResults: number;
+  manualRecords: number;
+  penaltyResults: number;
+  linkedRecordsTotal: number;
+};
+
 export type SchoolYearRecordActionResult = {
   schoolYear: SchoolYearRecord;
   eventsUpdated?: number;
@@ -414,6 +426,46 @@ async function deleteSchoolYearLinkedRecords(
     importsDeleted: Number(importDelete.rowCount ?? 0),
     eventsDeleted: Number(eventDelete.rowCount ?? 0),
   };
+}
+
+export async function getSchoolYearDeleteImpact(
+  schoolYearId: string,
+): Promise<SchoolYearDeleteImpact> {
+  const schoolYearResult = await query<SchoolYearRecord>(
+    "SELECT * FROM school_years WHERE id = $1 LIMIT 1",
+    [schoolYearId],
+  );
+  const schoolYear = schoolYearResult.rows[0];
+  if (!schoolYear) throw createValidationError("School year not found.", 404);
+
+  const counts = await query<{
+    events: string; imports: string; attendance_records: string; fines: string;
+    final_results: string; manual_records: string; penalty_results: string;
+  }>(
+    `SELECT
+      (SELECT COUNT(*) FROM attendance_events WHERE school_year_id = $1) AS events,
+      (SELECT COUNT(*) FROM attendance_imports WHERE school_year_id = $1) AS imports,
+      (SELECT COUNT(*) FROM attendance_records WHERE school_year_id = $1) AS attendance_records,
+      (SELECT COUNT(*) FROM fines WHERE school_year_id = $1) AS fines,
+      (SELECT COUNT(*) FROM attendance_final_results WHERE school_year_id = $1) AS final_results,
+      (SELECT COUNT(*) FROM manual_attendance_records WHERE school_year_id = $1) AS manual_records,
+      (SELECT COUNT(*) FROM penalty_results WHERE school_year_id = $1) AS penalty_results`,
+    [schoolYearId],
+  );
+  const row = counts.rows[0];
+  const impact = {
+    schoolYear,
+    events: Number(row?.events ?? 0),
+    imports: Number(row?.imports ?? 0),
+    attendanceRecords: Number(row?.attendance_records ?? 0),
+    fines: Number(row?.fines ?? 0),
+    finalResults: Number(row?.final_results ?? 0),
+    manualRecords: Number(row?.manual_records ?? 0),
+    penaltyResults: Number(row?.penalty_results ?? 0),
+    linkedRecordsTotal: 0,
+  };
+  impact.linkedRecordsTotal = impact.events + impact.imports + impact.attendanceRecords + impact.fines + impact.finalResults + impact.manualRecords + impact.penaltyResults;
+  return impact;
 }
 
 export async function deleteSchoolYear(

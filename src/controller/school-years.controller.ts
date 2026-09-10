@@ -6,6 +6,7 @@ import {
   createSchoolYear,
   deleteSchoolYear,
   deleteSchoolYearRecords,
+  getSchoolYearDeleteImpact,
   listSchoolYears,
   transferSchoolYearRecords,
   updateSchoolYear,
@@ -120,6 +121,20 @@ export async function assignCurrent(req: Request, res: Response, next: NextFunct
 
     const data = await assignCurrentRecordsToSchoolYear(id);
     res.json({ message: "Current records assigned to school year successfully.", data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function deleteImpact(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+    if (!id) {
+      res.status(400).json({ message: "School year ID is required." });
+      return;
+    }
+    const data = await getSchoolYearDeleteImpact(id);
+    res.json({ data });
   } catch (error) {
     next(error);
   }
