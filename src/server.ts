@@ -3,6 +3,7 @@ import express, { NextFunction, Request, Response } from "express";
 import multer from "multer";
 
 import {
+  attachAuthUser,
   deleteUser,
   listUsers,
   login,
@@ -12,6 +13,7 @@ import {
   requireAuth,
   updateUser,
 } from "./controller/auth.controller";
+import { listAuditLogs } from "./controller/audit-logs.controller";
 import {
   createRequest as createAttendanceRequest,
   requests as attendanceRequests,
@@ -85,6 +87,7 @@ import {
 } from "./controller/school-years.controller";
 import { query } from "./lib/db";
 import { purgeExpiredAttendanceImports } from "./services/attendance.service";
+import { auditMutation } from "./services/audit-log.service";
 
 const app = express();
 const attendanceBatchUpload = attendanceUpload.fields([
@@ -156,6 +159,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use(attachAuthUser);
+app.use(auditMutation);
 
 app.get("/", (_req: Request, res: Response) => {
   res.json({
@@ -184,6 +189,8 @@ app.get("/api/users", requireAuth, requireAdmin, listUsers);
 app.patch("/api/users/:id", requireAuth, requireAdmin, updateUser);
 app.put("/api/users/:id", requireAuth, requireAdmin, updateUser);
 app.delete("/api/users/:id", requireAuth, requireAdmin, deleteUser);
+
+app.get("/api/audit-logs", requireAuth, requireAdmin, listAuditLogs);
 
 app.get("/api/school-years", schoolYears);
 app.post("/api/school-years", saveSchoolYear);

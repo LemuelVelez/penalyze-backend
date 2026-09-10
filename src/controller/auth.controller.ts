@@ -239,6 +239,22 @@ export async function login(req: Request, res: Response, next: NextFunction) {
   }
 }
 
+export function attachAuthUser(req: AuthenticatedRequest, _res: Response, next: NextFunction) {
+  try {
+    const header = req.headers.authorization ?? "";
+    const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
+
+    if (token) {
+      const payload = verifyToken(token);
+      if (payload) req.user = payload;
+    }
+  } catch {
+    // Optional authentication must never block public routes.
+  }
+
+  next();
+}
+
 export async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   try {
     const header = req.headers.authorization ?? "";
