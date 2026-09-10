@@ -4,12 +4,15 @@ import { seedPenalties } from "../seeder/penalties.seeder";
 import { seedUser } from "../seeder/users.seeder";
 import { seedParticipants } from "../seeder/participants.seeder";
 import { seedFrcManualAttendees } from "../seeder/frc-manual-attendees.seeder";
+import { seedCafFrcManualAttendees } from "../seeder/frc-caf-manual-attendees.seeder";
 import { seedManualAttendanceCcsCollege } from "../seeder/manual-attendance-ccs-college.seeder";
 import { closeDatabasePool, query } from "../../lib/db";
 import { consoleUi, formatDuration } from "./console-ui";
 
 const DATA_SEED_HISTORY_TABLE = "data_seed_history";
 const FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-09-01-frc-manual-attendees-v1";
+const CAF_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-caf-frc-manual-attendees-v1";
+const CAF_FRC_EVENT_DATES = ["2026-08-17", "2026-08-24", "2026-09-01"] as const;
 const MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY =
   "manual-attendance-ccs-college-v1";
 
@@ -121,6 +124,40 @@ async function hasExistingSeptemberFrcManualAttendance() {
   return Boolean(result.rows[0]?.exists);
 }
 
+async function hasExistingCafFrcManualAttendance() {
+  const result = await query<{ event_count: string }>(
+    `
+      SELECT COUNT(*)::text AS event_count
+      FROM unnest($1::date[]) AS target(event_date)
+      WHERE EXISTS (
+        SELECT 1
+        FROM manual_attendance_records mar
+        JOIN attendance_events ae ON ae.id = mar.event_id
+        JOIN school_years sy ON sy.id = ae.school_year_id
+        WHERE sy.name = $2
+          AND sy.semester = $3
+          AND LOWER(TRIM(ae.name)) = LOWER(TRIM($4))
+          AND (
+            ae.event_date = target.event_date
+            OR timezone('Asia/Manila', ae.event_start_at)::date = target.event_date
+            OR timezone('Asia/Manila', ae.event_end_at)::date = target.event_date
+          )
+          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($5))
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+      )
+    `,
+    [
+      [...CAF_FRC_EVENT_DATES],
+      "2026-2027",
+      "first_semester",
+      "Flag Raising Ceremony",
+      "College of Agriculture and Forestry",
+    ],
+  );
+
+  return Number(result.rows[0]?.event_count ?? 0) === CAF_FRC_EVENT_DATES.length;
+}
+
 async function bootstrapPreviouslyAppliedOneTimeSeeders(
   seeders: readonly OneTimeSeederDefinition<unknown>[],
 ) {
@@ -196,6 +233,15 @@ async function runSeeders() {
       bootstrapApplied: hasExistingSeptemberFrcManualAttendance,
     },
     {
+      key: CAF_FRC_MANUAL_ATTENDEES_SEED_KEY,
+      icon: "🌾",
+      label: "CAF FRC manual attendees",
+      processing:
+        "Seeding the bundled Agriculture and Forestry FRC workbooks into manual attendance only once",
+      seeder: seedCafFrcManualAttendees,
+      bootstrapApplied: hasExistingCafFrcManualAttendance,
+    },
+    {
       key: MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY,
       icon: "🏫",
       label: "Manual attendance CCS college normalization",
@@ -245,7 +291,7 @@ async function runSeeders() {
   registryTask.succeed("Data-seeder registry ready", DATA_SEED_HISTORY_TABLE);
 
   const bootstrapTask = consoleUi.task("Recognizing previously seeded historical data", {
-    detail: "Existing September 1 FRC manual-attendance rows will be marked applied without reseeding",
+    detail: "Existing historical manual-attendance rows will be marked applied without reseeding",
   });
   const bootstrappedCount = await bootstrapPreviouslyAppliedOneTimeSeeders(
     oneTimeSeeders,
@@ -288,6 +334,9 @@ async function runSeeders() {
   const participantsResult = participantsRun.result;
   const frcRun = oneTimeRuns.get(FRC_MANUAL_ATTENDEES_SEED_KEY) as
     | SeederRun<Awaited<ReturnType<typeof seedFrcManualAttendees>>>
+    | undefined;
+  const cafFrcRun = oneTimeRuns.get(CAF_FRC_MANUAL_ATTENDEES_SEED_KEY) as
+    | SeederRun<Awaited<ReturnType<typeof seedCafFrcManualAttendees>>>
     | undefined;
   const ccsRun = oneTimeRuns.get(MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY) as
     | SeederRun<Awaited<ReturnType<typeof seedManualAttendanceCcsCollege>>>
@@ -350,6 +399,23 @@ async function runSeeders() {
   } else {
     consoleUi.skipped(
       "September 1 FRC manual-attendance seeder is already applied — it was not executed again.",
+    );
+  }
+
+  if (cafFrcRun) {
+    const result = cafFrcRun.result;
+    consoleUi.success(
+      `Created ${result.manualAttendanceRecordsCreated} CAF FRC manual attendance record(s) and ${result.eventsCreated} event(s).`,
+      cafFrcRun.durationMs,
+    );
+    if (result.unresolvedAttendees.length > 0) {
+      consoleUi.warning(
+        `Could not safely resolve ${result.unresolvedAttendees.length} CAF attendee(s): ${result.unresolvedAttendees.join(", ")}`,
+      );
+    }
+  } else {
+    consoleUi.skipped(
+      "CAF FRC manual-attendance seeder is already applied — it was not executed again.",
     );
   }
 
