@@ -8,6 +8,7 @@ import { seedCafFrcManualAttendees } from "../seeder/frc-caf-manual-attendees.se
 import { seedLamsFrcManualAttendees } from "../seeder/frc-lams-manual-attendees.seeder";
 import { seedSoeFrcManualAttendees } from "../seeder/frc-soe-manual-attendees.seeder";
 import { seedScjeFrcManualAttendees } from "../seeder/frc-scje-manual-attendees.seeder";
+import { seedRelinkFrcManualAttendanceEvents } from "../seeder/relink-frc-manual-attendance-events.seeder";
 import { seedManualAttendanceCcsCollege } from "../seeder/manual-attendance-ccs-college.seeder";
 import { closeDatabasePool, query } from "../../lib/db";
 import { consoleUi, formatDuration } from "./console-ui";
@@ -22,6 +23,8 @@ const SOE_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-soe-frc-manual-attendees-v1";
 const SOE_FRC_EVENT_DATES = ["2026-08-24"] as const;
 const SCJE_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-scje-frc-manual-attendees-v1";
 const SCJE_FRC_EVENT_DATES = ["2026-09-01"] as const;
+const RELINK_FRC_MANUAL_ATTENDANCE_EVENTS_SEED_KEY =
+  "2026-relink-frc-manual-attendance-events-v1";
 const MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY =
   "manual-attendance-ccs-college-v1";
 
@@ -119,16 +122,32 @@ async function registerDataSeeder(seedKey: string) {
 }
 
 async function hasExistingSeptemberFrcManualAttendance() {
-  const result = await query<{ exists: boolean }>(`
-    SELECT EXISTS (
-      SELECT 1
-      FROM manual_attendance_records mar
-      JOIN attendance_events ae ON ae.id = mar.event_id
-      WHERE LOWER(TRIM(ae.name)) = 'flag raising ceremony'
-        AND (COALESCE(ae.event_start_at, ae.event_end_at) AT TIME ZONE 'Asia/Manila')::DATE = DATE '2026-09-01'
-        AND mar.remarks ILIKE 'Seeded as manual attendance from the September 1, 2026 FRC%'
-    ) AS exists
-  `);
+  const result = await query<{ exists: boolean }>(
+    `
+      SELECT EXISTS (
+        SELECT 1
+        FROM manual_attendance_records mar
+        JOIN attendance_events ae ON ae.id = mar.event_id
+        JOIN school_years sy ON sy.id = ae.school_year_id
+        WHERE sy.name = $1
+          AND sy.semester = $2
+          AND (
+            ae.event_date = $3::date
+            OR timezone('Asia/Manila', ae.event_start_at)::date = $3::date
+            OR timezone('Asia/Manila', ae.event_end_at)::date = $3::date
+          )
+          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($4))
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+          AND mar.remarks ILIKE 'Seeded as manual attendance from the September 1, 2026 FRC%'
+      ) AS exists
+    `,
+    [
+      "2026-2027",
+      "first_semester",
+      "2026-09-01",
+      "College of Computing Studies",
+    ],
+  );
 
   return Boolean(result.rows[0]?.exists);
 }
@@ -145,13 +164,12 @@ async function hasExistingCafFrcManualAttendance() {
         JOIN school_years sy ON sy.id = ae.school_year_id
         WHERE sy.name = $2
           AND sy.semester = $3
-          AND LOWER(TRIM(ae.name)) = LOWER(TRIM($4))
           AND (
             ae.event_date = target.event_date
             OR timezone('Asia/Manila', ae.event_start_at)::date = target.event_date
             OR timezone('Asia/Manila', ae.event_end_at)::date = target.event_date
           )
-          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($5))
+          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($4))
           AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       )
     `,
@@ -159,7 +177,6 @@ async function hasExistingCafFrcManualAttendance() {
       [...CAF_FRC_EVENT_DATES],
       "2026-2027",
       "first_semester",
-      "Flag Raising Ceremony",
       "College of Agriculture and Forestry",
     ],
   );
@@ -179,13 +196,12 @@ async function hasExistingLamsFrcManualAttendance() {
         JOIN school_years sy ON sy.id = ae.school_year_id
         WHERE sy.name = $2
           AND sy.semester = $3
-          AND LOWER(TRIM(ae.name)) = LOWER(TRIM($4))
           AND (
             ae.event_date = target.event_date
             OR timezone('Asia/Manila', ae.event_start_at)::date = target.event_date
             OR timezone('Asia/Manila', ae.event_end_at)::date = target.event_date
           )
-          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($5))
+          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($4))
           AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       )
     `,
@@ -193,7 +209,6 @@ async function hasExistingLamsFrcManualAttendance() {
       [...LAMS_FRC_EVENT_DATES],
       "2026-2027",
       "first_semester",
-      "Flag Raising Ceremony",
       "College of Liberal Arts, Mathematics and Sciences",
     ],
   );
@@ -213,13 +228,12 @@ async function hasExistingSoeFrcManualAttendance() {
         JOIN school_years sy ON sy.id = ae.school_year_id
         WHERE sy.name = $2
           AND sy.semester = $3
-          AND LOWER(TRIM(ae.name)) = LOWER(TRIM($4))
           AND (
             ae.event_date = target.event_date
             OR timezone('Asia/Manila', ae.event_start_at)::date = target.event_date
             OR timezone('Asia/Manila', ae.event_end_at)::date = target.event_date
           )
-          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($5))
+          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($4))
           AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       )
     `,
@@ -227,7 +241,6 @@ async function hasExistingSoeFrcManualAttendance() {
       [...SOE_FRC_EVENT_DATES],
       "2026-2027",
       "first_semester",
-      "Flag Raising Ceremony",
       "School of Engineering",
     ],
   );
@@ -247,13 +260,12 @@ async function hasExistingScjeFrcManualAttendance() {
         JOIN school_years sy ON sy.id = ae.school_year_id
         WHERE sy.name = $2
           AND sy.semester = $3
-          AND LOWER(TRIM(ae.name)) = LOWER(TRIM($4))
           AND (
             ae.event_date = target.event_date
             OR timezone('Asia/Manila', ae.event_start_at)::date = target.event_date
             OR timezone('Asia/Manila', ae.event_end_at)::date = target.event_date
           )
-          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($5))
+          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($4))
           AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       )
     `,
@@ -261,7 +273,6 @@ async function hasExistingScjeFrcManualAttendance() {
       [...SCJE_FRC_EVENT_DATES],
       "2026-2027",
       "first_semester",
-      "Flag Raising Ceremony",
       "School of Criminal Justice Education",
     ],
   );
@@ -380,6 +391,14 @@ async function runSeeders() {
       bootstrapApplied: hasExistingScjeFrcManualAttendance,
     },
     {
+      key: RELINK_FRC_MANUAL_ATTENDANCE_EVENTS_SEED_KEY,
+      icon: "🔗",
+      label: "Relink FRC manual attendance events",
+      processing:
+        "Relinking historical FRC manual attendance to canonical dated events only once",
+      seeder: seedRelinkFrcManualAttendanceEvents,
+    },
+    {
       key: MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY,
       icon: "🏫",
       label: "Manual attendance CCS college normalization",
@@ -484,6 +503,11 @@ async function runSeeders() {
     | undefined;
   const scjeFrcRun = oneTimeRuns.get(SCJE_FRC_MANUAL_ATTENDEES_SEED_KEY) as
     | SeederRun<Awaited<ReturnType<typeof seedScjeFrcManualAttendees>>>
+    | undefined;
+  const relinkFrcRun = oneTimeRuns.get(
+    RELINK_FRC_MANUAL_ATTENDANCE_EVENTS_SEED_KEY,
+  ) as
+    | SeederRun<Awaited<ReturnType<typeof seedRelinkFrcManualAttendanceEvents>>>
     | undefined;
   const ccsRun = oneTimeRuns.get(MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY) as
     | SeederRun<Awaited<ReturnType<typeof seedManualAttendanceCcsCollege>>>
@@ -626,6 +650,37 @@ async function runSeeders() {
   } else {
     consoleUi.skipped(
       "SCJE FRC manual-attendance seeder is already applied — it was not executed again.",
+    );
+  }
+
+  if (relinkFrcRun) {
+    const result = relinkFrcRun.result;
+    const summary = `${result.recordsRelinked} record(s) relinked • ${result.duplicatesRemoved} duplicate(s) removed • ${result.emptyEventsDeleted} empty event(s) deleted`;
+
+    if (result.alreadySeeded) {
+      consoleUi.skipped(
+        `FRC manual-attendance event links were already correct — ${summary}.`,
+      );
+    } else {
+      consoleUi.success(
+        `Repaired FRC manual-attendance event links: ${summary}.`,
+        relinkFrcRun.durationMs,
+      );
+    }
+
+    result.remarkGroups.forEach((group) => {
+      consoleUi.detail(
+        group.remarks,
+        `${group.recordsRelinked} relinked • ${group.duplicatesRemoved} duplicate(s) removed`,
+      );
+    });
+
+    if (result.deletedEvents.length > 0) {
+      consoleUi.detail("Empty events deleted", result.deletedEvents.join(", "));
+    }
+  } else {
+    consoleUi.skipped(
+      "FRC manual-attendance event relink seeder is already applied — it was not executed again.",
     );
   }
 

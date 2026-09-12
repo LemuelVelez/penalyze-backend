@@ -12,7 +12,7 @@ import {
 
 const TARGET_SCHOOL_YEAR = "2026-2027";
 const TARGET_SEMESTER = "first_semester";
-const TARGET_EVENT_NAME = "Flag Raising Ceremony";
+const TARGET_EVENT_NAME = "FRC September 01";
 const TARGET_EVENT_DATE = "2026-09-01";
 const PLACEHOLDER_STUDENT_ID = "TC-20-A-00000";
 const DEFAULT_COLLEGE = "College of Computing Studies";
@@ -277,16 +277,15 @@ async function getOrCreateTargetEvent(
         SELECT id, school_year_id
         FROM attendance_events
         WHERE school_year_id = $1
-          AND LOWER(TRIM(name)) = LOWER(TRIM($2))
           AND (
-            event_date = $3::date
-            OR timezone('Asia/Manila', event_start_at)::date = $3::date
-            OR timezone('Asia/Manila', event_end_at)::date = $3::date
+            event_date = $2::date
+            OR timezone('Asia/Manila', event_start_at)::date = $2::date
+            OR timezone('Asia/Manila', event_end_at)::date = $2::date
           )
-        ORDER BY created_at ASC
+        ORDER BY created_at ASC, id ASC
         LIMIT 1
       `,
-      [schoolYearId, TARGET_EVENT_NAME, TARGET_EVENT_DATE],
+      [schoolYearId, TARGET_EVENT_DATE],
     );
 
     if (existing.rows[0]) return existing.rows[0];
