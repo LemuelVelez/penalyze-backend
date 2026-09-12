@@ -7,6 +7,7 @@ import { seedFrcManualAttendees } from "../seeder/frc-manual-attendees.seeder";
 import { seedCafFrcManualAttendees } from "../seeder/frc-caf-manual-attendees.seeder";
 import { seedLamsFrcManualAttendees } from "../seeder/frc-lams-manual-attendees.seeder";
 import { seedSoeFrcManualAttendees } from "../seeder/frc-soe-manual-attendees.seeder";
+import { seedScjeFrcManualAttendees } from "../seeder/frc-scje-manual-attendees.seeder";
 import { seedManualAttendanceCcsCollege } from "../seeder/manual-attendance-ccs-college.seeder";
 import { closeDatabasePool, query } from "../../lib/db";
 import { consoleUi, formatDuration } from "./console-ui";
@@ -19,6 +20,8 @@ const LAMS_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-lams-frc-manual-attendees-v1";
 const LAMS_FRC_EVENT_DATES = ["2026-08-24", "2026-09-01"] as const;
 const SOE_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-soe-frc-manual-attendees-v1";
 const SOE_FRC_EVENT_DATES = ["2026-08-24"] as const;
+const SCJE_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-scje-frc-manual-attendees-v1";
+const SCJE_FRC_EVENT_DATES = ["2026-09-01"] as const;
 const MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY =
   "manual-attendance-ccs-college-v1";
 
@@ -232,6 +235,40 @@ async function hasExistingSoeFrcManualAttendance() {
   return Number(result.rows[0]?.event_count ?? 0) === SOE_FRC_EVENT_DATES.length;
 }
 
+async function hasExistingScjeFrcManualAttendance() {
+  const result = await query<{ event_count: string }>(
+    `
+      SELECT COUNT(*)::text AS event_count
+      FROM unnest($1::date[]) AS target(event_date)
+      WHERE EXISTS (
+        SELECT 1
+        FROM manual_attendance_records mar
+        JOIN attendance_events ae ON ae.id = mar.event_id
+        JOIN school_years sy ON sy.id = ae.school_year_id
+        WHERE sy.name = $2
+          AND sy.semester = $3
+          AND LOWER(TRIM(ae.name)) = LOWER(TRIM($4))
+          AND (
+            ae.event_date = target.event_date
+            OR timezone('Asia/Manila', ae.event_start_at)::date = target.event_date
+            OR timezone('Asia/Manila', ae.event_end_at)::date = target.event_date
+          )
+          AND LOWER(TRIM(COALESCE(mar.college, ''))) = LOWER(TRIM($5))
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+      )
+    `,
+    [
+      [...SCJE_FRC_EVENT_DATES],
+      "2026-2027",
+      "first_semester",
+      "Flag Raising Ceremony",
+      "School of Criminal Justice Education",
+    ],
+  );
+
+  return Number(result.rows[0]?.event_count ?? 0) === SCJE_FRC_EVENT_DATES.length;
+}
+
 async function bootstrapPreviouslyAppliedOneTimeSeeders(
   seeders: readonly OneTimeSeederDefinition<unknown>[],
 ) {
@@ -332,6 +369,15 @@ async function runSeeders() {
         "Seeding the bundled School of Engineering FRC attendance sheet into manual attendance only once",
       seeder: seedSoeFrcManualAttendees,
       bootstrapApplied: hasExistingSoeFrcManualAttendance,
+    },
+    {
+      key: SCJE_FRC_MANUAL_ATTENDEES_SEED_KEY,
+      icon: "🛡️",
+      label: "SCJE FRC manual attendees",
+      processing:
+        "Seeding the bundled School of Criminal Justice Education FRC attendance sheet into manual attendance only once",
+      seeder: seedScjeFrcManualAttendees,
+      bootstrapApplied: hasExistingScjeFrcManualAttendance,
     },
     {
       key: MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY,
@@ -435,6 +481,9 @@ async function runSeeders() {
     | undefined;
   const soeFrcRun = oneTimeRuns.get(SOE_FRC_MANUAL_ATTENDEES_SEED_KEY) as
     | SeederRun<Awaited<ReturnType<typeof seedSoeFrcManualAttendees>>>
+    | undefined;
+  const scjeFrcRun = oneTimeRuns.get(SCJE_FRC_MANUAL_ATTENDEES_SEED_KEY) as
+    | SeederRun<Awaited<ReturnType<typeof seedScjeFrcManualAttendees>>>
     | undefined;
   const ccsRun = oneTimeRuns.get(MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY) as
     | SeederRun<Awaited<ReturnType<typeof seedManualAttendanceCcsCollege>>>
@@ -554,6 +603,29 @@ async function runSeeders() {
   } else {
     consoleUi.skipped(
       "SOE FRC manual-attendance seeder is already applied — it was not executed again.",
+    );
+  }
+
+  if (scjeFrcRun) {
+    const result = scjeFrcRun.result;
+    if (result.alreadySeeded) {
+      consoleUi.skipped(
+        "SCJE FRC manual attendance is already seeded — no new records were created.",
+      );
+    } else {
+      consoleUi.success(
+        `Created ${result.manualAttendanceRecordsCreated} SCJE FRC manual attendance record(s) and ${result.eventsCreated} event(s).`,
+        scjeFrcRun.durationMs,
+      );
+    }
+    if (result.unresolvedAttendees.length > 0) {
+      consoleUi.warning(
+        `Could not safely resolve ${result.unresolvedAttendees.length} SCJE attendee(s): ${result.unresolvedAttendees.join(", ")}`,
+      );
+    }
+  } else {
+    consoleUi.skipped(
+      "SCJE FRC manual-attendance seeder is already applied — it was not executed again.",
     );
   }
 
