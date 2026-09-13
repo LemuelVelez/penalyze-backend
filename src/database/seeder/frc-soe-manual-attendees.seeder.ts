@@ -6,6 +6,7 @@ import type { PoolClient } from "pg";
 
 import { closeDatabasePool, withTransaction } from "../../lib/db";
 import { refreshAttendanceFinalResults } from "../../services/attendance.service";
+import { normalizeAttendanceEventIdentityName } from "../../services/attendance-event-identity";
 
 const TARGET_SCHOOL_YEAR = "2026-2027";
 const TARGET_SEMESTER = "first_semester";
@@ -23,14 +24,90 @@ const DATA_DIRECTORY = path.join(
   "engineering-frc",
 );
 
+type EventDefinition = {
+  eventDate: string;
+  eventDateLabel: string;
+  eventName: string;
+  remarks: string;
+  description: string;
+};
+
 const FIXTURES = [
   {
     fileName: "FRC__August_24_2026_.csv",
     eventDate: "2026-08-24",
     eventDateLabel: "August 24, 2026",
     eventName: "FRC August 24",
+    remarks:
+      "Seeded as manual attendance from the August 24, 2026 SOE FRC attendance sheet.",
+    description:
+      "Seeded manual attendance event for the August 24, 2026 SOE Flag Raising Ceremony.",
   },
-] as const;
+  {
+    fileName: "attendance_Aug_24_2026.csv",
+    eventDate: "2026-08-24",
+    eventDateLabel: "August 24, 2026",
+    eventName: "FRC August 24",
+    remarks:
+      "Seeded as manual attendance from the August 24, 2026 SOE FRC secondary scanner export.",
+    description:
+      "Seeded manual attendance event for the August 24, 2026 SOE Flag Raising Ceremony.",
+  },
+  {
+    fileName: "Buwan_Ng_Wika_Out.csv",
+    eventDate: "2026-08-27",
+    eventDateLabel: "August 27, 2026",
+    eventName: "Buwan ng Wika August 27",
+    remarks:
+      "Seeded as manual attendance from the August 27, 2026 SOE Buwan ng Wika attendance sheet.",
+    description:
+      "Seeded manual attendance event for the August 27, 2026 SOE Buwan ng Wika celebration.",
+  },
+] as const satisfies readonly (EventDefinition & { fileName: string })[];
+
+const WALK_IN_GROUPS = [
+  {
+    eventDate: "2026-08-24",
+    eventDateLabel: "August 24, 2026",
+    eventName: "FRC August 24",
+    remarks:
+      "Seeded as manual attendance from the August 24, 2026 SOE FRC walk-in attendee list.",
+    description:
+      "Seeded manual attendance event for the August 24, 2026 SOE Flag Raising Ceremony.",
+    attendees: [
+      { name: "Christian Kurl E. Sumangil", studentId: "TC-26-A-00413" },
+      { name: "Achilles D. Sanchez", studentId: "TC-26-A-00471" },
+      { name: "Bobby Jose C. Sanchez", studentId: "TC-26-A-00470" },
+      { name: "John Cydie Bagutua", studentId: "" },
+      { name: "Albert Fanuncio", studentId: "TC-26-A-00670" },
+      { name: "Angelou Ozarraga", studentId: "TC-26-A-01076" },
+      { name: "Deo E. Garcia", studentId: "TC-26-A-00578" },
+      { name: "Vinzent E. Alub", studentId: "TC-26-A-00236" },
+    ],
+  },
+  {
+    eventDate: "2026-08-27",
+    eventDateLabel: "August 27, 2026",
+    eventName: "Buwan ng Wika August 27",
+    remarks:
+      "Seeded as manual attendance from the August 27, 2026 SOE Buwan ng Wika walk-in attendee list.",
+    description:
+      "Seeded manual attendance event for the August 27, 2026 SOE Buwan ng Wika celebration.",
+    attendees: [{ name: "Angelou Ozarraga", studentId: "TC-26-A-01076" }],
+  },
+  {
+    eventDate: "2026-09-01",
+    eventDateLabel: "September 1, 2026",
+    eventName: "FRC September 01",
+    remarks:
+      "Seeded as manual attendance from the September 1, 2026 SOE FRC walk-in attendee list.",
+    description:
+      "Seeded manual attendance event for the September 1, 2026 SOE Flag Raising Ceremony.",
+    attendees: [{ name: "Celio Rendoque", studentId: "TC-24-A-00339" }],
+  },
+] as const satisfies readonly (EventDefinition & {
+  attendees: readonly { name: string; studentId: string }[];
+})[];
 
 type FixtureDefinition = (typeof FIXTURES)[number];
 
@@ -46,6 +123,9 @@ type ManualAttendee = {
   eventDateLabel: string;
   sourceFile: string;
   sourceRowNumber: number;
+  eventName: string;
+  eventDescription: string;
+  remarks: string;
 };
 
 type StudentLookup = {
@@ -60,12 +140,17 @@ type StudentLookup = {
 type TargetEvent = {
   id: string;
   school_year_id: string;
+  name: string;
 };
 
 type ParsedFixture = {
   fixture: FixtureDefinition;
   rows: ManualAttendee[];
   skippedJunkRows: number;
+};
+
+type EventSeedGroup = EventDefinition & {
+  rows: ManualAttendee[];
 };
 
 export type SeedSoeFrcManualAttendeesResult = {
@@ -397,6 +482,56 @@ function parseQuotedCsvRecord(record: string) {
     .map((value) => value.replace(/\"\"/g, '"'));
 }
 
+function normalizeFixtureDate(value: unknown, expectedEventDate: string) {
+  const text = clean(value);
+  const match = text.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/);
+  if (!match) return null;
+
+  const first = Number(match[1]);
+  const second = Number(match[2]);
+  const year = Number(match[3]);
+
+  const toIsoDate = (month: number, day: number) => {
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    const date = new Date(Date.UTC(year, month - 1, day));
+    if (
+      date.getUTCFullYear() !== year ||
+      date.getUTCMonth() !== month - 1 ||
+      date.getUTCDate() !== day
+    ) {
+      return null;
+    }
+    return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  };
+
+  const candidates = [toIsoDate(first, second), toIsoDate(second, first)].filter(
+    (candidate): candidate is string => Boolean(candidate),
+  );
+
+  return candidates.includes(expectedEventDate) ? expectedEventDate : null;
+}
+
+function getWalkInRows(): ManualAttendee[] {
+  return WALK_IN_GROUPS.flatMap((group) =>
+    group.attendees.map((attendee, index) => ({
+      studentId: normalizeStudentId(attendee.studentId),
+      name: normalizeDisplayName(attendee.name),
+      yearLevel: "",
+      college: DEFAULT_COLLEGE,
+      program: DEFAULT_PROGRAM,
+      institution: DEFAULT_INSTITUTION,
+      scannedAt: null,
+      eventDate: group.eventDate,
+      eventDateLabel: group.eventDateLabel,
+      sourceFile: `${group.eventName} walk-in attendee list`,
+      sourceRowNumber: index + 1,
+      eventName: group.eventName,
+      eventDescription: group.description,
+      remarks: group.remarks,
+    })),
+  );
+}
+
 function parseFixture(fixture: FixtureDefinition): ParsedFixture {
   const contents = fs
     .readFileSync(getFixturePath(fixture.fileName), "utf8")
@@ -466,9 +601,9 @@ function parseFixture(fixture: FixtureDefinition): ParsedFixture {
     }
 
     const checkInDate = clean(values[checkInDateColumnIndex]);
-    if (checkInDate !== "08-24-2026") {
+    if (!normalizeFixtureDate(checkInDate, fixture.eventDate)) {
       throw new Error(
-        `Unexpected CHECK-IN DATE in ${fixture.fileName} row ${sourceRowNumber}: ${checkInDate || "(empty)"}.`,
+        `Unexpected CHECK-IN DATE in ${fixture.fileName} row ${sourceRowNumber}: ${checkInDate || "(empty)"}. Expected ${fixture.eventDate}.`,
       );
     }
 
@@ -495,10 +630,37 @@ function parseFixture(fixture: FixtureDefinition): ParsedFixture {
       eventDateLabel: fixture.eventDateLabel,
       sourceFile: fixture.fileName,
       sourceRowNumber,
+      eventName: fixture.eventName,
+      eventDescription: fixture.description,
+      remarks: fixture.remarks,
     });
   });
 
   return { fixture, rows, skippedJunkRows };
+}
+
+function groupRowsByEvent(rows: ManualAttendee[]) {
+  const groups = new Map<string, EventSeedGroup>();
+
+  rows.forEach((row) => {
+    const key = `${row.eventDate}:${normalizeAttendanceEventIdentityName(row.eventName)}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.rows.push(row);
+      return;
+    }
+
+    groups.set(key, {
+      eventDate: row.eventDate,
+      eventDateLabel: row.eventDateLabel,
+      eventName: row.eventName,
+      remarks: row.remarks,
+      description: row.eventDescription,
+      rows: [row],
+    });
+  });
+
+  return Array.from(groups.values());
 }
 
 function getEventBounds(rows: ManualAttendee[]) {
@@ -540,11 +702,11 @@ async function getTargetSchoolYearId(client: PoolClient) {
 async function getOrCreateTargetEvent(
   client: PoolClient,
   schoolYearId: string,
-  parsedFixture: ParsedFixture,
+  eventGroup: EventSeedGroup,
 ) {
   const existing = await client.query<TargetEvent>(
     `
-      SELECT id, school_year_id
+      SELECT id, school_year_id, name
       FROM attendance_events
       WHERE school_year_id = $1
         AND (
@@ -553,16 +715,43 @@ async function getOrCreateTargetEvent(
           OR timezone('Asia/Manila', event_end_at)::date = $2::date
         )
       ORDER BY created_at ASC, id ASC
-      LIMIT 1
     `,
-    [schoolYearId, parsedFixture.fixture.eventDate],
+    [schoolYearId, eventGroup.eventDate],
   );
 
-  if (existing.rows[0]) {
-    return { event: existing.rows[0], created: false };
+  const targetIdentity = normalizeAttendanceEventIdentityName(
+    eventGroup.eventName,
+  );
+  const namedMatch = existing.rows.find(
+    (event) =>
+      normalizeAttendanceEventIdentityName(event.name) === targetIdentity,
+  );
+  if (namedMatch) {
+    return { event: namedMatch, created: false };
   }
 
-  const bounds = getEventBounds(parsedFixture.rows);
+  const frcIdentity = normalizeAttendanceEventIdentityName("FRC");
+  const compatibleFrcMatch =
+    targetIdentity === frcIdentity
+      ? existing.rows.find((event) =>
+          normalizeAttendanceEventIdentityName(event.name).includes(
+            frcIdentity,
+          ),
+        )
+      : undefined;
+  if (compatibleFrcMatch) {
+    return { event: compatibleFrcMatch, created: false };
+  }
+
+  const dateOnlyFallback =
+    targetIdentity === frcIdentity && existing.rows.length === 1
+      ? existing.rows[0]
+      : undefined;
+  if (dateOnlyFallback) {
+    return { event: dateOnlyFallback, created: false };
+  }
+
+  const bounds = getEventBounds(eventGroup.rows);
   const created = await client.query<TargetEvent>(
     `
       INSERT INTO attendance_events (
@@ -586,15 +775,15 @@ async function getOrCreateTargetEvent(
           1
         )
       )
-      RETURNING id, school_year_id
+      RETURNING id, school_year_id, name
     `,
     [
       schoolYearId,
-      parsedFixture.fixture.eventName,
-      parsedFixture.fixture.eventDate,
+      eventGroup.eventName,
+      eventGroup.eventDate,
       bounds.startAt,
       bounds.endAt,
-      `Seeded manual attendance event for the ${parsedFixture.fixture.eventDateLabel} SOE Flag Raising Ceremony.`,
+      eventGroup.description,
     ],
   );
 
@@ -758,8 +947,11 @@ function hydrateRowsWithStudents(
     return {
       ...row,
       name:
-        normalizeDisplayName(row.name) ||
-        normalizeDisplayName(existingStudent?.name),
+        row.scannedAt === null
+          ? normalizeDisplayName(existingStudent?.name) ||
+            normalizeDisplayName(row.name)
+          : normalizeDisplayName(row.name) ||
+            normalizeDisplayName(existingStudent?.name),
       yearLevel:
         normalizeYearLevel(row.yearLevel) ||
         normalizeYearLevel(existingStudent?.year_level),
@@ -859,8 +1051,6 @@ async function insertManualAttendanceRow(
   eventId: string,
   row: ManualAttendee,
 ) {
-  const remarks =
-    "Seeded as manual attendance from the August 24, 2026 SOE FRC attendance sheet.";
   const inserted = await client.query<{ id: string }>(
     `
       INSERT INTO manual_attendance_records (
@@ -908,7 +1098,7 @@ async function insertManualAttendanceRow(
       DEFAULT_COLLEGE,
       DEFAULT_PROGRAM,
       row.institution || DEFAULT_INSTITUTION,
-      remarks,
+      row.remarks,
       row.scannedAt,
     ],
   );
@@ -922,19 +1112,21 @@ export async function seedSoeFrcManualAttendees(
   onProgress?.("Verifying bundled SOE FRC manual-attendance CSV fixture");
   assertFixtureFilesExist();
 
-  onProgress?.("Parsing the bundled SOE FRC attendance CSV");
+  onProgress?.("Parsing the bundled SOE manual-attendance CSV fixtures");
   const parsedFixtures = FIXTURES.map((fixture) => parseFixture(fixture));
-  const rowsParsed = parsedFixtures.reduce(
-    (sum, parsedFixture) => sum + parsedFixture.rows.length,
-    0,
+  const walkInRows = getWalkInRows();
+  const fixtureRows = parsedFixtures.flatMap((parsedFixture) =>
+    parsedFixture.rows,
   );
+  const eventGroups = groupRowsByEvent([...fixtureRows, ...walkInRows]);
+  const rowsParsed = fixtureRows.length;
   const skippedJunkRows = parsedFixtures.reduce(
     (sum, parsedFixture) => sum + parsedFixture.skippedJunkRows,
     0,
   );
 
   onProgress?.(
-    "Resolving SY 2026-2027 / First Semester and SOE Flag Raising Ceremony event",
+    "Resolving SY 2026-2027 / First Semester and SOE attendance events",
   );
   const transactionResult = await withTransaction(async (client) => {
     const schoolYearId = await getTargetSchoolYearId(client);
@@ -945,22 +1137,21 @@ export async function seedSoeFrcManualAttendees(
     const unresolvedKeys = new Set<string>();
     const resolvedStudentCache = new Map<string, StudentLookup | null>();
 
-    for (const parsedFixture of parsedFixtures) {
-      const targetEvent = await getOrCreateTargetEvent(
-        client,
-        schoolYearId,
-        parsedFixture,
-      );
-      if (targetEvent.created) eventsCreated += 1;
-
+    for (const eventGroup of eventGroups) {
       const resolvedRows = await resolveRows(
         client,
-        parsedFixture.rows,
+        eventGroup.rows,
         unresolvedAttendees,
         unresolvedKeys,
         resolvedStudentCache,
       );
       const mergedRows = mergeAttendeeRows(resolvedRows);
+      const targetEvent = await getOrCreateTargetEvent(client, schoolYearId, {
+        ...eventGroup,
+        rows: mergedRows,
+      });
+      if (targetEvent.created) eventsCreated += 1;
+
       const existingStudents = await hydrateExistingStudents(
         client,
         mergedRows,
@@ -1024,8 +1215,8 @@ if (require.main === module) {
     .then(async (result) => {
       console.log(
         result.alreadySeeded
-          ? "SOE FRC manual attendance is already seeded."
-          : `Created ${result.manualAttendanceRecordsCreated} SOE FRC manual attendance record(s) and ${result.eventsCreated} event(s).`,
+          ? "SOE manual attendance is already seeded."
+          : `Created ${result.manualAttendanceRecordsCreated} SOE manual attendance record(s) across August 24 FRC, August 27 Buwan ng Wika, and September 1 FRC, plus ${result.eventsCreated} event(s).`,
       );
       if (result.unresolvedAttendees.length > 0) {
         console.warn(
@@ -1035,7 +1226,7 @@ if (require.main === module) {
       await closeDatabasePool();
     })
     .catch(async (error) => {
-      console.error("SOE FRC manual-attendance seeder failed:", error);
+      console.error("SOE manual-attendance seeder failed:", error);
       await closeDatabasePool();
       process.exit(1);
     });

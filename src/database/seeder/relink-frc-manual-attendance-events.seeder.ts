@@ -22,6 +22,31 @@ const RELINK_GROUPS = [
   },
   {
     remarks:
+      "Seeded as manual attendance from the August 24, 2026 SOE FRC secondary scanner export.",
+    eventDate: "2026-08-24",
+  },
+  {
+    remarks:
+      "Seeded as manual attendance from the August 24, 2026 SOE FRC walk-in attendee list.",
+    eventDate: "2026-08-24",
+  },
+  {
+    remarks:
+      "Seeded as manual attendance from the August 27, 2026 SOE Buwan ng Wika attendance sheet.",
+    eventDate: "2026-08-27",
+  },
+  {
+    remarks:
+      "Seeded as manual attendance from the August 27, 2026 SOE Buwan ng Wika walk-in attendee list.",
+    eventDate: "2026-08-27",
+  },
+  {
+    remarks:
+      "Seeded as manual attendance from the September 1, 2026 SOE FRC walk-in attendee list.",
+    eventDate: "2026-09-01",
+  },
+  {
+    remarks:
       "Seeded as manual attendance from the August 17, 2026 CAF FRC scanner list.",
     eventDate: "2026-08-17",
   },

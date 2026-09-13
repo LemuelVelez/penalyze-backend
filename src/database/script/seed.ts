@@ -19,8 +19,8 @@ const CAF_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-caf-frc-manual-attendees-v1";
 const CAF_FRC_EVENT_DATES = ["2026-08-17", "2026-08-24", "2026-09-01"] as const;
 const LAMS_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-lams-frc-manual-attendees-v1";
 const LAMS_FRC_EVENT_DATES = ["2026-08-24", "2026-09-01"] as const;
-const SOE_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-soe-frc-manual-attendees-v1";
-const SOE_FRC_EVENT_DATES = ["2026-08-24"] as const;
+const SOE_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-soe-frc-manual-attendees-v2";
+const SOE_FRC_EVENT_DATES = ["2026-08-24", "2026-08-27", "2026-09-01"] as const;
 const SCJE_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-scje-frc-manual-attendees-v1";
 const SCJE_FRC_EVENT_DATES = ["2026-09-01"] as const;
 const RELINK_FRC_MANUAL_ATTENDANCE_EVENTS_SEED_KEY =
@@ -375,9 +375,9 @@ async function runSeeders() {
     {
       key: SOE_FRC_MANUAL_ATTENDEES_SEED_KEY,
       icon: "⚙️",
-      label: "SOE FRC manual attendees",
+      label: "SOE manual attendees",
       processing:
-        "Seeding the bundled School of Engineering FRC attendance sheet into manual attendance only once",
+        "Seeding the bundled School of Engineering FRC and Buwan ng Wika attendance into manual attendance only once",
       seeder: seedSoeFrcManualAttendees,
       bootstrapApplied: hasExistingSoeFrcManualAttendance,
     },
@@ -611,11 +611,11 @@ async function runSeeders() {
     const result = soeFrcRun.result;
     if (result.alreadySeeded) {
       consoleUi.skipped(
-        "SOE FRC manual attendance is already seeded — no new records were created.",
+        "SOE manual attendance is already seeded — no new records were created.",
       );
     } else {
       consoleUi.success(
-        `Created ${result.manualAttendanceRecordsCreated} SOE FRC manual attendance record(s) and ${result.eventsCreated} event(s).`,
+        `Created ${result.manualAttendanceRecordsCreated} SOE manual attendance record(s) across August 24 FRC, August 27 Buwan ng Wika, and September 1 FRC, plus ${result.eventsCreated} event(s).`,
         soeFrcRun.durationMs,
       );
     }
@@ -626,7 +626,7 @@ async function runSeeders() {
     }
   } else {
     consoleUi.skipped(
-      "SOE FRC manual-attendance seeder is already applied — it was not executed again.",
+      "SOE manual-attendance seeder is already applied — it was not executed again.",
     );
   }
 
