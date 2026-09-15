@@ -1950,25 +1950,39 @@ type AttendanceRecordWithEventRosterScope = AttendanceRecord & {
   attendance_school_year_id: string | null;
 };
 
-export function getAttendanceRecordEventRosterCollegeSql(recordAlias: string) {
-  return `
-    LOWER(TRIM(COALESCE(
-      (
+export function getCanonicalCollegeKeySql(
+  recordAlias: string,
+  studentAlias?: string,
+) {
+  const studentCollegeSql = studentAlias
+    ? `NULLIF(TRIM(${studentAlias}.college), '')`
+    : `(
         SELECT NULLIF(TRIM(scope_student.college), '')
         FROM students scope_student
         WHERE LOWER(TRIM(scope_student.student_id)) = LOWER(TRIM(${recordAlias}.student_id))
         LIMIT 1
-      ),
-      NULLIF(TRIM(${recordAlias}.college), ''),
-      CASE
-        WHEN NULLIF(TRIM(${recordAlias}.program), '') IS NOT NULL
-          THEN 'program:' || LOWER(TRIM(${recordAlias}.program))
-        WHEN NULLIF(TRIM(${recordAlias}.institution), '') IS NOT NULL
-          THEN 'institution:' || LOWER(TRIM(${recordAlias}.institution))
-        ELSE 'student:' || LOWER(TRIM(${recordAlias}.student_id))
-      END
-    )))
-  `;
+      )`;
+
+  return `NULLIF(
+    TRIM(
+      REGEXP_REPLACE(
+        REGEXP_REPLACE(
+          LOWER(REPLACE(COALESCE(${studentCollegeSql}, NULLIF(TRIM(${recordAlias}.college), '')), '&', ' and ')),
+          '[^a-z0-9]+',
+          ' ',
+          'g'
+        ),
+        '[[:space:]]+',
+        ' ',
+        'g'
+      )
+    ),
+    ''
+  )`;
+}
+
+export function getAttendanceRecordEventRosterCollegeSql(recordAlias: string) {
+  return getCanonicalCollegeKeySql(recordAlias);
 }
 
 function getAttendanceRecordSortTime(record: AttendanceRecord) {
@@ -1980,27 +1994,60 @@ function getAttendanceRecordSortTime(record: AttendanceRecord) {
 
 const ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL =
   getAttendanceRecordEventRosterCollegeSql("ar");
+const MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL =
+  getCanonicalCollegeKeySql("mar");
 const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
   event_participation AS (
     SELECT DISTINCT
       ar.school_year_id,
-      ar.event_id,
+      COALESCE(ar.event_id, ai.event_id) AS event_id,
       LOWER(TRIM(ar.student_id)) AS normalized_student_id
     FROM attendance_records ar
+    LEFT JOIN attendance_imports ai
+      ON ai.id = ar.import_id
+     AND ai.deleted_at IS NULL
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
-      AND ar.event_id IS NOT NULL
+      AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
       AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
+
+    UNION
+
+    SELECT DISTINCT
+      mar.school_year_id,
+      mar.event_id,
+      LOWER(TRIM(mar.student_id)) AS normalized_student_id
+    FROM manual_attendance_records mar
+    WHERE mar.event_id IS NOT NULL
+      AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+      AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+      AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
   )
 `;
 export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
   event_roster_scope AS (
     SELECT DISTINCT
       ar.school_year_id,
-      ar.event_id,
+      COALESCE(ar.event_id, ai.event_id) AS event_id,
       ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
     FROM attendance_records ar
+    LEFT JOIN attendance_imports ai
+      ON ai.id = ar.import_id
+     AND ai.deleted_at IS NULL
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
-      AND ar.event_id IS NOT NULL
+      AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
+      AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
+
+    UNION
+
+    SELECT DISTINCT
+      mar.school_year_id,
+      mar.event_id,
+      ${MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL} AS college_key
+    FROM manual_attendance_records mar
+    WHERE mar.event_id IS NOT NULL
+      AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+      AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+      AND ${MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
   )
 `;
 const ATTENDANCE_ABSENCE_SYNC_LOCK_SQL =
@@ -5462,24 +5509,6 @@ function normalizeImportIds(value: unknown) {
   ).sort((left, right) => left.localeCompare(right));
 }
 
-const ATTENDANCE_EVENT_KEY_SQL = (
-  recordAlias: "ar" | "mar",
-  eventAlias = "ae",
-) => `COALESCE(
-  ${recordAlias}.event_id::TEXT,
-  NULLIF(
-    LOWER(
-      REGEXP_REPLACE(
-        TRIM(${eventAlias}.name),
-        '[[:space:]]+',
-        ' ',
-        'g'
-      )
-    ),
-    ''
-  )
-)`;
-
 const CALCULATION_SOURCE_TYPE_ORDER: CalculationSourceType[] = [
   "imported",
   "manual",
@@ -5538,6 +5567,240 @@ function getCalculationSourceFlags(sourceTypes?: CalculationSourceType[]) {
   };
 }
 
+
+async function resolveUnattachedAttendanceEventIdsWithClient(
+  client: PoolClient,
+  schoolYearId: string | null,
+) {
+  await client.query(
+    `
+      UPDATE attendance_records ar
+      SET event_id = ai.event_id,
+          updated_at = NOW()
+      FROM attendance_imports ai
+      WHERE ar.import_id = ai.id
+        AND ar.event_id IS NULL
+        AND ai.event_id IS NOT NULL
+        AND ai.deleted_at IS NULL
+        AND ar.deleted_at IS NULL
+        AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+    `,
+    [schoolYearId],
+  );
+
+  const unresolvedImports = await client.query<{
+    import_id: string;
+    school_year_id: string | null;
+    event_name_snapshot: string | null;
+    created_at: Date | string;
+  }>(
+    `
+      SELECT DISTINCT
+        ai.id AS import_id,
+        COALESCE(ai.school_year_id, ar.school_year_id) AS school_year_id,
+        ai.event_name_snapshot,
+        ai.created_at
+      FROM attendance_records ar
+      JOIN attendance_imports ai ON ai.id = ar.import_id
+      WHERE ar.event_id IS NULL
+        AND ai.event_id IS NULL
+        AND ai.deleted_at IS NULL
+        AND ar.deleted_at IS NULL
+        AND NULLIF(TRIM(ai.event_name_snapshot), '') IS NOT NULL
+        AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+      LIMIT 250
+    `,
+    [schoolYearId],
+  );
+
+  const unresolvedManual = await client.query<{
+    id: string;
+    school_year_id: string | null;
+    remarks: string | null;
+    scanned_at: Date | string | null;
+  }>(
+    `
+      SELECT id, school_year_id, remarks, scanned_at
+      FROM manual_attendance_records
+      WHERE event_id IS NULL
+        AND COALESCE(attendance_type, 'manual') <> 'zero_attendance'
+        AND NULLIF(TRIM(remarks), '') IS NOT NULL
+        AND LOWER(TRIM(remarks)) <> LOWER($2::TEXT)
+        AND ($1::uuid IS NULL OR school_year_id = $1::uuid)
+      LIMIT 250
+    `,
+    [schoolYearId, ZERO_ATTENDANCE_REMARK],
+  );
+
+  if (!unresolvedImports.rows.length && !unresolvedManual.rows.length) return;
+
+  const eventResult = await client.query<AttendanceEventRecord>(
+    `
+      SELECT e.*, 0::INT AS attendees_count
+      FROM attendance_events e
+      WHERE ($1::uuid IS NULL OR e.school_year_id = $1::uuid)
+      ORDER BY e.event_order ASC NULLS LAST, e.created_at ASC
+    `,
+    [schoolYearId],
+  );
+
+  const findUniqueHighConfidenceEvent = (
+    name: string,
+    schoolYear: string | null,
+    timestamp?: Date | string | null,
+  ) => {
+    const ranked = eventResult.rows
+      .filter((event) => event.school_year_id === schoolYear)
+      .map((event) => ({
+        event,
+        match: scoreAttendanceEventIdentity(
+          { name, startAt: timestamp ?? undefined },
+          {
+            name: event.name,
+            startAt: event.event_start_at,
+            endAt: event.event_end_at,
+          },
+        ),
+      }))
+      .sort((left, right) => right.match.score - left.match.score);
+    const best = ranked[0];
+    const second = ranked[1];
+
+    if (!best || best.match.score < 0.94) return null;
+    if (second && best.match.score - second.match.score < 0.08) return null;
+    return best.event;
+  };
+
+  for (const row of unresolvedImports.rows) {
+    const event = findUniqueHighConfidenceEvent(
+      row.event_name_snapshot ?? "",
+      row.school_year_id,
+      row.created_at,
+    );
+    if (!event) continue;
+
+    await client.query(
+      `
+        UPDATE attendance_imports
+        SET event_id = $2::uuid
+        WHERE id = $1::uuid
+          AND event_id IS NULL
+      `,
+      [row.import_id, event.id],
+    );
+    await client.query(
+      `
+        UPDATE attendance_records
+        SET event_id = $2::uuid,
+            updated_at = NOW()
+        WHERE import_id = $1::uuid
+          AND event_id IS NULL
+          AND deleted_at IS NULL
+      `,
+      [row.import_id, event.id],
+    );
+  }
+
+  for (const row of unresolvedManual.rows) {
+    const event = findUniqueHighConfidenceEvent(
+      row.remarks ?? "",
+      row.school_year_id,
+      row.scanned_at,
+    );
+    if (!event) continue;
+
+    await client.query(
+      `
+        UPDATE manual_attendance_records
+        SET event_id = $2::uuid,
+            updated_at = NOW()
+        WHERE id = $1::uuid
+          AND event_id IS NULL
+      `,
+      [row.id, event.id],
+    );
+  }
+}
+
+type AttendanceConsistencyTable =
+  | "attendance_final_results"
+  | "calculation_results";
+
+async function assertExpectedEventConsistencyWithClient(
+  client: PoolClient,
+  table: AttendanceConsistencyTable,
+  schoolYearId: string | null,
+  calculationScopeKey?: string,
+) {
+  const scopeClause =
+    table === "calculation_results" && calculationScopeKey
+      ? "AND calculation_scope_key = $2::TEXT"
+      : "";
+  const params =
+    table === "calculation_results" && calculationScopeKey
+      ? [schoolYearId, calculationScopeKey]
+      : [schoolYearId];
+
+  const violations = await client.query<{
+    school_year_id: string | null;
+    college_key: string;
+    expected_event_values: number[];
+    student_count: number;
+  }>(
+    `
+      SELECT
+        school_year_id,
+        college_key,
+        ARRAY_AGG(DISTINCT expected_events ORDER BY expected_events) AS expected_event_values,
+        COUNT(*)::INT AS student_count
+      FROM ${table}
+      WHERE ($1::uuid IS NULL OR school_year_id = $1::uuid)
+        AND college_key IS NOT NULL
+        ${scopeClause}
+      GROUP BY school_year_id, college_key
+      HAVING COUNT(DISTINCT expected_events) > 1
+    `,
+    params,
+  );
+
+  if (!violations.rows.length) return new Set<string>();
+
+  await client.query(
+    `
+      INSERT INTO audit_logs (
+        action,
+        resource_type,
+        method,
+        route,
+        status_code,
+        details
+      )
+      VALUES (
+        'attendance_expected_events_consistency_violation',
+        $1::TEXT,
+        'SYSTEM',
+        '/internal/attendance/refresh',
+        409,
+        $2::jsonb
+      )
+    `,
+    [
+      table,
+      JSON.stringify({
+        schoolYearId,
+        calculationScopeKey: calculationScopeKey ?? null,
+        violations: violations.rows,
+      }),
+    ],
+  );
+
+  return new Set(
+    violations.rows.map(
+      (row) => `${row.school_year_id ?? "null"}::${row.college_key}`,
+    ),
+  );
+}
+
 async function refreshCalculationResultsWithClient(
   client: PoolClient,
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
@@ -5548,87 +5811,36 @@ async function refreshCalculationResultsWithClient(
   const sourceFlags = getCalculationSourceFlags(sourceTypes);
   const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
 
+  await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
+
   await client.query(
     `
       WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
       ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
-      imported_records AS (
+      selected_imported_records AS (
         SELECT
           ar.school_year_id,
           ar.import_id,
-          ar.student_id,
-          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(ar.name), ''), ar.student_id) AS name,
-          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(ar.year_level), '')) AS year_level,
-          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), '')) AS college,
-          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), '')) AS program,
-          COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
-          CASE
-            WHEN LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($4::TEXT) THEN NULL
-            ELSE ${ATTENDANCE_EVENT_KEY_SQL("ar")}
-          END AS event_key,
-          GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
-          COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
-          ar.updated_at
+          LOWER(TRIM(ar.student_id)) AS normalized_student_id
         FROM attendance_records ar
-        LEFT JOIN attendance_events ae ON ae.id = ar.event_id
-        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
-        WHERE ar.deleted_at IS NULL
+        WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
           AND (
             (
               $5::BOOLEAN
               AND ar.import_id IS NOT NULL
-              AND (
-                CARDINALITY($2::uuid[]) = 0
-                OR ar.import_id = ANY($2::uuid[])
-              )
+              AND (CARDINALITY($2::uuid[]) = 0 OR ar.import_id = ANY($2::uuid[]))
             )
             OR (
               $7::BOOLEAN
               AND LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($4::TEXT)
             )
           )
-          AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
-      ), imported_totals AS (
-        SELECT
-          school_year_id,
-          LOWER(TRIM(student_id)) AS normalized_student_id,
-          MAX(student_id) AS student_id,
-          MAX(name) AS name,
-          MAX(year_level) AS year_level,
-          MAX(college) AS college,
-          MAX(program) AS program,
-          MAX(institution) AS institution,
-          ARRAY_AGG(DISTINCT import_id ORDER BY import_id) FILTER (WHERE import_id IS NOT NULL) AS import_ids,
-          COUNT(DISTINCT event_key)::INT AS attended_events,
-          GREATEST(0, MAX(no_of_absences))::INT AS imported_absences,
-          COUNT(*)::INT AS imported_record_count,
-          MAX(scanned_at) AS latest_scanned_at,
-          MAX(updated_at) AS source_updated_at
-        FROM imported_records
-        GROUP BY school_year_id, LOWER(TRIM(student_id))
-      ), manual_records AS (
+      ), selected_manual_records AS (
         SELECT
           mar.school_year_id,
-          LOWER(TRIM(mar.student_id)) AS normalized_student_id,
-          mar.student_id,
-          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id) AS name,
-          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(mar.year_level), '')) AS year_level,
-          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')) AS college,
-          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), '')) AS program,
-          COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(mar.institution), '')) AS institution,
-          CASE
-            WHEN (
-              mar.attendance_type = 'zero_attendance'
-              OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT)
-            ) THEN NULL
-            ELSE ${ATTENDANCE_EVENT_KEY_SQL("mar")}
-          END AS event_key,
-          GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
-          COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
-          mar.updated_at
+          LOWER(TRIM(mar.student_id)) AS normalized_student_id
         FROM manual_attendance_records mar
-        LEFT JOIN attendance_events ae ON ae.id = mar.event_id
-        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
           AND (
             (
@@ -5644,6 +5856,71 @@ async function refreshCalculationResultsWithClient(
               )
             )
           )
+      ), selected_student_keys AS (
+        SELECT school_year_id, normalized_student_id FROM selected_imported_records
+        UNION
+        SELECT school_year_id, normalized_student_id FROM selected_manual_records
+      ), all_imported_records AS (
+        SELECT
+          ar.school_year_id,
+          ar.import_id,
+          LOWER(TRIM(ar.student_id)) AS normalized_student_id,
+          ar.student_id,
+          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(ar.name), ''), ar.student_id) AS name,
+          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(ar.year_level), '')) AS year_level,
+          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), '')) AS college,
+          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), '')) AS program,
+          COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
+          ${getCanonicalCollegeKeySql("ar", "s")} AS college_key,
+          COALESCE(ar.event_id, ai.event_id) AS event_id,
+          GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
+          COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
+          ar.updated_at
+        FROM attendance_records ar
+        LEFT JOIN attendance_imports ai
+          ON ai.id = ar.import_id
+         AND ai.deleted_at IS NULL
+        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+        WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+      ), all_manual_records AS (
+        SELECT
+          mar.school_year_id,
+          LOWER(TRIM(mar.student_id)) AS normalized_student_id,
+          mar.student_id,
+          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id) AS name,
+          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(mar.year_level), '')) AS year_level,
+          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')) AS college,
+          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), '')) AS program,
+          COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(mar.institution), '')) AS institution,
+          ${getCanonicalCollegeKeySql("mar", "s")} AS college_key,
+          CASE
+            WHEN mar.attendance_type = 'zero_attendance'
+              OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT)
+            THEN NULL
+            ELSE mar.event_id
+          END AS event_id,
+          GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
+          COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
+          mar.updated_at
+        FROM manual_attendance_records mar
+        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
+        WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+      ), imported_totals AS (
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          MAX(student_id) AS student_id,
+          COALESCE(NULLIF(MAX(name), ''), MAX(student_id)) AS name,
+          COALESCE(NULLIF(MAX(year_level), ''), '') AS year_level,
+          COALESCE(NULLIF(MAX(college), ''), '') AS college,
+          COALESCE(NULLIF(MAX(program), ''), '') AS program,
+          COALESCE(NULLIF(MAX(institution), ''), '') AS institution,
+          GREATEST(0, MAX(no_of_absences))::INT AS imported_absences,
+          MAX(scanned_at) AS latest_scanned_at,
+          MAX(updated_at) AS source_updated_at
+        FROM all_imported_records
+        GROUP BY school_year_id, normalized_student_id
       ), manual_totals AS (
         SELECT
           school_year_id,
@@ -5655,133 +5932,120 @@ async function refreshCalculationResultsWithClient(
           COALESCE(NULLIF(MAX(program), ''), '') AS program,
           COALESCE(NULLIF(MAX(institution), ''), '') AS institution,
           GREATEST(0, SUM(no_of_absences))::INT AS manual_absences,
-          COUNT(*)::INT AS manual_record_count,
           MAX(scanned_at) AS latest_scanned_at,
           MAX(updated_at) AS source_updated_at
-        FROM manual_records
+        FROM all_manual_records
         GROUP BY school_year_id, normalized_student_id
-      ), imported_event_scope AS (
-        SELECT DISTINCT
-          school_year_id,
-          event_key
-        FROM imported_records
-        WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
-      ), imported_event_roster_scope AS (
-        SELECT DISTINCT
-          roster.school_year_id,
-          roster.event_id,
-          roster.college_key
-        FROM event_roster_scope roster
-        JOIN imported_event_scope scope
-          ON scope.school_year_id IS NOT DISTINCT FROM roster.school_year_id
-          AND scope.event_key = roster.event_id::TEXT
-      ), imported_event_participation AS (
-        SELECT
-          ep.school_year_id,
-          ep.normalized_student_id,
-          ep.event_id::TEXT AS event_key
-        FROM event_participation ep
-        JOIN imported_event_scope scope
-          ON scope.school_year_id IS NOT DISTINCT FROM ep.school_year_id
-          AND scope.event_key = ep.event_id::TEXT
-      ), event_attendance AS (
-        SELECT
-          school_year_id,
-          normalized_student_id,
-          event_key
-        FROM imported_event_participation
+      ), student_college_candidates AS (
+        SELECT school_year_id, normalized_student_id, college_key
+        FROM all_imported_records
+        WHERE college_key IS NOT NULL
         UNION
+        SELECT school_year_id, normalized_student_id, college_key
+        FROM all_manual_records
+        WHERE college_key IS NOT NULL
+      ), student_college_totals AS (
         SELECT
           school_year_id,
           normalized_student_id,
-          event_key
-        FROM manual_records
-        WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
-      ), attended_event_totals AS (
-        SELECT
-          school_year_id,
-          normalized_student_id,
-          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS attended_events
-        FROM event_attendance
+          COUNT(DISTINCT college_key)::INT AS college_key_count,
+          MAX(college_key) AS college_key
+        FROM student_college_candidates
         GROUP BY school_year_id, normalized_student_id
-      ), student_keys AS (
-        SELECT school_year_id, normalized_student_id FROM imported_totals
-        UNION
-        SELECT school_year_id, normalized_student_id FROM manual_totals
       ), student_event_scope AS (
         SELECT
           keys.school_year_id,
           keys.normalized_student_id,
-          LOWER(TRIM(COALESCE(
-            NULLIF(imported.college, ''),
-            NULLIF(manual.college, ''),
-            ''
-          ))) AS college_key
-        FROM student_keys keys
-        LEFT JOIN imported_totals imported
-          ON imported.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND imported.normalized_student_id = keys.normalized_student_id
-        LEFT JOIN manual_totals manual
-          ON manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND manual.normalized_student_id = keys.normalized_student_id
+          CASE
+            WHEN ${getCanonicalCollegeKeySql("s", "s")} IS NOT NULL
+              THEN ${getCanonicalCollegeKeySql("s", "s")}
+            WHEN COALESCE(colleges.college_key_count, 0) = 1
+              THEN colleges.college_key
+            ELSE NULL
+          END AS college_key
+        FROM selected_student_keys keys
+        LEFT JOIN students s
+          ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
+        LEFT JOIN student_college_totals colleges
+          ON colleges.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND colleges.normalized_student_id = keys.normalized_student_id
       ), expected_event_totals AS (
         SELECT
-          student.school_year_id,
-          student.normalized_student_id,
-          COUNT(DISTINCT roster.event_id)::INT AS expected_events
-        FROM student_event_scope student
-        LEFT JOIN imported_event_roster_scope roster
-          ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
-          AND roster.college_key = student.college_key
-        GROUP BY student.school_year_id, student.normalized_student_id
+          school_year_id,
+          college_key,
+          COUNT(DISTINCT event_id)::INT AS expected_events
+        FROM event_roster_scope
+        WHERE college_key IS NOT NULL
+          AND ($1::uuid IS NULL OR school_year_id = $1::uuid)
+        GROUP BY school_year_id, college_key
       ), expected_attended_event_totals AS (
         SELECT
           student.school_year_id,
           student.normalized_student_id,
-          COUNT(DISTINCT attended.event_key)::INT AS attended_expected_events
+          COUNT(DISTINCT participation.event_id)::INT AS attended_expected_events
         FROM student_event_scope student
-        LEFT JOIN imported_event_roster_scope roster
+        LEFT JOIN event_roster_scope roster
           ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
-          AND roster.college_key = student.college_key
-        LEFT JOIN event_attendance attended
-          ON attended.school_year_id IS NOT DISTINCT FROM student.school_year_id
-          AND attended.normalized_student_id = student.normalized_student_id
-          AND attended.event_key = roster.event_id::TEXT
+         AND roster.college_key = student.college_key
+        LEFT JOIN event_participation participation
+          ON participation.school_year_id IS NOT DISTINCT FROM student.school_year_id
+         AND participation.normalized_student_id = student.normalized_student_id
+         AND participation.event_id = roster.event_id
         GROUP BY student.school_year_id, student.normalized_student_id
+      ), selected_import_ids AS (
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          ARRAY_AGG(DISTINCT import_id ORDER BY import_id) FILTER (WHERE import_id IS NOT NULL) AS import_ids,
+          COUNT(*)::INT AS selected_imported_count
+        FROM selected_imported_records
+        GROUP BY school_year_id, normalized_student_id
+      ), selected_manual_counts AS (
+        SELECT school_year_id, normalized_student_id, COUNT(*)::INT AS selected_manual_count
+        FROM selected_manual_records
+        GROUP BY school_year_id, normalized_student_id
       ), merged AS (
         SELECT
           keys.school_year_id,
           $3::TEXT AS calculation_scope_key,
-          COALESCE(imported.import_ids, ARRAY[]::uuid[]) AS import_ids,
+          COALESCE(selected_imports.import_ids, ARRAY[]::uuid[]) AS import_ids,
           COALESCE(imported.student_id, manual.student_id, keys.normalized_student_id) AS student_id,
           COALESCE(imported.name, manual.name, keys.normalized_student_id) AS name,
           COALESCE(imported.year_level, manual.year_level) AS year_level,
           COALESCE(imported.college, manual.college) AS college,
           COALESCE(imported.program, manual.program) AS program,
           COALESCE(imported.institution, manual.institution) AS institution,
-          COALESCE(attended.attended_events, 0)::INT AS attended_events,
-          GREATEST(
-            COALESCE(imported.imported_absences, 0),
-            GREATEST(
-              COALESCE(expected.expected_events, 0) -
-                COALESCE(expected_attended.attended_expected_events, 0),
-              0
-            )
-          )::INT AS imported_absences,
+          scope.college_key,
+          COALESCE(expected.expected_events, 0)::INT AS expected_events,
+          COALESCE(attended.attended_expected_events, 0)::INT AS attended_events,
+          CASE
+            WHEN COALESCE(expected.expected_events, 0) > 0 THEN
+              GREATEST(
+                COALESCE(expected.expected_events, 0) - COALESCE(attended.attended_expected_events, 0),
+                0
+              )::INT
+            ELSE COALESCE(imported.imported_absences, 0)::INT
+          END AS imported_absences,
           COALESCE(manual.manual_absences, 0)::INT AS manual_absences,
           (
-            GREATEST(
-              COALESCE(imported.imported_absences, 0),
-              GREATEST(
-                COALESCE(expected.expected_events, 0) -
-                  COALESCE(expected_attended.attended_expected_events, 0),
-                0
-              )
-            ) + COALESCE(manual.manual_absences, 0)
+            CASE
+              WHEN COALESCE(expected.expected_events, 0) > 0 THEN
+                GREATEST(
+                  COALESCE(expected.expected_events, 0) - COALESCE(attended.attended_expected_events, 0),
+                  0
+                )
+              ELSE COALESCE(imported.imported_absences, 0)
+            END
+            + COALESCE(manual.manual_absences, 0)
           )::INT AS total_absences,
+          CASE
+            WHEN scope.college_key IS NULL THEN 'unresolved_college'
+            WHEN COALESCE(expected.expected_events, 0) > 0 THEN 'roster'
+            ELSE 'imported_fallback'
+          END AS absence_calculation_source,
           (
-            COALESCE(imported.imported_record_count, 0) +
-            COALESCE(manual.manual_record_count, 0)
+            COALESCE(selected_imports.selected_imported_count, 0) +
+            COALESCE(selected_manual.selected_manual_count, 0)
           )::INT AS source_record_count,
           GREATEST(
             COALESCE(imported.latest_scanned_at, '-infinity'::timestamptz),
@@ -5791,22 +6055,28 @@ async function refreshCalculationResultsWithClient(
             COALESCE(imported.source_updated_at, '-infinity'::timestamptz),
             COALESCE(manual.source_updated_at, '-infinity'::timestamptz)
           ) AS source_updated_at
-        FROM student_keys keys
+        FROM selected_student_keys keys
         LEFT JOIN imported_totals imported
           ON imported.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND imported.normalized_student_id = keys.normalized_student_id
+         AND imported.normalized_student_id = keys.normalized_student_id
         LEFT JOIN manual_totals manual
           ON manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND manual.normalized_student_id = keys.normalized_student_id
-        LEFT JOIN attended_event_totals attended
-          ON attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND attended.normalized_student_id = keys.normalized_student_id
+         AND manual.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN student_event_scope scope
+          ON scope.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND scope.normalized_student_id = keys.normalized_student_id
         LEFT JOIN expected_event_totals expected
           ON expected.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND expected.normalized_student_id = keys.normalized_student_id
-        LEFT JOIN expected_attended_event_totals expected_attended
-          ON expected_attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND expected_attended.normalized_student_id = keys.normalized_student_id
+         AND expected.college_key = scope.college_key
+        LEFT JOIN expected_attended_event_totals attended
+          ON attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND attended.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN selected_import_ids selected_imports
+          ON selected_imports.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND selected_imports.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN selected_manual_counts selected_manual
+          ON selected_manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND selected_manual.normalized_student_id = keys.normalized_student_id
       ), matched AS (
         SELECT
           merged.*,
@@ -5819,7 +6089,7 @@ async function refreshCalculationResultsWithClient(
           WHERE no_of_absences <= merged.total_absences
           ORDER BY no_of_absences DESC
           LIMIT 1
-        ) penalty ON merged.total_absences > 0
+        ) penalty ON merged.total_absences > 0 AND merged.college_key IS NOT NULL
       )
       INSERT INTO calculation_results AS existing (
         school_year_id,
@@ -5831,10 +6101,13 @@ async function refreshCalculationResultsWithClient(
         college,
         program,
         institution,
+        college_key,
         attended_events,
+        expected_events,
         imported_absences,
         manual_absences,
         total_absences,
+        absence_calculation_source,
         attendance_status,
         penalty_id,
         prescribed_penalty,
@@ -5849,21 +6122,26 @@ async function refreshCalculationResultsWithClient(
         import_ids,
         student_id,
         name,
-        year_level,
-        college,
-        program,
-        institution,
+        NULLIF(year_level, ''),
+        NULLIF(college, ''),
+        NULLIF(program, ''),
+        NULLIF(institution, ''),
+        college_key,
         attended_events,
+        expected_events,
         imported_absences,
         manual_absences,
         total_absences,
+        absence_calculation_source,
         CASE
-          WHEN total_absences <= 0 THEN 'perfect_attendance'
+          WHEN college_key IS NULL THEN 'unresolved_college'
+          WHEN expected_events > 0 AND attended_events >= expected_events AND total_absences <= 0
+            THEN 'perfect_attendance'
           ELSE 'with_absences'
         END,
         penalty_id,
         CASE
-          WHEN total_absences <= 0 THEN NULL
+          WHEN college_key IS NULL OR total_absences <= 0 THEN NULL
           ELSE COALESCE(prescribed_penalty, 'No prescribed penalty configured.')
         END,
         source_record_count,
@@ -5880,10 +6158,13 @@ async function refreshCalculationResultsWithClient(
         college = EXCLUDED.college,
         program = EXCLUDED.program,
         institution = EXCLUDED.institution,
+        college_key = EXCLUDED.college_key,
         attended_events = EXCLUDED.attended_events,
+        expected_events = EXCLUDED.expected_events,
         imported_absences = EXCLUDED.imported_absences,
         manual_absences = EXCLUDED.manual_absences,
         total_absences = EXCLUDED.total_absences,
+        absence_calculation_source = EXCLUDED.absence_calculation_source,
         attendance_status = EXCLUDED.attendance_status,
         penalty_id = EXCLUDED.penalty_id,
         prescribed_penalty = EXCLUDED.prescribed_penalty,
@@ -5900,10 +6181,13 @@ async function refreshCalculationResultsWithClient(
         existing.college,
         existing.program,
         existing.institution,
+        existing.college_key,
         existing.attended_events,
+        existing.expected_events,
         existing.imported_absences,
         existing.manual_absences,
         existing.total_absences,
+        existing.absence_calculation_source,
         existing.attendance_status,
         existing.penalty_id,
         existing.prescribed_penalty,
@@ -5918,10 +6202,13 @@ async function refreshCalculationResultsWithClient(
         EXCLUDED.college,
         EXCLUDED.program,
         EXCLUDED.institution,
+        EXCLUDED.college_key,
         EXCLUDED.attended_events,
+        EXCLUDED.expected_events,
         EXCLUDED.imported_absences,
         EXCLUDED.manual_absences,
         EXCLUDED.total_absences,
+        EXCLUDED.absence_calculation_source,
         EXCLUDED.attendance_status,
         EXCLUDED.penalty_id,
         EXCLUDED.prescribed_penalty,
@@ -5957,10 +6244,7 @@ async function refreshCalculationResultsWithClient(
                 AND ar.school_year_id IS NOT DISTINCT FROM cr.school_year_id
                 AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM(cr.student_id))
                 AND ar.import_id IS NOT NULL
-                AND (
-                  CARDINALITY($3::uuid[]) = 0
-                  OR ar.import_id = ANY($3::uuid[])
-                )
+                AND (CARDINALITY($3::uuid[]) = 0 OR ar.import_id = ANY($3::uuid[]))
             )
           )
           OR (
@@ -6022,9 +6306,24 @@ async function refreshCalculationResultsWithClient(
     [schoolYearId, calculationScopeKey],
   );
 
-  return currentResult.rows;
-}
+  const consistencyWarnings = await assertExpectedEventConsistencyWithClient(
+    client,
+    "calculation_results",
+    schoolYearId,
+    calculationScopeKey,
+  );
 
+  if (!consistencyWarnings.size) return currentResult.rows;
+
+  return currentResult.rows.map((row) => ({
+    ...row,
+    consistency_warning:
+      row.college_key &&
+      consistencyWarnings.has(`${row.school_year_id ?? "null"}::${row.college_key}`)
+        ? "Expected-event denominator mismatch detected for this college."
+        : null,
+  }));
+}
 export async function previewCalculationResults(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
 ) {
@@ -6154,7 +6453,42 @@ export async function listCalculationResults(
     params,
   );
 
-  return result.rows;
+  const warningParams: unknown[] = [options.schoolYearId ?? null];
+  const warningClauses = ["($1::uuid IS NULL OR school_year_id = $1::uuid)"];
+  if (importIds.length || options.sourceTypes?.length) {
+    warningParams.push(getCalculationScopeKey(importIds, sourceTypes));
+    warningClauses.push(`calculation_scope_key = $${warningParams.length}::TEXT`);
+  }
+  const consistencyResult = await query<{
+    school_year_id: string | null;
+    college_key: string;
+  }>(
+    `
+      SELECT school_year_id, college_key
+      FROM calculation_results
+      WHERE ${warningClauses.join(" AND ")}
+        AND college_key IS NOT NULL
+      GROUP BY school_year_id, college_key
+      HAVING COUNT(DISTINCT expected_events) > 1
+    `,
+    warningParams,
+  );
+  const inconsistentKeys = new Set(
+    consistencyResult.rows.map(
+      (row) => `${row.school_year_id ?? "null"}::${row.college_key}`,
+    ),
+  );
+
+  if (!inconsistentKeys.size) return result.rows;
+
+  return result.rows.map((row) => ({
+    ...row,
+    consistency_warning:
+      row.college_key &&
+      inconsistentKeys.has(`${row.school_year_id ?? "null"}::${row.college_key}`)
+        ? "Expected-event denominator mismatch detected for this college."
+        : null,
+  }));
 }
 
 export async function deleteCalculationResultsByIds(
@@ -6252,49 +6586,35 @@ async function refreshAttendanceFinalResultsWithClient(
 ) {
   const schoolYearId = cleanText(options.schoolYearId) || null;
 
+  await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
+
   await client.query(
     `
       WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
       ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
-      imported_records AS (
+      all_imported_records AS (
         SELECT
           ar.school_year_id,
+          LOWER(TRIM(ar.student_id)) AS normalized_student_id,
           ar.student_id,
           COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(ar.name), ''), ar.student_id) AS name,
           COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(ar.year_level), '')) AS year_level,
           COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), '')) AS college,
           COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), '')) AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
-          CASE
-            WHEN LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($2::TEXT) THEN NULL
-            ELSE ${ATTENDANCE_EVENT_KEY_SQL("ar")}
-          END AS event_key,
+          ${getCanonicalCollegeKeySql("ar", "s")} AS college_key,
+          COALESCE(ar.event_id, ai.event_id) AS event_id,
           GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
           ar.updated_at
         FROM attendance_records ar
-        LEFT JOIN attendance_events ae ON ae.id = ar.event_id
+        LEFT JOIN attendance_imports ai
+          ON ai.id = ar.import_id
+         AND ai.deleted_at IS NULL
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
         WHERE ${getAttendanceRecordVisibilitySql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
-      ), imported_totals AS (
-        SELECT
-          school_year_id,
-          LOWER(TRIM(student_id)) AS normalized_student_id,
-          MAX(student_id) AS student_id,
-          COALESCE(NULLIF(MAX(name), ''), MAX(student_id)) AS name,
-          COALESCE(NULLIF(MAX(year_level), ''), '') AS year_level,
-          COALESCE(NULLIF(MAX(college), ''), '') AS college,
-          COALESCE(NULLIF(MAX(program), ''), '') AS program,
-          COALESCE(NULLIF(MAX(institution), ''), '') AS institution,
-          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS attended_events,
-          GREATEST(0, MAX(no_of_absences))::INT AS imported_absences,
-          COUNT(*)::INT AS imported_record_count,
-          MAX(scanned_at) AS latest_scanned_at,
-          MAX(updated_at) AS source_updated_at
-        FROM imported_records
-        GROUP BY school_year_id, LOWER(TRIM(student_id))
-      ), manual_records AS (
+      ), all_manual_records AS (
         SELECT
           mar.school_year_id,
           LOWER(TRIM(mar.student_id)) AS normalized_student_id,
@@ -6304,20 +6624,34 @@ async function refreshAttendanceFinalResultsWithClient(
           COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')) AS college,
           COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), '')) AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(mar.institution), '')) AS institution,
+          ${getCanonicalCollegeKeySql("mar", "s")} AS college_key,
           CASE
-            WHEN (
-              mar.attendance_type = 'zero_attendance'
+            WHEN mar.attendance_type = 'zero_attendance'
               OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($2::TEXT)
-            ) THEN NULL
-            ELSE ${ATTENDANCE_EVENT_KEY_SQL("mar")}
-          END AS event_key,
+            THEN NULL
+            ELSE mar.event_id
+          END AS event_id,
           GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
           COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
           mar.updated_at
         FROM manual_attendance_records mar
-        LEFT JOIN attendance_events ae ON ae.id = mar.event_id
         LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+      ), imported_totals AS (
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          MAX(student_id) AS student_id,
+          COALESCE(NULLIF(MAX(name), ''), MAX(student_id)) AS name,
+          COALESCE(NULLIF(MAX(year_level), ''), '') AS year_level,
+          COALESCE(NULLIF(MAX(college), ''), '') AS college,
+          COALESCE(NULLIF(MAX(program), ''), '') AS program,
+          COALESCE(NULLIF(MAX(institution), ''), '') AS institution,
+          GREATEST(0, MAX(no_of_absences))::INT AS imported_absences,
+          MAX(scanned_at) AS latest_scanned_at,
+          MAX(updated_at) AS source_updated_at
+        FROM all_imported_records
+        GROUP BY school_year_id, normalized_student_id
       ), manual_totals AS (
         SELECT
           school_year_id,
@@ -6329,89 +6663,69 @@ async function refreshAttendanceFinalResultsWithClient(
           COALESCE(NULLIF(MAX(program), ''), '') AS program,
           COALESCE(NULLIF(MAX(institution), ''), '') AS institution,
           GREATEST(0, SUM(no_of_absences))::INT AS manual_absences,
-          COUNT(*)::INT AS manual_record_count,
           MAX(scanned_at) AS latest_scanned_at,
           MAX(updated_at) AS source_updated_at
-        FROM manual_records
-        GROUP BY school_year_id, normalized_student_id
-      ), imported_event_scope AS (
-        SELECT DISTINCT
-          school_year_id,
-          event_key
-        FROM imported_records
-        WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
-      ), imported_event_participation AS (
-        SELECT
-          ep.school_year_id,
-          ep.normalized_student_id,
-          ep.event_id::TEXT AS event_key
-        FROM event_participation ep
-        JOIN imported_event_scope scope
-          ON scope.school_year_id IS NOT DISTINCT FROM ep.school_year_id
-          AND scope.event_key = ep.event_id::TEXT
-      ), event_attendance AS (
-        SELECT
-          school_year_id,
-          normalized_student_id,
-          event_key
-        FROM imported_event_participation
-        UNION
-        SELECT
-          school_year_id,
-          normalized_student_id,
-          event_key
-        FROM manual_records
-        WHERE NULLIF(TRIM(event_key), '') IS NOT NULL
-      ), attended_event_totals AS (
-        SELECT
-          school_year_id,
-          normalized_student_id,
-          COUNT(DISTINCT NULLIF(TRIM(event_key), ''))::INT AS attended_events
-        FROM event_attendance
+        FROM all_manual_records
         GROUP BY school_year_id, normalized_student_id
       ), student_keys AS (
         SELECT school_year_id, normalized_student_id FROM imported_totals
         UNION
         SELECT school_year_id, normalized_student_id FROM manual_totals
+      ), student_college_candidates AS (
+        SELECT school_year_id, normalized_student_id, college_key
+        FROM all_imported_records
+        WHERE college_key IS NOT NULL
+        UNION
+        SELECT school_year_id, normalized_student_id, college_key
+        FROM all_manual_records
+        WHERE college_key IS NOT NULL
+      ), student_college_totals AS (
+        SELECT
+          school_year_id,
+          normalized_student_id,
+          COUNT(DISTINCT college_key)::INT AS college_key_count,
+          MAX(college_key) AS college_key
+        FROM student_college_candidates
+        GROUP BY school_year_id, normalized_student_id
       ), student_event_scope AS (
         SELECT
           keys.school_year_id,
           keys.normalized_student_id,
-          LOWER(TRIM(COALESCE(
-            NULLIF(imported.college, ''),
-            NULLIF(manual.college, ''),
-            ''
-          ))) AS college_key
+          CASE
+            WHEN ${getCanonicalCollegeKeySql("s", "s")} IS NOT NULL
+              THEN ${getCanonicalCollegeKeySql("s", "s")}
+            WHEN COALESCE(colleges.college_key_count, 0) = 1
+              THEN colleges.college_key
+            ELSE NULL
+          END AS college_key
         FROM student_keys keys
-        LEFT JOIN imported_totals imported
-          ON imported.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND imported.normalized_student_id = keys.normalized_student_id
-        LEFT JOIN manual_totals manual
-          ON manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND manual.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN students s
+          ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
+        LEFT JOIN student_college_totals colleges
+          ON colleges.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND colleges.normalized_student_id = keys.normalized_student_id
       ), expected_event_totals AS (
         SELECT
-          student.school_year_id,
-          student.normalized_student_id,
-          COUNT(DISTINCT roster.event_id)::INT AS expected_events
-        FROM student_event_scope student
-        LEFT JOIN event_roster_scope roster
-          ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
-          AND roster.college_key = student.college_key
-        GROUP BY student.school_year_id, student.normalized_student_id
+          school_year_id,
+          college_key,
+          COUNT(DISTINCT event_id)::INT AS expected_events
+        FROM event_roster_scope
+        WHERE college_key IS NOT NULL
+          AND ($1::uuid IS NULL OR school_year_id = $1::uuid)
+        GROUP BY school_year_id, college_key
       ), expected_attended_event_totals AS (
         SELECT
           student.school_year_id,
           student.normalized_student_id,
-          COUNT(DISTINCT attended.event_key)::INT AS attended_expected_events
+          COUNT(DISTINCT participation.event_id)::INT AS attended_expected_events
         FROM student_event_scope student
         LEFT JOIN event_roster_scope roster
           ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
-          AND roster.college_key = student.college_key
-        LEFT JOIN event_attendance attended
-          ON attended.school_year_id IS NOT DISTINCT FROM student.school_year_id
-          AND attended.normalized_student_id = student.normalized_student_id
-          AND attended.event_key = roster.event_id::TEXT
+         AND roster.college_key = student.college_key
+        LEFT JOIN event_participation participation
+          ON participation.school_year_id IS NOT DISTINCT FROM student.school_year_id
+         AND participation.normalized_student_id = student.normalized_student_id
+         AND participation.event_id = roster.event_id
         GROUP BY student.school_year_id, student.normalized_student_id
       ), merged AS (
         SELECT
@@ -6422,17 +6736,25 @@ async function refreshAttendanceFinalResultsWithClient(
           COALESCE(imported.college, manual.college, '') AS college,
           COALESCE(imported.program, manual.program, '') AS program,
           COALESCE(imported.institution, manual.institution, '') AS institution,
-          COALESCE(attended.attended_events, 0)::INT AS attended_events,
+          scope.college_key,
+          COALESCE(expected.expected_events, 0)::INT AS expected_events,
+          COALESCE(attended.attended_expected_events, 0)::INT AS attended_events,
           (
-            GREATEST(
-              COALESCE(imported.imported_absences, 0),
-              GREATEST(
-                COALESCE(expected.expected_events, 0) -
-                  COALESCE(expected_attended.attended_expected_events, 0),
-                0
-              )
-            ) + COALESCE(manual.manual_absences, 0)
+            CASE
+              WHEN COALESCE(expected.expected_events, 0) > 0 THEN
+                GREATEST(
+                  COALESCE(expected.expected_events, 0) - COALESCE(attended.attended_expected_events, 0),
+                  0
+                )
+              ELSE COALESCE(imported.imported_absences, 0)
+            END
+            + COALESCE(manual.manual_absences, 0)
           )::INT AS total_absences,
+          CASE
+            WHEN scope.college_key IS NULL THEN 'unresolved_college'
+            WHEN COALESCE(expected.expected_events, 0) > 0 THEN 'roster'
+            ELSE 'imported_fallback'
+          END AS absence_calculation_source,
           GREATEST(
             COALESCE(imported.latest_scanned_at, '-infinity'::timestamptz),
             COALESCE(manual.latest_scanned_at, '-infinity'::timestamptz)
@@ -6444,19 +6766,19 @@ async function refreshAttendanceFinalResultsWithClient(
         FROM student_keys keys
         LEFT JOIN imported_totals imported
           ON imported.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND imported.normalized_student_id = keys.normalized_student_id
+         AND imported.normalized_student_id = keys.normalized_student_id
         LEFT JOIN manual_totals manual
           ON manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND manual.normalized_student_id = keys.normalized_student_id
-        LEFT JOIN attended_event_totals attended
-          ON attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND attended.normalized_student_id = keys.normalized_student_id
+         AND manual.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN student_event_scope scope
+          ON scope.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND scope.normalized_student_id = keys.normalized_student_id
         LEFT JOIN expected_event_totals expected
           ON expected.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND expected.normalized_student_id = keys.normalized_student_id
-        LEFT JOIN expected_attended_event_totals expected_attended
-          ON expected_attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-          AND expected_attended.normalized_student_id = keys.normalized_student_id
+         AND expected.college_key = scope.college_key
+        LEFT JOIN expected_attended_event_totals attended
+          ON attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND attended.normalized_student_id = keys.normalized_student_id
       ), candidates AS (
         SELECT
           school_year_id,
@@ -6466,10 +6788,15 @@ async function refreshAttendanceFinalResultsWithClient(
           NULLIF(college, '') AS college,
           NULLIF(program, '') AS program,
           NULLIF(institution, '') AS institution,
+          college_key,
           attended_events,
+          expected_events,
           total_absences,
+          absence_calculation_source,
           CASE
-            WHEN total_absences <= 0 THEN 'perfect_attendance'
+            WHEN college_key IS NULL THEN 'unresolved_college'
+            WHEN expected_events > 0 AND attended_events >= expected_events AND total_absences <= 0
+              THEN 'perfect_attendance'
             ELSE 'with_absences'
           END AS attendance_status,
           NULLIF(latest_scanned_at, '-infinity'::timestamptz) AS latest_scanned_at,
@@ -6484,8 +6811,11 @@ async function refreshAttendanceFinalResultsWithClient(
           college = candidate.college,
           program = candidate.program,
           institution = candidate.institution,
+          college_key = candidate.college_key,
           attended_events = candidate.attended_events,
+          expected_events = candidate.expected_events,
           total_absences = candidate.total_absences,
+          absence_calculation_source = candidate.absence_calculation_source,
           attendance_status = candidate.attendance_status,
           latest_scanned_at = candidate.latest_scanned_at,
           source_updated_at = candidate.source_updated_at,
@@ -6501,8 +6831,11 @@ async function refreshAttendanceFinalResultsWithClient(
             existing.college,
             existing.program,
             existing.institution,
+            existing.college_key,
             existing.attended_events,
+            existing.expected_events,
             existing.total_absences,
+            existing.absence_calculation_source,
             existing.attendance_status,
             existing.latest_scanned_at,
             existing.source_updated_at
@@ -6513,8 +6846,11 @@ async function refreshAttendanceFinalResultsWithClient(
             candidate.college,
             candidate.program,
             candidate.institution,
+            candidate.college_key,
             candidate.attended_events,
+            candidate.expected_events,
             candidate.total_absences,
+            candidate.absence_calculation_source,
             candidate.attendance_status,
             candidate.latest_scanned_at,
             candidate.source_updated_at
@@ -6530,8 +6866,11 @@ async function refreshAttendanceFinalResultsWithClient(
           college,
           program,
           institution,
+          college_key,
           attended_events,
+          expected_events,
           total_absences,
+          absence_calculation_source,
           attendance_status,
           latest_scanned_at,
           source_updated_at
@@ -6545,8 +6884,11 @@ async function refreshAttendanceFinalResultsWithClient(
           candidate.college,
           candidate.program,
           candidate.institution,
+          candidate.college_key,
           candidate.attended_events,
+          candidate.expected_events,
           candidate.total_absences,
+          candidate.absence_calculation_source,
           candidate.attendance_status,
           candidate.latest_scanned_at,
           candidate.source_updated_at
@@ -6592,9 +6934,23 @@ async function refreshAttendanceFinalResultsWithClient(
     [schoolYearId],
   );
 
-  return currentResult.rows;
-}
+  const consistencyWarnings = await assertExpectedEventConsistencyWithClient(
+    client,
+    "attendance_final_results",
+    schoolYearId,
+  );
 
+  if (!consistencyWarnings.size) return currentResult.rows;
+
+  return currentResult.rows.map((row) => ({
+    ...row,
+    consistency_warning:
+      row.college_key &&
+      consistencyWarnings.has(`${row.school_year_id ?? "null"}::${row.college_key}`)
+        ? "Expected-event denominator mismatch detected for this college."
+        : null,
+  }));
+}
 export async function refreshPenaltyResultsForSchoolYearWithClient(
   client: PoolClient,
   schoolYearId?: string,
@@ -6786,16 +7142,56 @@ export async function listAttendanceFinalResults(
 
   const result = await query<AttendanceFinalResultRecord>(
     `
+      WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}
       SELECT
         afr.*,
         ai.event_id,
         ae.name AS event_name,
         ae.event_order,
         ae.event_start_at,
-        ae.event_end_at
+        ae.event_end_at,
+        COALESCE(missed.missed_events, '[]'::jsonb) AS missed_events
       FROM attendance_final_results afr
       LEFT JOIN attendance_imports ai ON ai.id = afr.import_id AND ai.deleted_at IS NULL
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+      LEFT JOIN LATERAL (
+        SELECT JSONB_AGG(
+          JSONB_BUILD_OBJECT(
+            'id', roster.event_id,
+            'name', expected_event.name,
+            'event_order', expected_event.event_order,
+            'event_start_at', expected_event.event_start_at,
+            'event_end_at', expected_event.event_end_at
+          )
+          ORDER BY expected_event.event_order ASC NULLS LAST,
+                   COALESCE(expected_event.event_start_at, expected_event.event_end_at) ASC NULLS LAST,
+                   expected_event.name ASC
+        ) AS missed_events
+        FROM event_roster_scope roster
+        JOIN attendance_events expected_event ON expected_event.id = roster.event_id
+        WHERE roster.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+          AND roster.college_key = afr.college_key
+          AND NOT EXISTS (
+            SELECT 1
+            FROM attendance_records attended_record
+            LEFT JOIN attendance_imports attended_import
+              ON attended_import.id = attended_record.import_id
+             AND attended_import.deleted_at IS NULL
+            WHERE ${getAttendanceRecordVisibilitySql("attended_record")}
+              AND attended_record.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+              AND LOWER(TRIM(attended_record.student_id)) = LOWER(TRIM(afr.student_id))
+              AND COALESCE(attended_record.event_id, attended_import.event_id) = roster.event_id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM manual_attendance_records attended_manual
+            WHERE attended_manual.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+              AND LOWER(TRIM(attended_manual.student_id)) = LOWER(TRIM(afr.student_id))
+              AND attended_manual.event_id = roster.event_id
+              AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
+              AND LOWER(TRIM(COALESCE(attended_manual.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+          )
+      ) missed ON TRUE
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY
         ae.event_order ASC NULLS LAST,
