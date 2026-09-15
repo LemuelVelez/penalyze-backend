@@ -5347,6 +5347,71 @@ export async function deleteAttendanceEvent(id: string) {
   });
 }
 
+export type AttendanceDashboardOverview = {
+  attendanceRecordCount: number;
+  recentAttendanceRecords: AttendanceRecord[];
+  recentImports: AttendanceImportRecord[];
+};
+
+export async function getAttendanceDashboardOverview(
+  schoolYearId?: string,
+): Promise<AttendanceDashboardOverview> {
+  const params = schoolYearId ? [schoolYearId] : [];
+  const attendanceSchoolYearSql = schoolYearId
+    ? "AND ar.school_year_id = $1"
+    : "";
+  const importSchoolYearSql = schoolYearId ? "AND ai.school_year_id = $1" : "";
+
+  const [countResult, attendanceResult, importResult] = await Promise.all([
+    query<{ total: number }>(
+      `
+        SELECT COUNT(*)::INT AS total
+        FROM attendance_records ar
+        WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          ${attendanceSchoolYearSql}
+      `,
+      params,
+    ),
+    query<AttendanceRecord>(
+      `
+        SELECT ${ATTENDANCE_RECORD_SELECT}
+        FROM attendance_records ar
+        LEFT JOIN attendance_events ae ON ae.id = ar.event_id
+        LEFT JOIN students s
+          ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+        WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          ${attendanceSchoolYearSql}
+        ORDER BY
+          COALESCE(ar.scanned_at, ar.created_at) DESC NULLS LAST,
+          ar.created_at DESC,
+          ar.id DESC
+        LIMIT 8
+      `,
+      params,
+    ),
+    query<AttendanceImportRecord>(
+      `
+        SELECT ${ATTENDANCE_IMPORT_SELECT}
+        FROM attendance_imports ai
+        LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+        LEFT JOIN users uploader ON uploader.id = ai.uploaded_by
+        LEFT JOIN users deleter ON deleter.id = ai.deleted_by
+        WHERE ai.deleted_at IS NULL
+          ${importSchoolYearSql}
+        ORDER BY ai.created_at DESC, ai.id DESC
+        LIMIT 5
+      `,
+      params,
+    ),
+  ]);
+
+  return {
+    attendanceRecordCount: Number(countResult.rows[0]?.total ?? 0),
+    recentAttendanceRecords: attendanceResult.rows,
+    recentImports: importResult.rows.map(withAttendanceImportRetention),
+  };
+}
+
 export async function listAttendanceRecords(
   limit = 100,
   offset = 0,
@@ -5355,6 +5420,7 @@ export async function listAttendanceRecords(
   college?: string,
   schoolYearId?: string,
   importIds: string[] = [],
+  zeroAttendanceOnly = false,
 ) {
   const clauses: string[] = [getAttendanceRecordVisibilitySql("ar")];
   const params: unknown[] = [];
@@ -5385,6 +5451,12 @@ export async function listAttendanceRecords(
   if (cleanImportIds.length) {
     params.push(cleanImportIds);
     clauses.push(`ar.import_id = ANY($${params.length}::uuid[])`);
+  }
+
+  if (zeroAttendanceOnly) {
+    clauses.push(
+      `LOWER(TRIM(COALESCE(ar.remarks, ''))) LIKE '%zero attendance%'`,
+    );
   }
 
   params.push(limit);
@@ -6576,6 +6648,7 @@ type AttendanceFinalResultsFilter = {
   importId?: string;
   studentId?: string;
   college?: string;
+  includeMissedEvents?: boolean;
   limit?: number;
   offset?: number;
 };
@@ -7140,20 +7213,15 @@ export async function listAttendanceFinalResults(
   params.push(options.offset ?? 0);
   const offsetPosition = params.length;
 
-  const result = await query<AttendanceFinalResultRecord>(
-    `
-      WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}
-      SELECT
-        afr.*,
-        ai.event_id,
-        ae.name AS event_name,
-        ae.event_order,
-        ae.event_start_at,
-        ae.event_end_at,
-        COALESCE(missed.missed_events, '[]'::jsonb) AS missed_events
-      FROM attendance_final_results afr
-      LEFT JOIN attendance_imports ai ON ai.id = afr.import_id AND ai.deleted_at IS NULL
-      LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+  const includeMissedEvents = options.includeMissedEvents === true;
+  const rosterCteSql = includeMissedEvents
+    ? `WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}`
+    : "";
+  const missedEventsSelectSql = includeMissedEvents
+    ? `, COALESCE(missed.missed_events, '[]'::jsonb) AS missed_events`
+    : "";
+  const missedEventsJoinSql = includeMissedEvents
+    ? `
       LEFT JOIN LATERAL (
         SELECT JSONB_AGG(
           JSONB_BUILD_OBJECT(
@@ -7191,7 +7259,24 @@ export async function listAttendanceFinalResults(
               AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
               AND LOWER(TRIM(COALESCE(attended_manual.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
           )
-      ) missed ON TRUE
+      ) missed ON TRUE`
+    : "";
+
+  const result = await query<AttendanceFinalResultRecord>(
+    `
+      ${rosterCteSql}
+      SELECT
+        afr.*,
+        ai.event_id,
+        ae.name AS event_name,
+        ae.event_order,
+        ae.event_start_at,
+        ae.event_end_at
+        ${missedEventsSelectSql}
+      FROM attendance_final_results afr
+      LEFT JOIN attendance_imports ai ON ai.id = afr.import_id AND ai.deleted_at IS NULL
+      LEFT JOIN attendance_events ae ON ae.id = ai.event_id
+      ${missedEventsJoinSql}
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY
         ae.event_order ASC NULLS LAST,

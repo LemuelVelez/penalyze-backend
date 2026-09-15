@@ -31,6 +31,7 @@ import {
   deleteManualRecord as deleteAttendanceManualRecord,
   deleteManualRecords as deleteAttendanceManualRecords,
   deleteRecord as deleteAttendanceRecord,
+  dashboardOverview as attendanceDashboardOverview,
   events as attendanceEvents,
   eventDuplicateGroups as attendanceEventDuplicateGroups,
   eventMergeImpact as attendanceEventMergeImpact,
@@ -238,6 +239,7 @@ app.post("/api/attendance/events", saveAttendanceEvent);
 app.put("/api/attendance/events/:eventId", updateAttendanceEvent);
 app.patch("/api/attendance/events/:eventId", updateAttendanceEvent);
 app.delete("/api/attendance/events/:eventId", deleteAttendanceEvent);
+app.get("/api/attendance/dashboard-overview", requireAuth, attendanceDashboardOverview);
 app.get("/api/attendance/final-results", attendanceFinalResults);
 app.delete("/api/attendance/final-results", deleteAttendanceFinalResults);
 app.delete("/api/attendance/final-results/:id", deleteAttendanceFinalResult);

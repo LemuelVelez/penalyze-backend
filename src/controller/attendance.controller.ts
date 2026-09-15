@@ -9,6 +9,7 @@ import {
   deleteAttendanceImport,
   deleteAttendanceImports,
   getAttendanceImportDeleteImpact,
+  getAttendanceDashboardOverview,
   getAttendanceEventMergeImpact,
   purgeAttendanceImport,
   restoreAttendanceImport,
@@ -715,6 +716,22 @@ export async function saveImportWithProgress(
   }
 }
 
+export async function dashboardOverview(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const schoolYearId = req.query.schoolYearId
+      ? String(req.query.schoolYearId).trim()
+      : undefined;
+    const data = await getAttendanceDashboardOverview(schoolYearId);
+    res.json({ data });
+  } catch (error) {
+    next(error);
+  }
+}
+
 export async function index(req: Request, res: Response, next: NextFunction) {
   try {
     const limit = toPositiveInt(req.query.limit, 100);
@@ -737,6 +754,8 @@ export async function index(req: Request, res: Response, next: NextFunction) {
           .map((value) => value.trim())
           .filter(Boolean)
       : [];
+    const zeroAttendanceOnly =
+      String(req.query.zeroAttendanceOnly ?? "").trim().toLowerCase() === "true";
     const records = await listAttendanceRecords(
       limit,
       offset,
@@ -745,6 +764,7 @@ export async function index(req: Request, res: Response, next: NextFunction) {
       college,
       schoolYearId,
       importIds,
+      zeroAttendanceOnly,
     );
 
     res.json({ data: records });
@@ -772,6 +792,10 @@ export async function finalResults(
         ? String(req.query.studentId).trim()
         : undefined,
       college: req.query.college ? String(req.query.college).trim() : undefined,
+      includeMissedEvents:
+        String(req.query.includeMissedEvents ?? "")
+          .trim()
+          .toLowerCase() === "true",
       limit,
       offset,
     });
