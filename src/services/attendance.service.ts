@@ -6649,6 +6649,7 @@ type AttendanceFinalResultsFilter = {
   studentId?: string;
   college?: string;
   includeMissedEvents?: boolean;
+  includeEventDetails?: boolean;
   limit?: number;
   offset?: number;
 };
@@ -7214,6 +7215,7 @@ export async function listAttendanceFinalResults(
   const offsetPosition = params.length;
 
   const includeMissedEvents = options.includeMissedEvents === true;
+  const includeEventDetails = options.includeEventDetails === true;
   const rosterCteSql = includeMissedEvents
     ? `WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}`
     : "";
@@ -7261,6 +7263,96 @@ export async function listAttendanceFinalResults(
           )
       ) missed ON TRUE`
     : "";
+  const eventDetailsSelectSql = includeEventDetails
+    ? `, COALESCE(details.event_details, '[]'::jsonb) AS event_details`
+    : "";
+  const eventDetailsJoinSql = includeEventDetails
+    ? `
+      LEFT JOIN LATERAL (
+        SELECT JSONB_AGG(
+          JSONB_BUILD_OBJECT(
+            'id', roster.event_id,
+            'name', expected_event.name,
+            'event_order', expected_event.event_order,
+            'event_start_at', expected_event.event_start_at,
+            'event_end_at', expected_event.event_end_at,
+            'attended', attended.record_id IS NOT NULL,
+            'source', attended.source,
+            'record_id', attended.record_id,
+            'scanned_at', attended.scanned_at,
+            'remarks', attended.remarks
+          )
+          ORDER BY expected_event.event_order ASC NULLS LAST,
+                   COALESCE(expected_event.event_start_at, expected_event.event_end_at) ASC NULLS LAST,
+                   expected_event.name ASC
+        ) AS event_details
+        FROM (
+          SELECT DISTINCT
+            COALESCE(detail_record.event_id, detail_import.event_id) AS event_id
+          FROM attendance_records detail_record
+          LEFT JOIN attendance_imports detail_import
+            ON detail_import.id = detail_record.import_id
+           AND detail_import.deleted_at IS NULL
+          LEFT JOIN students detail_student
+            ON LOWER(TRIM(detail_student.student_id)) = LOWER(TRIM(detail_record.student_id))
+          WHERE ${getAttendanceRecordVisibilitySql("detail_record")}
+            AND detail_record.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+            AND COALESCE(detail_record.event_id, detail_import.event_id) IS NOT NULL
+            AND ${getCanonicalCollegeKeySql("detail_record", "detail_student")} = afr.college_key
+
+          UNION
+
+          SELECT DISTINCT
+            detail_manual.event_id
+          FROM manual_attendance_records detail_manual
+          LEFT JOIN students detail_manual_student
+            ON LOWER(TRIM(detail_manual_student.student_id)) = LOWER(TRIM(detail_manual.student_id))
+          WHERE detail_manual.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+            AND detail_manual.event_id IS NOT NULL
+            AND COALESCE(detail_manual.attendance_type, 'manual') <> 'zero_attendance'
+            AND LOWER(TRIM(COALESCE(detail_manual.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+            AND ${getCanonicalCollegeKeySql("detail_manual", "detail_manual_student")} = afr.college_key
+        ) roster
+        JOIN attendance_events expected_event ON expected_event.id = roster.event_id
+        LEFT JOIN LATERAL (
+          SELECT source_record.source,
+                 source_record.record_id,
+                 source_record.scanned_at,
+                 source_record.remarks
+          FROM (
+            SELECT
+              'Uploaded'::TEXT AS source,
+              attended_record.id AS record_id,
+              COALESCE(attended_record.scanned_at, attended_record.created_at) AS scanned_at,
+              attended_record.remarks
+            FROM attendance_records attended_record
+            LEFT JOIN attendance_imports attended_import
+              ON attended_import.id = attended_record.import_id
+             AND attended_import.deleted_at IS NULL
+            WHERE ${getAttendanceRecordVisibilitySql("attended_record")}
+              AND attended_record.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+              AND LOWER(TRIM(attended_record.student_id)) = LOWER(TRIM(afr.student_id))
+              AND COALESCE(attended_record.event_id, attended_import.event_id) = roster.event_id
+
+            UNION ALL
+
+            SELECT
+              'Manual'::TEXT AS source,
+              attended_manual.id AS record_id,
+              COALESCE(attended_manual.scanned_at, attended_manual.created_at) AS scanned_at,
+              attended_manual.remarks
+            FROM manual_attendance_records attended_manual
+            WHERE attended_manual.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+              AND LOWER(TRIM(attended_manual.student_id)) = LOWER(TRIM(afr.student_id))
+              AND attended_manual.event_id = roster.event_id
+              AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
+              AND LOWER(TRIM(COALESCE(attended_manual.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+          ) source_record
+          ORDER BY source_record.scanned_at DESC NULLS LAST, source_record.record_id DESC
+          LIMIT 1
+        ) attended ON TRUE
+      ) details ON TRUE`
+    : "";
 
   const result = await query<AttendanceFinalResultRecord>(
     `
@@ -7273,10 +7365,12 @@ export async function listAttendanceFinalResults(
         ae.event_start_at,
         ae.event_end_at
         ${missedEventsSelectSql}
+        ${eventDetailsSelectSql}
       FROM attendance_final_results afr
       LEFT JOIN attendance_imports ai ON ai.id = afr.import_id AND ai.deleted_at IS NULL
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id
       ${missedEventsJoinSql}
+      ${eventDetailsJoinSql}
       ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY
         ae.event_order ASC NULLS LAST,

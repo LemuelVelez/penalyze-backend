@@ -796,6 +796,10 @@ export async function finalResults(
         String(req.query.includeMissedEvents ?? "")
           .trim()
           .toLowerCase() === "true",
+      includeEventDetails:
+        String(req.query.includeEventDetails ?? "")
+          .trim()
+          .toLowerCase() === "true",
       limit,
       offset,
     });

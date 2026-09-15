@@ -223,6 +223,18 @@ export type AttendanceFinalResultRecord = {
     event_start_at: Date | string | null;
     event_end_at: Date | string | null;
   }>;
+  event_details?: Array<{
+    id: string;
+    name: string;
+    event_order: number | null;
+    event_start_at: Date | string | null;
+    event_end_at: Date | string | null;
+    attended: boolean;
+    source: "Uploaded" | "Manual" | null;
+    record_id: string | null;
+    scanned_at: Date | string | null;
+    remarks: string | null;
+  }>;
   latest_scanned_at: Date | string | null;
   source_updated_at: Date | string | null;
   created_at: Date;
