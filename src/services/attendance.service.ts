@@ -1728,6 +1728,12 @@ async function findOrCreateAttendanceEvent(
 }
 
 async function upsertStudent(client: PoolClient, row: ParsedAttendanceRow) {
+  const studentId = cleanText(row.studentId);
+
+  if (!studentId) {
+    throw createValidationError("Student ID is required.");
+  }
+
   const updated = await client.query(
     `
       UPDATE students
@@ -1737,10 +1743,16 @@ async function upsertStudent(client: PoolClient, row: ParsedAttendanceRow) {
           program = COALESCE(NULLIF($5, ''), program),
           institution = COALESCE(NULLIF($6, ''), institution),
           updated_at = NOW()
-      WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+      WHERE id = (
+        SELECT id
+        FROM students
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT 1
+      )
     `,
     [
-      row.studentId,
+      studentId,
       row.name,
       row.yearLevel ?? "",
       row.college ?? "",
@@ -1755,7 +1767,7 @@ async function upsertStudent(client: PoolClient, row: ParsedAttendanceRow) {
     `
       INSERT INTO students (student_id, name, year_level, college, program, institution)
       VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''))
-      ON CONFLICT (student_id)
+      ON CONFLICT ((LOWER(TRIM(student_id))))
       DO UPDATE SET
         name = EXCLUDED.name,
         year_level = COALESCE(EXCLUDED.year_level, students.year_level),
@@ -1765,7 +1777,7 @@ async function upsertStudent(client: PoolClient, row: ParsedAttendanceRow) {
         updated_at = NOW()
     `,
     [
-      row.studentId,
+      studentId,
       row.name,
       row.yearLevel ?? "",
       row.college ?? "",
@@ -1852,7 +1864,7 @@ async function findMatchingPenalty(client: PoolClient, noOfAbsences: number) {
       SELECT *
       FROM penalties
       WHERE no_of_absences <= $1
-      ORDER BY no_of_absences DESC
+      ORDER BY no_of_absences DESC, id DESC
       LIMIT 1
     `,
     [noOfAbsences],
@@ -1960,6 +1972,7 @@ export function getCanonicalCollegeKeySql(
         SELECT NULLIF(TRIM(scope_student.college), '')
         FROM students scope_student
         WHERE LOWER(TRIM(scope_student.student_id)) = LOWER(TRIM(${recordAlias}.student_id))
+        ORDER BY scope_student.updated_at DESC, scope_student.created_at DESC, scope_student.id DESC
         LIMIT 1
       )`;
 
@@ -3451,7 +3464,7 @@ async function getPenaltyForAbsenceCount(
       SELECT id, prescribed_penalty
       FROM penalties
       WHERE no_of_absences <= $1
-      ORDER BY no_of_absences DESC
+      ORDER BY no_of_absences DESC, id DESC
       LIMIT 1
     `,
     [noOfAbsences],
@@ -3544,7 +3557,11 @@ async function upsertPenaltyResultForManualRecord(
 }
 
 export async function saveManualAttendanceRecord(input: RawImportRow) {
-  const row = validateAttendanceInput(input);
+  const validatedRow = validateAttendanceInput(input);
+  const row = {
+    ...validatedRow,
+    studentId: cleanText(validatedRow.studentId),
+  };
   const attendanceType = getManualAttendanceType(input);
 
   return withTransaction(async (client) => {
@@ -3788,7 +3805,11 @@ async function updateManualAttendanceRecord(
   id: string,
   input: RawImportRow,
 ) {
-  const row = validateAttendanceInput(input);
+  const validatedRow = validateAttendanceInput(input);
+  const row = {
+    ...validatedRow,
+    studentId: cleanText(validatedRow.studentId),
+  };
   const existingResult = await client.query<ManualAttendanceRecord>(
     `
       SELECT ${getManualRecordSelectSql()}
@@ -5889,6 +5910,25 @@ async function refreshCalculationResultsWithClient(
     `
       WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
       ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
+      canonical_students AS (
+        SELECT DISTINCT ON (LOWER(TRIM(student_id)))
+          id,
+          student_id,
+          name,
+          year_level,
+          college,
+          program,
+          institution,
+          created_at,
+          updated_at
+        FROM students
+        WHERE NULLIF(TRIM(student_id), '') IS NOT NULL
+        ORDER BY
+          LOWER(TRIM(student_id)),
+          updated_at DESC,
+          created_at DESC,
+          id DESC
+      ),
       selected_imported_records AS (
         SELECT
           ar.school_year_id,
@@ -5952,7 +5992,7 @@ async function refreshCalculationResultsWithClient(
         LEFT JOIN attendance_imports ai
           ON ai.id = ar.import_id
          AND ai.deleted_at IS NULL
-        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+        LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
         WHERE ${getAttendanceRecordVisibilitySql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
       ), all_manual_records AS (
@@ -5976,7 +6016,7 @@ async function refreshCalculationResultsWithClient(
           COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
           mar.updated_at
         FROM manual_attendance_records mar
-        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
+        LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
       ), imported_totals AS (
         SELECT
@@ -6036,7 +6076,7 @@ async function refreshCalculationResultsWithClient(
             ELSE NULL
           END AS college_key
         FROM selected_student_keys keys
-        LEFT JOIN students s
+        LEFT JOIN canonical_students s
           ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
         LEFT JOIN student_college_totals colleges
           ON colleges.school_year_id IS NOT DISTINCT FROM keys.school_year_id
@@ -6159,9 +6199,25 @@ async function refreshCalculationResultsWithClient(
           SELECT id, prescribed_penalty
           FROM penalties
           WHERE no_of_absences <= merged.total_absences
-          ORDER BY no_of_absences DESC
+          ORDER BY no_of_absences DESC, id DESC
           LIMIT 1
         ) penalty ON merged.total_absences > 0 AND merged.college_key IS NOT NULL
+      ), deduped_matched AS (
+        SELECT DISTINCT ON (
+          school_year_id,
+          calculation_scope_key,
+          LOWER(TRIM(student_id))
+        )
+          matched.*
+        FROM matched
+        ORDER BY
+          school_year_id,
+          calculation_scope_key,
+          LOWER(TRIM(student_id)),
+          source_updated_at DESC NULLS LAST,
+          latest_scanned_at DESC NULLS LAST,
+          student_id,
+          name
       )
       INSERT INTO calculation_results AS existing (
         school_year_id,
@@ -6220,10 +6276,9 @@ async function refreshCalculationResultsWithClient(
         NULLIF(latest_scanned_at, '-infinity'::timestamptz),
         NULLIF(source_updated_at, '-infinity'::timestamptz),
         NOW()
-      FROM matched
+      FROM deduped_matched
       ON CONFLICT (school_year_id, calculation_scope_key, (LOWER(TRIM(student_id))))
       DO UPDATE SET
-        student_id = EXCLUDED.student_id,
         import_ids = EXCLUDED.import_ids,
         name = EXCLUDED.name,
         year_level = EXCLUDED.year_level,
@@ -6666,6 +6721,25 @@ async function refreshAttendanceFinalResultsWithClient(
     `
       WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
       ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
+      canonical_students AS (
+        SELECT DISTINCT ON (LOWER(TRIM(student_id)))
+          id,
+          student_id,
+          name,
+          year_level,
+          college,
+          program,
+          institution,
+          created_at,
+          updated_at
+        FROM students
+        WHERE NULLIF(TRIM(student_id), '') IS NOT NULL
+        ORDER BY
+          LOWER(TRIM(student_id)),
+          updated_at DESC,
+          created_at DESC,
+          id DESC
+      ),
       all_imported_records AS (
         SELECT
           ar.school_year_id,
@@ -6685,7 +6759,7 @@ async function refreshAttendanceFinalResultsWithClient(
         LEFT JOIN attendance_imports ai
           ON ai.id = ar.import_id
          AND ai.deleted_at IS NULL
-        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+        LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
         WHERE ${getAttendanceRecordVisibilitySql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
       ), all_manual_records AS (
@@ -6709,7 +6783,7 @@ async function refreshAttendanceFinalResultsWithClient(
           COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
           mar.updated_at
         FROM manual_attendance_records mar
-        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
+        LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
       ), imported_totals AS (
         SELECT
@@ -6773,7 +6847,7 @@ async function refreshAttendanceFinalResultsWithClient(
             ELSE NULL
           END AS college_key
         FROM student_keys keys
-        LEFT JOIN students s
+        LEFT JOIN canonical_students s
           ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
         LEFT JOIN student_college_totals colleges
           ON colleges.school_year_id IS NOT DISTINCT FROM keys.school_year_id
@@ -7033,7 +7107,26 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
   const visibleFinalResultSql = getAttendanceFinalResultVisibilitySql("afr");
   const result = await client.query<PenaltyResultRecord>(
     `
-      WITH totals AS (
+      WITH visible_final_results AS (
+        SELECT DISTINCT ON (
+          afr.school_year_id,
+          LOWER(TRIM(afr.student_id))
+        )
+          afr.*
+        FROM attendance_final_results afr
+        WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
+          AND afr.total_absences > 0
+          AND ${visibleFinalResultSql}
+        ORDER BY
+          afr.school_year_id,
+          LOWER(TRIM(afr.student_id)),
+          (afr.import_id IS NULL) DESC,
+          afr.source_updated_at DESC NULLS LAST,
+          afr.latest_scanned_at DESC NULLS LAST,
+          afr.updated_at DESC,
+          afr.created_at DESC,
+          afr.id DESC
+      ), totals AS (
         SELECT
           afr.school_year_id,
           afr.student_id,
@@ -7043,17 +7136,14 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
           COALESCE(penalty.prescribed_penalty, 'No prescribed penalty configured.') AS prescribed_penalty,
           'attendance_final_results'::TEXT AS source_table,
           afr.id AS source_record_id
-        FROM attendance_final_results afr
+        FROM visible_final_results afr
         LEFT JOIN LATERAL (
           SELECT id, prescribed_penalty
           FROM penalties
           WHERE no_of_absences <= afr.total_absences
-          ORDER BY no_of_absences DESC
+          ORDER BY no_of_absences DESC, id DESC
           LIMIT 1
         ) penalty ON afr.total_absences > 0
-        WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
-          AND afr.total_absences > 0
-          AND ${visibleFinalResultSql}
       )
       INSERT INTO penalty_results (
         school_year_id,
@@ -7079,7 +7169,6 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
       FROM totals
       ON CONFLICT (school_year_id, (LOWER(TRIM(student_id))))
       DO UPDATE SET
-        student_id = EXCLUDED.student_id,
         name = EXCLUDED.name,
         no_of_absences = EXCLUDED.no_of_absences,
         penalty_id = EXCLUDED.penalty_id,

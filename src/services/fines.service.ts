@@ -506,11 +506,42 @@ async function getAttendanceEventCount(
 async function upsertStudentRecord(
   input: ReturnType<typeof validateZeroAttendanceInput>,
 ) {
-  const result = await query<StudentRecord>(
+  const values = [
+    input.studentId.trim(),
+    input.name,
+    input.yearLevel,
+    input.college,
+    input.program,
+    input.institution,
+  ];
+  const updated = await query<StudentRecord>(
+    `
+      UPDATE students
+      SET name = $2,
+          year_level = $3,
+          college = $4,
+          program = $5,
+          institution = $6,
+          updated_at = NOW()
+      WHERE id = (
+        SELECT id
+        FROM students
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT 1
+      )
+      RETURNING *
+    `,
+    values,
+  );
+
+  if (updated.rows[0]) return updated.rows[0];
+
+  const inserted = await query<StudentRecord>(
     `
       INSERT INTO students (student_id, name, year_level, college, program, institution)
       VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT (student_id)
+      ON CONFLICT ((LOWER(TRIM(student_id))))
       DO UPDATE SET
         name = EXCLUDED.name,
         year_level = EXCLUDED.year_level,
@@ -520,17 +551,10 @@ async function upsertStudentRecord(
         updated_at = NOW()
       RETURNING *
     `,
-    [
-      input.studentId,
-      input.name,
-      input.yearLevel,
-      input.college,
-      input.program,
-      input.institution,
-    ],
+    values,
   );
 
-  return result.rows[0];
+  return inserted.rows[0];
 }
 
 async function upsertZeroAttendanceRecord(

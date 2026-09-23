@@ -45,6 +45,9 @@ export async function listAuditLogs(req: AuthenticatedRequest, res: Response, ne
     const offset = (page - 1) * limit;
     const search = cleanText(req.query.search);
     const outcome = cleanText(req.query.outcome).toLowerCase();
+    const sort =
+      cleanText(req.query.sort).toLowerCase() === "oldest" ? "oldest" : "newest";
+    const sortDirection = sort === "oldest" ? "ASC" : "DESC";
     const from = validDate(cleanText(req.query.from));
     const to = validDate(cleanText(req.query.to));
 
@@ -104,7 +107,7 @@ export async function listAuditLogs(req: AuthenticatedRequest, res: Response, ne
           created_at
         FROM audit_logs
         ${whereSql}
-        ORDER BY created_at DESC, id DESC
+        ORDER BY created_at ${sortDirection}, id ${sortDirection}
         LIMIT $${params.length - 1}
         OFFSET $${params.length}
       `,

@@ -344,35 +344,59 @@ async function addApprovedManualAttendance(
   request: AttendanceRequestRecord,
   events: AttendanceRequestEventWithSchoolYear[],
 ) {
-  await client.query(
+  const studentId = cleanText(request.student_id);
+  const studentValues = [
+    studentId,
+    request.name,
+    request.year_level ?? "",
+    request.college ?? "",
+    request.program ?? "",
+    request.institution ?? "",
+  ];
+  const updatedStudent = await client.query(
     `
-      INSERT INTO students (
-        student_id,
-        name,
-        year_level,
-        college,
-        program,
-        institution
+      UPDATE students
+      SET name = $2,
+          year_level = COALESCE(NULLIF($3, ''), year_level),
+          college = COALESCE(NULLIF($4, ''), college),
+          program = COALESCE(NULLIF($5, ''), program),
+          institution = COALESCE(NULLIF($6, ''), institution),
+          updated_at = NOW()
+      WHERE id = (
+        SELECT id
+        FROM students
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT 1
       )
-      VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''))
-      ON CONFLICT (student_id)
-      DO UPDATE SET
-        name = EXCLUDED.name,
-        year_level = COALESCE(EXCLUDED.year_level, students.year_level),
-        college = COALESCE(EXCLUDED.college, students.college),
-        program = COALESCE(EXCLUDED.program, students.program),
-        institution = COALESCE(EXCLUDED.institution, students.institution),
-        updated_at = NOW()
     `,
-    [
-      request.student_id,
-      request.name,
-      request.year_level ?? "",
-      request.college ?? "",
-      request.program ?? "",
-      request.institution ?? "",
-    ],
+    studentValues,
   );
+
+  if (!updatedStudent.rowCount) {
+    await client.query(
+      `
+        INSERT INTO students (
+          student_id,
+          name,
+          year_level,
+          college,
+          program,
+          institution
+        )
+        VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''))
+        ON CONFLICT ((LOWER(TRIM(student_id))))
+        DO UPDATE SET
+          name = EXCLUDED.name,
+          year_level = COALESCE(EXCLUDED.year_level, students.year_level),
+          college = COALESCE(EXCLUDED.college, students.college),
+          program = COALESCE(EXCLUDED.program, students.program),
+          institution = COALESCE(EXCLUDED.institution, students.institution),
+          updated_at = NOW()
+      `,
+      studentValues,
+    );
+  }
 
   let createdAttendanceCount = 0;
 
@@ -399,7 +423,7 @@ async function addApprovedManualAttendance(
             AND LOWER(TRIM(mar.student_id)) = LOWER(TRIM($2))
         ) AS exists
       `,
-      [event.event_id, request.student_id],
+      [event.event_id, studentId],
     );
 
     if (existingResult.rows[0]?.exists) continue;
@@ -425,7 +449,7 @@ async function addApprovedManualAttendance(
       [
         request.school_year_id,
         event.event_id,
-        request.student_id,
+        studentId,
         request.name,
         request.year_level ?? "",
         request.college ?? "",
@@ -445,7 +469,7 @@ async function addApprovedManualAttendance(
         AND attendance_type = 'zero_attendance'
         AND LOWER(TRIM(student_id)) = LOWER(TRIM($2))
     `,
-    [request.school_year_id, request.student_id],
+    [request.school_year_id, studentId],
   );
   const zeroManualIds = zeroManualResult.rows.map((row) => row.id);
 
@@ -473,7 +497,7 @@ async function addApprovedManualAttendance(
         AND LOWER(TRIM(student_id)) = LOWER(TRIM($2))
         AND remarks = $3
     `,
-    [request.school_year_id, request.student_id, ZERO_ATTENDANCE_REMARK],
+    [request.school_year_id, studentId, ZERO_ATTENDANCE_REMARK],
   );
 
   return createdAttendanceCount;
