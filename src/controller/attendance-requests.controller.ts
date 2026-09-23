@@ -4,6 +4,7 @@ import type { AuthenticatedRequest } from "./auth.controller";
 import {
   createAttendanceRequest,
   listAttendanceRequests,
+  listPublicAttendanceRequestsForStudent,
   reviewAttendanceRequest,
 } from "../services/attendance-requests.service";
 
@@ -18,6 +19,23 @@ export async function createRequest(
       message: "Attendance review request submitted.",
       data: request,
     });
+  } catch (error) {
+    next(error);
+  }
+}
+
+
+export async function publicStudentRequests(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const rows = await listPublicAttendanceRequestsForStudent(
+      req.query.studentId ?? req.query.student_id,
+      req.query.schoolYearId ?? req.query.school_year_id,
+    );
+    res.json({ data: rows });
   } catch (error) {
     next(error);
   }

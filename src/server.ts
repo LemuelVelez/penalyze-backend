@@ -17,11 +17,13 @@ import { listAuditLogs } from "./controller/audit-logs.controller";
 import {
   createRequest as createAttendanceRequest,
   requests as attendanceRequests,
+  publicStudentRequests as publicAttendanceStudentRequests,
   reviewRequest as reviewAttendanceRequest,
 } from "./controller/attendance-requests.controller";
 import {
   attendanceUpload,
   calculationResults as attendanceCalculationResults,
+  colleges as attendanceColleges,
   deleteCalculationResultRows as deleteAttendanceCalculationResults,
   deleteEvent as deleteAttendanceEvent,
   deleteFinalResult as deleteAttendanceFinalResult,
@@ -34,8 +36,11 @@ import {
   dashboardOverview as attendanceDashboardOverview,
   events as attendanceEvents,
   eventDuplicateGroups as attendanceEventDuplicateGroups,
+  eventExemptions as attendanceEventExemptions,
+  eventExemptionImpact as attendanceEventExemptionImpact,
   eventMergeImpact as attendanceEventMergeImpact,
   mergeEvents as mergeAttendanceEvents,
+  removeEventExemption as removeAttendanceEventExemption,
   finalResults as attendanceFinalResults,
   imports as attendanceImports,
   importDeleteImpact as attendanceImportDeleteImpact,
@@ -48,6 +53,7 @@ import {
   refreshCalculationResultRows as refreshAttendanceCalculationResults,
   refreshFinalResults as refreshAttendanceFinalResults,
   saveEvent as saveAttendanceEvent,
+  saveEventExemptions as saveAttendanceEventExemptions,
   saveImport,
   saveImportWithProgress,
   showImport,
@@ -183,6 +189,25 @@ app.get(
   },
 );
 
+
+const publicStudentStatusHits = new Map<string, { count: number; resetAt: number }>();
+function publicStudentStatusRateLimit(req: Request, res: Response, next: NextFunction) {
+  const now = Date.now();
+  const key = req.ip || req.socket.remoteAddress || "unknown";
+  const current = publicStudentStatusHits.get(key);
+  if (!current || current.resetAt <= now) {
+    publicStudentStatusHits.set(key, { count: 1, resetAt: now + 60_000 });
+    next();
+    return;
+  }
+  if (current.count >= 30) {
+    res.status(429).json({ message: "Too many requests. Please try again shortly." });
+    return;
+  }
+  current.count += 1;
+  next();
+}
+
 app.post("/api/auth/register", register);
 app.post("/api/auth/login", login);
 app.get("/api/auth/me", requireAuth, me);
@@ -210,12 +235,19 @@ app.delete("/api/school-years/:id", deleteSchoolYear);
 
 
 app.post("/api/attendance/requests", createAttendanceRequest);
+app.get("/api/attendance/requests/student-status", publicStudentStatusRateLimit, publicAttendanceStudentRequests);
 app.get("/api/attendance/requests", requireAuth, attendanceRequests);
 app.patch(
   "/api/attendance/requests/:id/review",
   requireAuth,
   reviewAttendanceRequest,
 );
+
+app.get("/api/attendance/colleges", requireAuth, attendanceColleges);
+app.get("/api/attendance/event-exemptions", requireAuth, attendanceEventExemptions);
+app.post("/api/attendance/event-exemptions/impact", requireAuth, requireAdmin, attendanceEventExemptionImpact);
+app.post("/api/attendance/event-exemptions", requireAuth, requireAdmin, saveAttendanceEventExemptions);
+app.delete("/api/attendance/event-exemptions/:id", requireAuth, requireAdmin, removeAttendanceEventExemption);
 
 app.get("/api/attendance/events", attendanceEvents);
 app.get(

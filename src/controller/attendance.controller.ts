@@ -3,7 +3,9 @@ import multer from "multer";
 
 import {
   createAttendanceEvent,
+  createEventCollegeExemptions,
   deleteAttendanceEvent,
+  deleteEventCollegeExemption,
   deleteAttendanceFinalResultsByIds,
   deleteAttendanceFinalResultsBySchoolYear,
   deleteAttendanceImport,
@@ -20,7 +22,10 @@ import {
   deleteManualAttendanceRecordsByIds,
   deleteManualAttendanceRecordsBySchoolYear,
   getAttendanceImport,
+  getEventCollegeExemptionImpact,
   listAttendanceEvents,
+  listAttendanceColleges,
+  listEventCollegeExemptions,
   listAttendanceEventDuplicateGroups,
   listAttendanceFinalResults,
   listCalculationResults,
@@ -302,6 +307,58 @@ function writeProgressStreamMessage(
 ) {
   if (res.destroyed || res.writableEnded) return;
   res.write(`${JSON.stringify(message)}\n`);
+}
+
+export async function colleges(req: Request, res: Response, next: NextFunction) {
+  try {
+    res.json({ data: await listAttendanceColleges() });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function eventExemptions(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await listEventCollegeExemptions({
+      schoolYearId: req.query.schoolYearId ?? req.query.school_year_id,
+      eventId: req.query.eventId ?? req.query.event_id,
+      college: req.query.college,
+    });
+    res.json({ data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function eventExemptionImpact(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await getEventCollegeExemptionImpact(req.body ?? {});
+    res.json({ data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function saveEventExemptions(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await createEventCollegeExemptions({
+      ...(req.body ?? {}),
+      createdBy: getAuthenticatedUserId(req),
+    });
+    res.status(201).json({ message: "College exemptions saved and fines recalculated.", data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function removeEventExemption(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+    const data = await deleteEventCollegeExemption(id);
+    res.json({ message: "College exemption removed and fines recalculated.", data });
+  } catch (error) {
+    next(error);
+  }
 }
 
 export async function events(req: Request, res: Response, next: NextFunction) {

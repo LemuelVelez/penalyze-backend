@@ -62,6 +62,8 @@ function getAuditContext(method: string, path: string): AuditContext {
     { matches: (m, p) => m === "DELETE" && /^\/api\/school-years\//.test(p), action: "Deleted school year", resourceType: "school year" },
     { matches: (m, p) => m === "POST" && p === "/api/attendance/requests", action: "Submitted attendance request", resourceType: "attendance request" },
     { matches: (m, p) => m === "PATCH" && p.endsWith("/review"), action: "Reviewed attendance request", resourceType: "attendance request" },
+    { matches: (m, p) => m === "POST" && p === "/api/attendance/event-exemptions", action: "Created attendance event college exemptions", resourceType: "attendance event college exemption" },
+    { matches: (m, p) => m === "DELETE" && /^\/api\/attendance\/event-exemptions\//.test(p), action: "Removed attendance event college exemption", resourceType: "attendance event college exemption" },
     { matches: (m, p) => m === "POST" && p === "/api/attendance/events", action: "Created attendance event", resourceType: "attendance event" },
     { matches: (m, p) => ["PATCH", "PUT"].includes(m) && /^\/api\/attendance\/events\//.test(p), action: "Updated attendance event", resourceType: "attendance event" },
     { matches: (m, p) => m === "DELETE" && /^\/api\/attendance\/events\//.test(p), action: "Deleted attendance event", resourceType: "attendance event" },

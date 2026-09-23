@@ -16,6 +16,8 @@ import {
 import {
   ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL,
   getAttendanceRecordEventRosterCollegeSql,
+  getCanonicalCollegeKeySql,
+  getEventCollegeExemptionFilterSql,
   refreshCalculationResults,
   refreshPenaltyResultsForSchoolYearWithClient,
 } from "./attendance.service";
@@ -1102,19 +1104,34 @@ export async function getPenaltyResultAbsentEvents(
         SELECT DISTINCT
           ar.school_year_id,
           LOWER(TRIM(ar.student_id)) AS normalized_student_id,
-          ar.event_id::TEXT AS event_key
+          ar.event_id::TEXT AS event_key,
+          ${getCanonicalCollegeKeySql("ar", "attendance_student")} AS college_key
         FROM attendance_records ar
+        LEFT JOIN students attendance_student
+          ON LOWER(TRIM(attendance_student.student_id)) = LOWER(TRIM(ar.student_id))
         WHERE ${getAttendanceRecordVisibilitySql("ar")}
           AND ar.event_id IS NOT NULL
           AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
+          AND (
+            ${getCanonicalCollegeKeySql("ar", "attendance_student")} IS NULL
+            OR ${getEventCollegeExemptionFilterSql("ar.event_id", getCanonicalCollegeKeySql("ar", "attendance_student"))}
+          )
         UNION
         SELECT DISTINCT
           mar.school_year_id,
           LOWER(TRIM(mar.student_id)) AS normalized_student_id,
-          mar.event_id::TEXT AS event_key
+          mar.event_id::TEXT AS event_key,
+          ${getCanonicalCollegeKeySql("mar", "manual_attendance_student")} AS college_key
         FROM manual_attendance_records mar
+        LEFT JOIN students manual_attendance_student
+          ON LOWER(TRIM(manual_attendance_student.student_id)) = LOWER(TRIM(mar.student_id))
         WHERE mar.event_id IS NOT NULL
           AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+          AND (
+            ${getCanonicalCollegeKeySql("mar", "manual_attendance_student")} IS NULL
+            OR ${getEventCollegeExemptionFilterSql("mar.event_id", getCanonicalCollegeKeySql("mar", "manual_attendance_student"))}
+          )
       ),
       absent_roster AS (
         SELECT DISTINCT roster.event_id
@@ -1125,6 +1142,7 @@ export async function getPenaltyResultAbsentEvents(
         LEFT JOIN event_attendance attended
           ON attended.school_year_id IS NOT DISTINCT FROM t.school_year_id
           AND attended.normalized_student_id = LOWER(TRIM(t.student_id))
+          AND attended.college_key IS NOT DISTINCT FROM t.college_key
           AND attended.event_key = roster.event_id::TEXT
         WHERE attended.event_key IS NULL
       )

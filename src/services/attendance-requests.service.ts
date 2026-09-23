@@ -503,6 +503,75 @@ async function addApprovedManualAttendance(
   return createdAttendanceCount;
 }
 
+
+export type PublicStudentAttendanceRequestStatus = {
+  id: string;
+  school_year_id: string;
+  school_year_name: string;
+  semester: SchoolSemester;
+  status: AttendanceRequestStatus;
+  request_note: string | null;
+  review_note: string | null;
+  reviewed_at: string | null;
+  created_at: string;
+  events: Array<{ event_id: string | null; event_name: string }>;
+};
+
+export async function listPublicAttendanceRequestsForStudent(
+  studentIdValue: unknown,
+  schoolYearIdValue?: unknown,
+): Promise<PublicStudentAttendanceRequestStatus[]> {
+  const studentId = cleanText(studentIdValue);
+  const schoolYearId = cleanText(schoolYearIdValue);
+  if (!studentId) return [];
+  if (schoolYearId && !isUuid(schoolYearId)) {
+    throw createHttpError("School year / semester ID is invalid.");
+  }
+
+  const params: unknown[] = [studentId];
+  const schoolYearClause = schoolYearId
+    ? `AND ar.school_year_id = $${params.push(schoolYearId)}`
+    : "";
+
+  const result = await query<PublicStudentAttendanceRequestStatus>(
+    `
+      SELECT
+        ar.id,
+        ar.school_year_id,
+        sy.name AS school_year_name,
+        sy.semester,
+        ar.status,
+        ar.request_note,
+        ar.review_note,
+        ar.reviewed_at,
+        ar.created_at,
+        COALESCE(
+          JSON_AGG(
+            JSON_BUILD_OBJECT(
+              'event_id', are.event_id,
+              'event_name', are.event_name
+            ) ORDER BY are.created_at, are.event_name
+          ) FILTER (WHERE are.id IS NOT NULL),
+          '[]'::JSON
+        ) AS events
+      FROM attendance_requests ar
+      JOIN school_years sy ON sy.id = ar.school_year_id
+      LEFT JOIN attendance_request_events are ON are.request_id = ar.id
+      WHERE LOWER(TRIM(ar.student_id)) = LOWER(TRIM($1))
+        ${schoolYearClause}
+      GROUP BY ar.id, sy.id
+      ORDER BY
+        CASE WHEN ar.status = 'pending' THEN 0 ELSE 1 END,
+        COALESCE(ar.reviewed_at, ar.created_at) DESC,
+        ar.created_at DESC
+      LIMIT 20
+    `,
+    params,
+  );
+
+  return result.rows;
+}
+
 export async function reviewAttendanceRequest(
   requestIdValue: unknown,
   reviewerIdValue: unknown,
