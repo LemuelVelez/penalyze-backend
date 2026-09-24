@@ -11,7 +11,7 @@ import { seedScjeFrcManualAttendees } from "../seeder/frc-scje-manual-attendees.
 import { seedRelinkFrcManualAttendanceEvents } from "../seeder/relink-frc-manual-attendance-events.seeder";
 import {
   seedSoeSessionEventsManualAttendees,
-  SOE_SESSION_EVENT_MANUAL_ATTENDANCE_REMARKS,
+  SOE_SESSION_EVENT_SEED_MARKERS,
 } from "../seeder/soe-session-events-manual-attendees.seeder";
 import { seedManualAttendanceCcsCollege } from "../seeder/manual-attendance-ccs-college.seeder";
 import { closeDatabasePool, query } from "../../lib/db";
@@ -24,13 +24,15 @@ const CAF_FRC_EVENT_DATES = ["2026-08-17", "2026-08-24", "2026-09-01"] as const;
 const LAMS_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-lams-frc-manual-attendees-v1";
 const LAMS_FRC_EVENT_DATES = ["2026-08-24", "2026-09-01"] as const;
 const SOE_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-soe-frc-manual-attendees-v2";
-const SOE_FRC_EVENT_DATES = ["2026-08-24", "2026-08-27", "2026-09-01"] as const;
+const SOE_FRC_EVENT_DATES = ["2026-08-24", "2026-09-01"] as const;
 const SCJE_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-scje-frc-manual-attendees-v1";
 const SCJE_FRC_EVENT_DATES = ["2026-09-01"] as const;
 const RELINK_FRC_MANUAL_ATTENDANCE_EVENTS_SEED_KEY =
   "2026-relink-frc-manual-attendance-events-v1";
+const SOE_SESSION_EVENTS_MANUAL_ATTENDEES_V2_SEED_KEY =
+  "2026-soe-session-events-manual-attendees-v2";
 const SOE_SESSION_EVENTS_MANUAL_ATTENDEES_SEED_KEY =
-  "2026-soe-session-events-manual-attendees-v1";
+  "2026-soe-session-events-manual-attendees-v3";
 const MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY =
   "manual-attendance-ccs-college-v1";
 
@@ -288,27 +290,51 @@ async function hasExistingScjeFrcManualAttendance() {
 }
 
 async function hasExistingSoeSessionManualAttendance() {
-  const result = await query<{ remark_count: string }>(
+  const result = await query<{ marker_count: string }>(
     `
-      SELECT COUNT(DISTINCT mar.remarks)::text AS remark_count
-      FROM manual_attendance_records mar
-      JOIN school_years sy ON sy.id = mar.school_year_id
-      WHERE sy.name = $1
-        AND sy.semester = $2
-        AND mar.remarks = ANY($3::text[])
-        AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+      SELECT COUNT(*)::text AS marker_count
+      FROM unnest($3::text[], $4::date[], $5::text[])
+        AS marker(event_name, event_date, remarks)
+      WHERE EXISTS (
+        SELECT 1
+        FROM attendance_events ae
+        JOIN school_years sy ON sy.id = ae.school_year_id
+        JOIN manual_attendance_records mar ON mar.event_id = ae.id
+        WHERE sy.name = $1
+          AND sy.semester = $2
+          AND ae.name = marker.event_name
+          AND COALESCE(
+            ae.event_date,
+            timezone('Asia/Manila', ae.event_start_at)::date,
+            timezone('Asia/Manila', ae.event_end_at)::date
+          ) = marker.event_date
+          AND mar.remarks = marker.remarks
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+      )
     `,
     [
       "2026-2027",
       "first_semester",
-      [...SOE_SESSION_EVENT_MANUAL_ATTENDANCE_REMARKS],
+      SOE_SESSION_EVENT_SEED_MARKERS.map((marker) => marker.eventName),
+      SOE_SESSION_EVENT_SEED_MARKERS.map((marker) => marker.eventDate),
+      SOE_SESSION_EVENT_SEED_MARKERS.map((marker) => marker.remarks),
     ],
   );
 
   return (
-    Number(result.rows[0]?.remark_count ?? 0) ===
-    SOE_SESSION_EVENT_MANUAL_ATTENDANCE_REMARKS.length
+    Number(result.rows[0]?.marker_count ?? 0) ===
+    SOE_SESSION_EVENT_SEED_MARKERS.length
   );
+}
+
+async function hasExistingSoeSessionManualAttendanceForV3() {
+  // Databases that already registered v2 must execute v3 once so rows that
+  // were skipped by the original placeholder-ID resolver are repaired.
+  if (await isDataSeederApplied(SOE_SESSION_EVENTS_MANUAL_ATTENDEES_V2_SEED_KEY)) {
+    return false;
+  }
+
+  return hasExistingSoeSessionManualAttendance();
 }
 
 async function bootstrapPreviouslyAppliedOneTimeSeeders(
@@ -408,7 +434,7 @@ async function runSeeders() {
       icon: "⚙️",
       label: "SOE manual attendees",
       processing:
-        "Seeding the bundled School of Engineering FRC and Buwan ng Wika attendance into manual attendance only once",
+        "Seeding the bundled School of Engineering FRC attendance into manual attendance only once",
       seeder: seedSoeFrcManualAttendees,
       bootstrapApplied: hasExistingSoeFrcManualAttendance,
     },
@@ -434,9 +460,9 @@ async function runSeeders() {
       icon: "🕘",
       label: "SOE session manual attendees",
       processing:
-        "Creating SOE-only session events, seeding manual attendance, and moving August 27 shared-event rows only once",
+        "Repairing SOE-only session attendance resolution, replacing seeded rows authoritatively, retiring legacy August 27 data, and adding shared-event exemptions only once",
       seeder: seedSoeSessionEventsManualAttendees,
-      bootstrapApplied: hasExistingSoeSessionManualAttendance,
+      bootstrapApplied: hasExistingSoeSessionManualAttendanceForV3,
       shouldRegister: (result) =>
         !(result as Awaited<ReturnType<typeof seedSoeSessionEventsManualAttendees>>)
           .skipped,
@@ -670,7 +696,7 @@ async function runSeeders() {
       );
     } else {
       consoleUi.success(
-        `Created ${result.manualAttendanceRecordsCreated} SOE manual attendance record(s) across August 24 FRC, August 27 Buwan ng Wika, and September 1 FRC, plus ${result.eventsCreated} event(s).`,
+        `Created ${result.manualAttendanceRecordsCreated} SOE manual attendance record(s) across August 24 FRC and September 1 FRC, plus ${result.eventsCreated} event(s).`,
         soeFrcRun.durationMs,
       );
     }
@@ -753,24 +779,26 @@ async function runSeeders() {
       );
     } else {
       consoleUi.success(
-        `Created ${result.manualAttendanceRecordsCreated} SOE session manual attendance record(s), ${result.eventsCreated} event(s), and moved ${result.rowsMoved} legacy row(s).`,
+        `Inserted ${result.manualAttendanceRecordsCreated} SOE session manual attendance record(s), created ${result.eventsCreated} event(s), and deleted ${result.legacyRowsDeleted} legacy row(s).`,
         soeSessionRun.durationMs,
       );
     }
 
     if (!result.skipped) {
       consoleUi.detail("Skipped source rows", skipSummary);
-    }
-    if (result.movedRowDuplicatesRemoved > 0) {
+      result.eventSummaries.forEach((event) => {
+        consoleUi.detail(
+          event.eventName,
+          `parsed ${event.rowsParsed} • inserted ${event.inserted} • stray ${event.stray} • junk ${event.junk} • invalid ${event.invalid} • unresolved ${event.unresolved}`,
+        );
+      });
+      consoleUi.detail("Legacy rows deleted", result.legacyRowsDeleted);
       consoleUi.detail(
-        "Moved-row duplicates removed",
-        result.movedRowDuplicatesRemoved,
+        "Legacy Buwan ng Wika event deleted",
+        result.legacyEventDeleted ? "yes" : "no",
       );
+      consoleUi.detail("SOE exemptions created", result.exemptionsCreated);
     }
-    consoleUi.detail(
-      "Legacy Buwan ng Wika walk-in mapping",
-      `Morning Log In — ${result.legacyWalkInRowsMovedToMorningLogIn} moved • ${result.legacyWalkInDuplicatesRemoved} duplicate(s) removed`,
-    );
     result.eventAttendeeCounts.forEach((event) => {
       consoleUi.detail(
         event.eventName,

@@ -53,16 +53,6 @@ const FIXTURES = [
     description:
       "Seeded manual attendance event for the August 24, 2026 SOE Flag Raising Ceremony.",
   },
-  {
-    fileName: "Buwan_Ng_Wika_Out.csv",
-    eventDate: "2026-08-27",
-    eventDateLabel: "August 27, 2026",
-    eventName: "Buwan ng Wika August 27",
-    remarks:
-      "Seeded as manual attendance from the August 27, 2026 SOE Buwan ng Wika attendance sheet.",
-    description:
-      "Seeded manual attendance event for the August 27, 2026 SOE Buwan ng Wika celebration.",
-  },
 ] as const satisfies readonly (EventDefinition & { fileName: string })[];
 
 const WALK_IN_GROUPS = [
@@ -84,16 +74,6 @@ const WALK_IN_GROUPS = [
       { name: "Deo E. Garcia", studentId: "TC-26-A-00578" },
       { name: "Vinzent E. Alub", studentId: "TC-26-A-00236" },
     ],
-  },
-  {
-    eventDate: "2026-08-27",
-    eventDateLabel: "August 27, 2026",
-    eventName: "Buwan ng Wika August 27",
-    remarks:
-      "Seeded as manual attendance from the August 27, 2026 SOE Buwan ng Wika walk-in attendee list.",
-    description:
-      "Seeded manual attendance event for the August 27, 2026 SOE Buwan ng Wika celebration.",
-    attendees: [{ name: "Angelou Ozarraga", studentId: "TC-26-A-01076" }],
   },
   {
     eventDate: "2026-09-01",
@@ -1216,7 +1196,7 @@ if (require.main === module) {
       console.log(
         result.alreadySeeded
           ? "SOE manual attendance is already seeded."
-          : `Created ${result.manualAttendanceRecordsCreated} SOE manual attendance record(s) across August 24 FRC, August 27 Buwan ng Wika, and September 1 FRC, plus ${result.eventsCreated} event(s).`,
+          : `Created ${result.manualAttendanceRecordsCreated} SOE manual attendance record(s) across August 24 FRC and September 1 FRC, plus ${result.eventsCreated} event(s).`,
       );
       if (result.unresolvedAttendees.length > 0) {
         console.warn(

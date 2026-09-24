@@ -121,15 +121,18 @@ const LEGACY_BUWAN_ATTENDANCE_REMARK =
   "Seeded as manual attendance from the August 27, 2026 SOE Buwan ng Wika attendance sheet.";
 const LEGACY_BUWAN_WALK_IN_REMARK =
   "Seeded as manual attendance from the August 27, 2026 SOE Buwan ng Wika walk-in attendee list.";
-
-const MORNING_LOG_IN_EVENT_NAME =
-  "School of Engineering Buwan ng Wika Morning Log In";
-const MORNING_LOG_OUT_EVENT_NAME =
-  "School of Engineering Buwan ng Wika Morning Log Out";
+const LEGACY_BUWAN_EVENT_NAME = "Buwan ng Wika August 27";
+const LEGACY_BUWAN_EVENT_DATE = "2026-08-27";
 
 export const SOE_SESSION_EVENT_MANUAL_ATTENDANCE_REMARKS = FIXTURES.map(
   (fixture) => fixture.remarks,
 );
+
+export const SOE_SESSION_EVENT_SEED_MARKERS = FIXTURES.map((fixture) => ({
+  eventName: fixture.eventName,
+  eventDate: fixture.eventDate,
+  remarks: fixture.remarks,
+}));
 
 type ScannerPayload = {
   studentId: string;
@@ -186,11 +189,6 @@ type ParsedFixture = {
   warnings: string[];
 };
 
-type LegacyMoveResult = {
-  rowsMoved: number;
-  duplicatesRemoved: number;
-};
-
 type SharedEventExemption = {
   eventId: string;
   eventName: string;
@@ -207,10 +205,8 @@ export type SeedSoeSessionEventsManualAttendeesResult = {
   eventsCreated: number;
   eventsUpdated: number;
   eventOrdersRenumbered: number;
-  rowsMoved: number;
-  movedRowDuplicatesRemoved: number;
-  legacyWalkInRowsMovedToMorningLogIn: number;
-  legacyWalkInDuplicatesRemoved: number;
+  legacyRowsDeleted: number;
+  legacyEventDeleted: boolean;
   skippedStrayRows: number;
   skippedJunkRows: number;
   skippedInvalidRows: number;
@@ -218,6 +214,16 @@ export type SeedSoeSessionEventsManualAttendeesResult = {
   warnings: string[];
   exemptionsCreated: number;
   sharedEventExemptions: SharedEventExemption[];
+  eventSummaries: Array<{
+    eventName: string;
+    eventDate: string;
+    rowsParsed: number;
+    inserted: number;
+    stray: number;
+    junk: number;
+    invalid: number;
+    unresolved: number;
+  }>;
   eventAttendeeCounts: Array<{
     eventName: string;
     eventDate: string;
@@ -978,35 +984,148 @@ async function getOrCreateTargetEvent(
   return { event: created.rows[0], created: true, updated: false };
 }
 
-async function resolveStudentByExactName(
-  client: PoolClient,
-  name: string,
-): Promise<StudentLookup | null> {
-  const normalizedName = normalizeName(name);
-  if (!normalizedName) return null;
+type StudentResolutionDirectory = {
+  exact: Map<string, StudentLookup[]>;
+  firstLast: Map<string, StudentLookup[]>;
+};
 
+function normalizeNameLookupKey(value: unknown) {
+  return collapseWhitespace(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildExactNameLookupKeys(value: unknown) {
+  const keys = new Set<string>();
+  buildNameCandidates(value).forEach((candidate) => {
+    const key = normalizeNameLookupKey(candidate);
+    if (key) keys.add(key);
+  });
+  return Array.from(keys);
+}
+
+function buildFirstLastLookupKeys(value: unknown) {
+  const keys = new Set<string>();
+  buildNameCandidates(value).forEach((candidate) => {
+    const tokens = normalizeNameLookupKey(candidate).split(" ").filter(Boolean);
+    if (tokens.length < 2) return;
+    keys.add(`${tokens[0]} ${tokens[tokens.length - 1]}`);
+  });
+  return Array.from(keys);
+}
+
+function addStudentToResolutionMap(
+  map: Map<string, StudentLookup[]>,
+  key: string,
+  student: StudentLookup,
+) {
+  if (!key) return;
+  const existing = map.get(key) ?? [];
+  const studentId = normalizeStudentId(student.student_id);
+  if (!existing.some((entry) => normalizeStudentId(entry.student_id) === studentId)) {
+    existing.push(student);
+    map.set(key, existing);
+  }
+}
+
+function buildStudentResolutionDirectory(students: StudentLookup[]) {
+  const directory: StudentResolutionDirectory = {
+    exact: new Map(),
+    firstLast: new Map(),
+  };
+
+  students.forEach((student) => {
+    buildExactNameLookupKeys(student.name).forEach((key) =>
+      addStudentToResolutionMap(directory.exact, key, student),
+    );
+    buildFirstLastLookupKeys(student.name).forEach((key) =>
+      addStudentToResolutionMap(directory.firstLast, key, student),
+    );
+  });
+
+  return directory;
+}
+
+async function loadStudentResolutionDirectory(client: PoolClient) {
   const result = await client.query<StudentLookup>(
     `
       SELECT student_id, name, year_level, college, program, institution
       FROM students
-      WHERE REGEXP_REPLACE(LOWER(TRIM(name)), '[[:space:]]+', ' ', 'g') = $1
-      ORDER BY updated_at DESC, created_at DESC
-      LIMIT 2
+      WHERE NULLIF(TRIM(student_id), '') IS NOT NULL
+        AND NULLIF(TRIM(name), '') IS NOT NULL
     `,
-    [normalizedName],
   );
 
-  return result.rows.length === 1 ? result.rows[0] : null;
+  return buildStudentResolutionDirectory(result.rows);
 }
 
-async function resolveRows(
-  client: PoolClient,
+function uniqueStudentFromKeys(
+  map: Map<string, StudentLookup[]>,
+  keys: string[],
+): StudentLookup | null {
+  const matches = new Map<string, StudentLookup>();
+  keys.forEach((key) => {
+    (map.get(key) ?? []).forEach((student) => {
+      const studentId = normalizeStudentId(student.student_id);
+      if (studentId) matches.set(studentId, student);
+    });
+  });
+  return matches.size === 1 ? Array.from(matches.values())[0] : null;
+}
+
+function resolveStudentByExactName(
+  directory: StudentResolutionDirectory,
+  name: string,
+): StudentLookup | null {
+  return uniqueStudentFromKeys(directory.exact, buildExactNameLookupKeys(name));
+}
+
+function resolveStudentByUniqueFirstLast(
+  directory: StudentResolutionDirectory,
+  name: string,
+): StudentLookup | null {
+  return uniqueStudentFromKeys(
+    directory.firstLast,
+    buildFirstLastLookupKeys(name),
+  );
+}
+
+function buildFixtureResolutionDirectory(parsedFixtures: ParsedFixture[]) {
+  const students: StudentLookup[] = [];
+  const seenIds = new Set<string>();
+
+  parsedFixtures.forEach((parsedFixture) => {
+    parsedFixture.rows.forEach((row) => {
+      const studentId = normalizeStudentId(row.studentId);
+      if (!studentId || studentId === PLACEHOLDER_STUDENT_ID) return;
+      const dedupeKey = `${studentId}:${normalizeNameLookupKey(row.name)}`;
+      if (seenIds.has(dedupeKey)) return;
+      seenIds.add(dedupeKey);
+      students.push({
+        student_id: studentId,
+        name: row.name,
+        year_level: row.yearLevel || null,
+        college: DEFAULT_COLLEGE,
+        program: DEFAULT_PROGRAM,
+        institution: row.institution || DEFAULT_INSTITUTION,
+      });
+    });
+  });
+
+  return buildStudentResolutionDirectory(students);
+}
+
+function resolveRows(
   rows: ManualAttendee[],
   unresolvedAttendees: string[],
   unresolvedKeys: Set<string>,
-  resolvedStudentCache: Map<string, StudentLookup | null>,
+  studentDirectory: StudentResolutionDirectory,
+  fixtureDirectory: StudentResolutionDirectory,
 ) {
   const resolvedRows: ManualAttendee[] = [];
+  let unresolvedRows = 0;
 
   for (const row of rows) {
     const currentStudentId = normalizeStudentId(row.studentId);
@@ -1018,23 +1137,24 @@ async function resolveRows(
       continue;
     }
 
-    let resolvedStudent: StudentLookup | null = null;
-    for (const candidate of row.nameCandidates.length
-      ? row.nameCandidates
-      : buildNameCandidates(row.name)) {
-      const normalizedCandidate = normalizeName(candidate);
-      let candidateStudent = resolvedStudentCache.get(normalizedCandidate);
-      if (candidateStudent === undefined) {
-        candidateStudent = await resolveStudentByExactName(client, candidate);
-        resolvedStudentCache.set(normalizedCandidate, candidateStudent);
-      }
-      if (candidateStudent) {
-        resolvedStudent = candidateStudent;
-        break;
-      }
+    let resolvedStudent = resolveStudentByExactName(studentDirectory, row.name);
+
+    // A placeholder scanner ID means the source explicitly identified the person
+    // but did not provide a usable ID. In that case, a unique first/last match in
+    // the authoritative students table is safe to use. Rows with no ID at all
+    // (including the pipe-format rows) intentionally stay exact-name-only.
+    if (!resolvedStudent && currentStudentId === PLACEHOLDER_STUDENT_ID) {
+      resolvedStudent = resolveStudentByExactName(fixtureDirectory, row.name);
+    }
+    if (!resolvedStudent && currentStudentId === PLACEHOLDER_STUDENT_ID) {
+      resolvedStudent = resolveStudentByUniqueFirstLast(studentDirectory, row.name);
+    }
+    if (!resolvedStudent && currentStudentId === PLACEHOLDER_STUDENT_ID) {
+      resolvedStudent = resolveStudentByUniqueFirstLast(fixtureDirectory, row.name);
     }
 
     if (!resolvedStudent) {
+      unresolvedRows += 1;
       const unresolvedKey = `${row.eventName}:${normalizeName(row.name)}`;
       if (!unresolvedKeys.has(unresolvedKey)) {
         unresolvedKeys.add(unresolvedKey);
@@ -1060,7 +1180,7 @@ async function resolveRows(
     });
   }
 
-  return resolvedRows;
+  return { rows: resolvedRows, unresolvedRows };
 }
 
 function mergeAttendeeRows(
@@ -1267,7 +1387,7 @@ async function insertManualAttendanceRow(
         remarks,
         scanned_at
       )
-      SELECT
+      VALUES (
         $1,
         $2,
         'manual',
@@ -1280,12 +1400,6 @@ async function insertManualAttendanceRow(
         0,
         $9,
         $10::timestamptz
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM manual_attendance_records mar
-        WHERE mar.event_id = $2
-          AND LOWER(TRIM(mar.student_id)) = LOWER(TRIM($3))
-          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       )
       RETURNING id
     `,
@@ -1306,76 +1420,117 @@ async function insertManualAttendanceRow(
   return inserted.rowCount ?? 0;
 }
 
-async function moveLegacyRows(
+async function deleteSeederOwnedRows(
+  client: PoolClient,
+  eventIds: string[],
+) {
+  if (!eventIds.length) return 0;
+
+  const deleted = await client.query(
+    `
+      DELETE FROM manual_attendance_records
+      WHERE event_id = ANY($1::uuid[])
+        AND remarks = ANY($2::text[])
+    `,
+    [eventIds, [...SOE_SESSION_EVENT_MANUAL_ATTENDANCE_REMARKS]],
+  );
+
+  return deleted.rowCount ?? 0;
+}
+
+async function retireLegacyBuwanData(
   client: PoolClient,
   schoolYearId: string,
-  sourceRemarks: string,
-  targetEventId: string,
-): Promise<LegacyMoveResult> {
-  const sourceRows = await client.query<{
-    id: string;
-    school_year_id: string | null;
-    event_id: string | null;
-    student_id: string;
-  }>(
+) {
+  const deletedLegacyRows = await client.query(
     `
-      SELECT id, school_year_id, event_id, student_id
-      FROM manual_attendance_records
-      WHERE remarks = $1
-        AND COALESCE(attendance_type, 'manual') <> 'zero_attendance'
+      DELETE FROM manual_attendance_records
+      WHERE remarks = ANY($1::text[])
+    `,
+    [[LEGACY_BUWAN_ATTENDANCE_REMARK, LEGACY_BUWAN_WALK_IN_REMARK]],
+  );
+
+  const candidates = await client.query<TargetEvent>(
+    `
+      SELECT
+        id,
+        school_year_id,
+        name,
+        event_date::text,
+        event_start_at::text,
+        event_end_at::text,
+        description
+      FROM attendance_events
+      WHERE school_year_id = $1
+        AND COALESCE(
+          event_date,
+          timezone('Asia/Manila', event_start_at)::date,
+          timezone('Asia/Manila', event_end_at)::date
+        ) = $2::date
       ORDER BY created_at ASC, id ASC
       FOR UPDATE
     `,
-    [sourceRemarks],
+    [schoolYearId, LEGACY_BUWAN_EVENT_DATE],
   );
 
-  let rowsMoved = 0;
-  let duplicatesRemoved = 0;
+  const legacyEvents = candidates.rows.filter(
+    (event) =>
+      clean(event.name).toLowerCase() === LEGACY_BUWAN_EVENT_NAME.toLowerCase(),
+  );
+  const warnings: string[] = [];
+  let legacyEventDeleted = false;
 
-  for (const row of sourceRows.rows) {
-    const collision = await client.query<{ id: string }>(
+  for (const event of legacyEvents) {
+    const references = await client.query<{
+      attendance_records: string;
+      manual_records: string;
+      request_events: string;
+    }>(
       `
-        SELECT id
-        FROM manual_attendance_records
-        WHERE event_id = $1
-          AND id <> $2
-          AND COALESCE(attendance_type, 'manual') <> 'zero_attendance'
-          AND LOWER(TRIM(student_id)) = LOWER(TRIM($3))
-        ORDER BY created_at ASC, id ASC
-        LIMIT 1
+        SELECT
+          (
+            SELECT COUNT(*)::text
+            FROM attendance_records ar
+            LEFT JOIN attendance_imports ai ON ai.id = ar.import_id
+            WHERE ar.event_id = $1 OR ai.event_id = $1
+          ) AS attendance_records,
+          (
+            SELECT COUNT(*)::text
+            FROM manual_attendance_records mar
+            WHERE mar.event_id = $1
+          ) AS manual_records,
+          (
+            SELECT COUNT(*)::text
+            FROM attendance_request_events areq
+            WHERE areq.event_id = $1
+          ) AS request_events
       `,
-      [targetEventId, row.id, row.student_id],
+      [event.id],
     );
+    const reference = references.rows[0];
+    const attendanceRecords = Number(reference?.attendance_records ?? 0);
+    const manualRecords = Number(reference?.manual_records ?? 0);
+    const requestEvents = Number(reference?.request_events ?? 0);
 
-    if (collision.rows[0]) {
-      const deleted = await client.query(
-        `DELETE FROM manual_attendance_records WHERE id = $1`,
-        [row.id],
+    if (attendanceRecords || manualRecords || requestEvents) {
+      warnings.push(
+        `Legacy event "${event.name}" was kept because it is still referenced (${attendanceRecords} attendance record(s), ${manualRecords} manual record(s), ${requestEvents} attendance request event(s)).`,
       );
-      duplicatesRemoved += deleted.rowCount ?? 0;
       continue;
     }
 
-    if (row.event_id === targetEventId && row.school_year_id === schoolYearId) {
-      continue;
-    }
-
-    const updated = await client.query(
-      `
-        UPDATE manual_attendance_records
-        SET event_id = $1,
-            school_year_id = $2,
-            college = $3,
-            program = $4,
-            updated_at = NOW()
-        WHERE id = $5
-      `,
-      [targetEventId, schoolYearId, DEFAULT_COLLEGE, DEFAULT_PROGRAM, row.id],
+    const deleted = await client.query(
+      `DELETE FROM attendance_events WHERE id = $1`,
+      [event.id],
     );
-    rowsMoved += updated.rowCount ?? 0;
+    legacyEventDeleted = legacyEventDeleted || Boolean(deleted.rowCount);
   }
 
-  return { rowsMoved, duplicatesRemoved };
+  return {
+    legacyRowsDeleted: deletedLegacyRows.rowCount ?? 0,
+    legacyEventDeleted,
+    warnings,
+  };
 }
 
 async function renumberEventOrder(client: PoolClient, schoolYearId: string) {
@@ -1437,46 +1592,17 @@ async function ensureSharedEventExemptions(
           timezone('Asia/Manila', ae.event_start_at)::date,
           timezone('Asia/Manila', ae.event_end_at)::date
         ) = ANY($2::date[])
-        AND (
-          EXISTS (
-            SELECT 1
-            FROM attendance_records ar
-            LEFT JOIN attendance_imports ai
-              ON ai.id = ar.import_id
-             AND ai.deleted_at IS NULL
-            LEFT JOIN students s
-              ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
-            WHERE ar.deleted_at IS NULL
-              AND COALESCE(ar.event_id, ai.event_id) = ae.id
-              AND NULLIF(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(
-                LOWER(REPLACE(COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), '')), '&', ' and ')),
-                '[^a-z0-9]+', ' ', 'g'
-              ), '[[:space:]]+', ' ', 'g')), '') = $3
-          )
-          OR EXISTS (
-            SELECT 1
-            FROM manual_attendance_records mar
-            LEFT JOIN students s
-              ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
-            WHERE mar.event_id = ae.id
-              AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
-              AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <>
-                LOWER('Zero attendance registration from landing page.')
-              AND NULLIF(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(
-                LOWER(REPLACE(COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')), '&', ' and ')),
-                '[^a-z0-9]+', ' ', 'g'
-              ), '[[:space:]]+', ' ', 'g')), '') = $3
-          )
-        )
       ORDER BY resolved_date ASC, ae.name ASC, ae.id ASC
     `,
-    [schoolYearId, ["2026-08-17", "2026-08-27"], SOE_COLLEGE_KEY],
+    [schoolYearId, ["2026-08-17", "2026-08-27"]],
   );
 
   const soeNameIdentity = normalizeAttendanceEventIdentityName(DEFAULT_COLLEGE);
   const sharedEvents = candidateEvents.rows.filter(
-    (event) =>
-      !normalizeAttendanceEventIdentityName(event.name).includes(soeNameIdentity),
+    (event) => {
+      const identity = normalizeAttendanceEventIdentityName(event.name);
+      return !identity.includes(soeNameIdentity) && !identity.startsWith("soe ");
+    },
   );
   const result: SharedEventExemption[] = [];
 
@@ -1548,10 +1674,8 @@ export async function seedSoeSessionEventsManualAttendees(
       eventsCreated: 0,
       eventsUpdated: 0,
       eventOrdersRenumbered: 0,
-      rowsMoved: 0,
-      movedRowDuplicatesRemoved: 0,
-      legacyWalkInRowsMovedToMorningLogIn: 0,
-      legacyWalkInDuplicatesRemoved: 0,
+      legacyRowsDeleted: 0,
+      legacyEventDeleted: false,
       skippedStrayRows: 0,
       skippedJunkRows: 0,
       skippedInvalidRows: 0,
@@ -1561,6 +1685,7 @@ export async function seedSoeSessionEventsManualAttendees(
       ],
       exemptionsCreated: 0,
       sharedEventExemptions: [],
+      eventSummaries: [],
       eventAttendeeCounts: [],
     };
   }
@@ -1583,15 +1708,19 @@ export async function seedSoeSessionEventsManualAttendees(
     (sum, parsedFixture) => sum + parsedFixture.skippedInvalidRows,
     0,
   );
-  const warnings = parsedFixtures.flatMap((parsedFixture) => parsedFixture.warnings);
+  const parseWarnings = parsedFixtures.flatMap(
+    (parsedFixture) => parsedFixture.warnings,
+  );
 
   const transactionResult = await withTransaction(async (client) => {
     const schoolYearId = await getTargetSchoolYearId(client);
     const unresolvedAttendees: string[] = [];
     const unresolvedKeys = new Set<string>();
-    const resolvedStudentCache = new Map<string, StudentLookup | null>();
+    const studentDirectory = await loadStudentResolutionDirectory(client);
+    const fixtureDirectory = buildFixtureResolutionDirectory(parsedFixtures);
     const eventByName = new Map<string, TargetEvent>();
     const eventAttendeeCounts: SeedSoeSessionEventsManualAttendeesResult["eventAttendeeCounts"] = [];
+    const eventSummaries: SeedSoeSessionEventsManualAttendeesResult["eventSummaries"] = [];
     let eventsCreated = 0;
     let eventsUpdated = 0;
     let manualAttendanceRecordsCreated = 0;
@@ -1608,55 +1737,65 @@ export async function seedSoeSessionEventsManualAttendees(
       if (targetEvent.created) eventsCreated += 1;
       if (targetEvent.updated) eventsUpdated += 1;
       eventByName.set(parsedFixture.fixture.eventName, targetEvent.event);
+    }
 
-      const resolvedRows = await resolveRows(
-        client,
+    onProgress?.("Replacing only this seeder's rows on the six SOE session events");
+    await deleteSeederOwnedRows(
+      client,
+      Array.from(eventByName.values()).map((event) => event.id),
+    );
+
+    for (const parsedFixture of parsedFixtures) {
+      const event = eventByName.get(parsedFixture.fixture.eventName);
+      if (!event) {
+        throw new Error(
+          `Missing SOE session event after creation: ${parsedFixture.fixture.eventName}.`,
+        );
+      }
+
+      const resolved = resolveRows(
         parsedFixture.rows,
         unresolvedAttendees,
         unresolvedKeys,
-        resolvedStudentCache,
+        studentDirectory,
+        fixtureDirectory,
       );
       const mergedRows = mergeAttendeeRows(
-        resolvedRows,
+        resolved.rows,
         parsedFixture.fixture.direction,
       );
       const existingStudents = await hydrateExistingStudents(client, mergedRows);
       const hydratedRows = hydrateRowsWithStudents(mergedRows, existingStudents);
+      let insertedForEvent = 0;
 
       for (const row of hydratedRows) {
         if (await upsertStudent(client, row)) studentsChanged += 1;
-        manualAttendanceRecordsCreated += await insertManualAttendanceRow(
+        const inserted = await insertManualAttendanceRow(
           client,
           schoolYearId,
-          targetEvent.event.id,
+          event.id,
           row,
         );
+        insertedForEvent += inserted;
+        manualAttendanceRecordsCreated += inserted;
       }
+
+      eventSummaries.push({
+        eventName: parsedFixture.fixture.eventName,
+        eventDate: parsedFixture.fixture.eventDate,
+        rowsParsed: parsedFixture.rows.length,
+        inserted: insertedForEvent,
+        stray: parsedFixture.skippedStrayRows,
+        junk: parsedFixture.skippedJunkRows,
+        invalid: parsedFixture.skippedInvalidRows,
+        unresolved: resolved.unresolvedRows,
+      });
     }
 
-    const morningLogOutEvent = eventByName.get(MORNING_LOG_OUT_EVENT_NAME);
-    const morningLogInEvent = eventByName.get(MORNING_LOG_IN_EVENT_NAME);
-    if (!morningLogOutEvent || !morningLogInEvent) {
-      throw new Error("Missing SOE Buwan ng Wika morning session events after creation.");
-    }
+    onProgress?.("Deleting legacy SOE Buwan ng Wika rows and retiring the old shared-looking event when safe");
+    const legacy = await retireLegacyBuwanData(client, schoolYearId);
 
-    onProgress?.("Moving previously seeded SOE Buwan ng Wika rows off the shared event");
-    const legacyAttendanceMove = await moveLegacyRows(
-      client,
-      schoolYearId,
-      LEGACY_BUWAN_ATTENDANCE_REMARK,
-      morningLogOutEvent.id,
-    );
-    const legacyWalkInMove = await moveLegacyRows(
-      client,
-      schoolYearId,
-      LEGACY_BUWAN_WALK_IN_REMARK,
-      morningLogInEvent.id,
-    );
-
-    const eventOrdersRenumbered = await renumberEventOrder(client, schoolYearId);
-
-    onProgress?.("Exempting SOE from any remaining shared August 17/27 events");
+    onProgress?.("Exempting SOE from every non-SOE August 17/27 event");
     const sharedEventExemptions = await ensureSharedEventExemptions(
       client,
       schoolYearId,
@@ -1664,6 +1803,8 @@ export async function seedSoeSessionEventsManualAttendees(
     const exemptionsCreated = sharedEventExemptions.filter(
       (entry) => entry.exemptionCreated,
     ).length;
+
+    const eventOrdersRenumbered = await renumberEventOrder(client, schoolYearId);
 
     for (const fixture of FIXTURES) {
       const event = eventByName.get(fixture.eventName);
@@ -1683,43 +1824,23 @@ export async function seedSoeSessionEventsManualAttendees(
       manualAttendanceRecordsCreated,
       studentsChanged,
       unresolvedAttendees,
-      legacyAttendanceMove,
-      legacyWalkInMove,
+      legacy,
       exemptionsCreated,
       sharedEventExemptions,
+      eventSummaries,
       eventAttendeeCounts,
     };
   });
 
-  const rowsMoved =
-    transactionResult.legacyAttendanceMove.rowsMoved +
-    transactionResult.legacyWalkInMove.rowsMoved;
-  const movedRowDuplicatesRemoved =
-    transactionResult.legacyAttendanceMove.duplicatesRemoved +
-    transactionResult.legacyWalkInMove.duplicatesRemoved;
-  const changed =
-    transactionResult.eventsCreated > 0 ||
-    transactionResult.eventsUpdated > 0 ||
-    transactionResult.eventOrdersRenumbered > 0 ||
-    transactionResult.manualAttendanceRecordsCreated > 0 ||
-    transactionResult.studentsChanged > 0 ||
-    rowsMoved > 0 ||
-    movedRowDuplicatesRemoved > 0 ||
-    transactionResult.exemptionsCreated > 0;
-
-  if (changed) {
-    onProgress?.(
-      "Refreshing final attendance and penalty results after SOE session changes",
-    );
-    await refreshAttendanceFinalResults({
-      schoolYearId: transactionResult.schoolYearId,
-    });
-  } else {
-    onProgress?.("SOE session attendance is unchanged; no refresh is needed");
-  }
+  onProgress?.(
+    "Refreshing final attendance and penalty results after SOE session changes",
+  );
+  await refreshAttendanceFinalResults({
+    schoolYearId: transactionResult.schoolYearId,
+  });
 
   return {
-    alreadySeeded: !changed,
+    alreadySeeded: false,
     skipped: false,
     missingFixtureFiles: [],
     rowsParsed,
@@ -1728,23 +1849,19 @@ export async function seedSoeSessionEventsManualAttendees(
     eventsCreated: transactionResult.eventsCreated,
     eventsUpdated: transactionResult.eventsUpdated,
     eventOrdersRenumbered: transactionResult.eventOrdersRenumbered,
-    rowsMoved,
-    movedRowDuplicatesRemoved,
-    legacyWalkInRowsMovedToMorningLogIn:
-      transactionResult.legacyWalkInMove.rowsMoved,
-    legacyWalkInDuplicatesRemoved:
-      transactionResult.legacyWalkInMove.duplicatesRemoved,
+    legacyRowsDeleted: transactionResult.legacy.legacyRowsDeleted,
+    legacyEventDeleted: transactionResult.legacy.legacyEventDeleted,
     skippedStrayRows,
     skippedJunkRows,
     skippedInvalidRows,
     unresolvedAttendees: transactionResult.unresolvedAttendees,
-    warnings,
+    warnings: [...parseWarnings, ...transactionResult.legacy.warnings],
     exemptionsCreated: transactionResult.exemptionsCreated,
     sharedEventExemptions: transactionResult.sharedEventExemptions,
+    eventSummaries: transactionResult.eventSummaries,
     eventAttendeeCounts: transactionResult.eventAttendeeCounts,
   };
 }
-
 if (require.main === module) {
   seedSoeSessionEventsManualAttendees((message) => console.log(message))
     .then(async (result) => {
@@ -1754,25 +1871,20 @@ if (require.main === module) {
         );
       } else {
         console.log(
-          result.alreadySeeded
-            ? "SOE session attendance is already seeded."
-            : `Created ${result.manualAttendanceRecordsCreated} manual attendance record(s), created ${result.eventsCreated} event(s), and moved ${result.rowsMoved} legacy row(s).`,
+          `Inserted ${result.manualAttendanceRecordsCreated} SOE session manual attendance record(s), created ${result.eventsCreated} event(s), and deleted ${result.legacyRowsDeleted} legacy row(s).`,
         );
+        result.eventSummaries.forEach((event) => {
+          console.log(
+            `${event.eventName}: parsed ${event.rowsParsed}, inserted ${event.inserted}, stray ${event.stray}, junk ${event.junk}, invalid ${event.invalid}, unresolved ${event.unresolved}.`,
+          );
+        });
         console.log(
-          `Skipped ${result.skippedStrayRows} stray-date row(s), ${result.skippedJunkRows} junk row(s), and ${result.skippedInvalidRows} invalid row(s).`,
+          `Legacy rows deleted: ${result.legacyRowsDeleted}; legacy event deleted: ${result.legacyEventDeleted ? "yes" : "no"}; exemptions created: ${result.exemptionsCreated}.`,
         );
       }
       result.eventAttendeeCounts.forEach((event) => {
         console.log(`${event.eventName}: ${event.attendeeCount} attendee(s)`);
       });
-      if (
-        result.legacyWalkInRowsMovedToMorningLogIn > 0 ||
-        result.legacyWalkInDuplicatesRemoved > 0
-      ) {
-        console.warn(
-          `Legacy August 27 SOE Buwan ng Wika walk-in attendance was mapped to Morning Log In: ${result.legacyWalkInRowsMovedToMorningLogIn} moved, ${result.legacyWalkInDuplicatesRemoved} duplicate(s) removed.`,
-        );
-      }
       if (result.unresolvedAttendees.length > 0) {
         console.warn(
           `Could not safely resolve ${result.unresolvedAttendees.length} attendee(s): ${result.unresolvedAttendees.join(", ")}`,
