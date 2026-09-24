@@ -7878,6 +7878,8 @@ export type EventExemptionImpact = {
   students_losing_absence: number;
   penalties_before: number;
   penalties_after: number;
+  already_exempted: boolean;
+  in_roster_scope: boolean;
 };
 
 export async function listAttendanceColleges() {
@@ -7956,8 +7958,31 @@ export async function getEventCollegeExemptionImpact(input: { college?: unknown;
   if (!schoolYearId) throw createValidationError("School year is required.");
   if (!eventIds.length) return [] as EventExemptionImpact[];
   const rows = await query<EventExemptionImpact>(`
-    WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
-    college_students AS (
+    WITH impact_event_roster_scope AS (
+      SELECT DISTINCT
+        ar.school_year_id,
+        COALESCE(ar.event_id, ai.event_id) AS event_id,
+        ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
+      FROM attendance_records ar
+      LEFT JOIN attendance_imports ai
+        ON ai.id = ar.import_id
+       AND ai.deleted_at IS NULL
+      WHERE ${getAttendanceRecordVisibilitySql("ar")}
+        AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
+        AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
+
+      UNION
+
+      SELECT DISTINCT
+        mar.school_year_id,
+        mar.event_id,
+        ${MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL} AS college_key
+      FROM manual_attendance_records mar
+      WHERE mar.event_id IS NOT NULL
+        AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+        AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+        AND ${MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
+    ), college_students AS (
       SELECT DISTINCT LOWER(TRIM(student_id)) AS student_key
       FROM (
         SELECT s.student_id
@@ -7974,6 +7999,30 @@ export async function getEventCollegeExemptionImpact(input: { college?: unknown;
         WHERE ${getCanonicalCollegeKeySql("mar")} = $1
       ) scoped_students
       WHERE NULLIF(TRIM(student_id), '') IS NOT NULL
+    ), college_attendance AS (
+      SELECT DISTINCT
+        COALESCE(ar.event_id, ai.event_id) AS event_id,
+        LOWER(TRIM(ar.student_id)) AS student_key
+      FROM attendance_records ar
+      LEFT JOIN attendance_imports ai
+        ON ai.id = ar.import_id
+       AND ai.deleted_at IS NULL
+      WHERE ${getAttendanceRecordVisibilitySql("ar")}
+        AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
+        AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
+        AND ${getCanonicalCollegeKeySql("ar")} = $1
+
+      UNION
+
+      SELECT DISTINCT
+        mar.event_id,
+        LOWER(TRIM(mar.student_id)) AS student_key
+      FROM manual_attendance_records mar
+      WHERE mar.event_id IS NOT NULL
+        AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+        AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+        AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
+        AND ${getCanonicalCollegeKeySql("mar")} = $1
     ), current_final AS (
       SELECT LOWER(TRIM(student_id)) AS student_key, total_absences
       FROM attendance_final_results afr
@@ -7989,39 +8038,43 @@ export async function getEventCollegeExemptionImpact(input: { college?: unknown;
     SELECT
       e.id AS event_id,
       e.name AS event_name,
-      COUNT(DISTINCT attended.student_key)::INT AS students_attended,
-      COUNT(DISTINCT CASE
-        WHEN cf.total_absences > 0 AND attended.student_key IS NULL THEN cs.student_key
-      END)::INT AS students_losing_absence,
-      COUNT(DISTINCT cp.student_key)::INT AS penalties_before,
-      COUNT(DISTINCT CASE
-        WHEN cp.student_key IS NOT NULL
-          AND GREATEST(COALESCE(cf.total_absences, 0) - CASE WHEN attended.student_key IS NULL THEN 1 ELSE 0 END, 0) > 0
+      COALESCE(COUNT(DISTINCT attended.student_key), 0)::INT AS students_attended,
+      COALESCE(COUNT(DISTINCT CASE
+        WHEN roster.event_id IS NOT NULL
+          AND exemption.id IS NULL
+          AND cf.total_absences > 0
+          AND attended.student_key IS NULL
+        THEN cs.student_key
+      END), 0)::INT AS students_losing_absence,
+      COALESCE(COUNT(DISTINCT CASE
+        WHEN roster.event_id IS NOT NULL THEN cp.student_key
+      END), 0)::INT AS penalties_before,
+      COALESCE(COUNT(DISTINCT CASE
+        WHEN roster.event_id IS NOT NULL
+          AND cp.student_key IS NOT NULL
+          AND GREATEST(
+            COALESCE(cf.total_absences, 0)
+              - CASE WHEN exemption.id IS NULL AND attended.student_key IS NULL THEN 1 ELSE 0 END,
+            0
+          ) > 0
         THEN cp.student_key
-      END)::INT AS penalties_after
+      END), 0)::INT AS penalties_after,
+      COALESCE(BOOL_OR(exemption.id IS NOT NULL), FALSE) AS already_exempted,
+      COALESCE(BOOL_OR(roster.event_id IS NOT NULL), FALSE) AS in_roster_scope
     FROM attendance_events e
-    JOIN event_roster_scope roster
+    LEFT JOIN impact_event_roster_scope roster
       ON roster.event_id = e.id
      AND roster.school_year_id IS NOT DISTINCT FROM e.school_year_id
      AND roster.college_key = $1
-    CROSS JOIN college_students cs
+    LEFT JOIN attendance_event_college_exemptions exemption
+      ON exemption.event_id = e.id
+     AND exemption.college_key = $1
+    LEFT JOIN college_students cs ON TRUE
     LEFT JOIN current_final cf ON cf.student_key = cs.student_key
     LEFT JOIN current_penalty cp ON cp.student_key = cs.student_key
-    LEFT JOIN LATERAL (
-      SELECT cs.student_key
-      WHERE EXISTS (
-        SELECT 1 FROM attendance_records ar
-        WHERE ar.event_id = e.id
-          AND ar.deleted_at IS NULL
-          AND LOWER(TRIM(ar.student_id)) = cs.student_key
-        UNION ALL
-        SELECT 1 FROM manual_attendance_records mar
-        WHERE mar.event_id = e.id
-          AND LOWER(TRIM(mar.student_id)) = cs.student_key
-          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
-          AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
-      )
-    ) attended ON TRUE
+    LEFT JOIN college_attendance attended
+      ON attended.event_id = e.id
+     AND attended.student_key = cs.student_key
     WHERE e.id = ANY($3::uuid[]) AND e.school_year_id = $2
     GROUP BY e.id
     ORDER BY e.event_order, e.name
