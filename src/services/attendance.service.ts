@@ -33,6 +33,32 @@ import {
 const ZERO_ATTENDANCE_REMARK =
   "Zero attendance registration from landing page.";
 
+const PROTECTED_SOE_SESSION_EVENT_IDENTITIES = new Set(
+  [
+    "School of Engineering Opening Program Log In",
+    "School of Engineering Opening Program Log Out",
+    "School of Engineering Buwan ng Wika Morning Log In",
+    "School of Engineering Buwan ng Wika Morning Log Out",
+    "School of Engineering Buwan ng Wika Afternoon Log In",
+    "School of Engineering Buwan ng Wika Afternoon Log Out",
+  ].map((name) => normalizeAttendanceEventIdentityName(name)),
+);
+
+function isProtectedSoeSessionMergeConflict(
+  leftName: unknown,
+  rightName: unknown,
+) {
+  const left = normalizeAttendanceEventIdentityName(leftName);
+  const right = normalizeAttendanceEventIdentityName(rightName);
+
+  if (!left || !right || left === right) return false;
+
+  return (
+    PROTECTED_SOE_SESSION_EVENT_IDENTITIES.has(left) ||
+    PROTECTED_SOE_SESSION_EVENT_IDENTITIES.has(right)
+  );
+}
+
 declare const require: any;
 
 export type UploadedAttendanceFile = {
@@ -1650,6 +1676,13 @@ async function rankAttendanceEventCandidates(props: {
     : await query<AttendanceEventRecord>(sql, values);
 
   return result.rows
+    .filter(
+      (event) =>
+        !isProtectedSoeSessionMergeConflict(
+          props.metadata.eventName,
+          event.name,
+        ),
+    )
     .map((event) => ({
       event,
       match: scoreAttendanceEventIdentity(
@@ -1710,6 +1743,7 @@ async function findOrCreateAttendanceEvent(
 
   const incomingIdentityName = normalizeAttendanceEventIdentityName(name);
   const rankedExistingEvents = existingResult.rows
+    .filter((event) => !isProtectedSoeSessionMergeConflict(name, event.name))
     .map((event) => ({
       event,
       match: scoreAttendanceEventIdentity(
@@ -2686,6 +2720,15 @@ function getBatchAttendanceCandidate(
   candidatePreview: AttendancePreviewResult,
   candidateIndex: number,
 ): AttendanceEventMergeCandidate | null {
+  if (
+    isProtectedSoeSessionMergeConflict(
+      preview.detectedEvent.eventName,
+      candidatePreview.detectedEvent.eventName,
+    )
+  ) {
+    return null;
+  }
+
   const match = scoreAttendanceEventIdentity(
     {
       name: preview.detectedEvent.eventName,
@@ -4919,6 +4962,7 @@ export async function listAttendanceEventDuplicateGroups(
       const left = events[leftIndex];
       const right = events[rightIndex];
       if (left.school_year_id !== right.school_year_id) continue;
+      if (isProtectedSoeSessionMergeConflict(left.name, right.name)) continue;
 
       const match = scoreAttendanceEventIdentity(
         { name: left.name, startAt: left.event_start_at, endAt: left.event_end_at },
@@ -4978,6 +5022,15 @@ async function getAttendanceEventMergeImpactWithClient(
     )
   ) {
     throw createValidationError("Attendance events can only be merged within the same school year.");
+  }
+  if (
+    sourceResult.rows.some((event) =>
+      isProtectedSoeSessionMergeConflict(targetEvent.name, event.name),
+    )
+  ) {
+    throw createValidationError(
+      "School of Engineering session Log In/Log Out and Morning/Afternoon events are intentionally separate and cannot be merged.",
+    );
   }
 
   const countResult = await client.query<{

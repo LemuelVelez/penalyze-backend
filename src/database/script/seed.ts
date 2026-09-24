@@ -31,8 +31,10 @@ const RELINK_FRC_MANUAL_ATTENDANCE_EVENTS_SEED_KEY =
   "2026-relink-frc-manual-attendance-events-v1";
 const SOE_SESSION_EVENTS_MANUAL_ATTENDEES_V2_SEED_KEY =
   "2026-soe-session-events-manual-attendees-v2";
-const SOE_SESSION_EVENTS_MANUAL_ATTENDEES_SEED_KEY =
+const SOE_SESSION_EVENTS_MANUAL_ATTENDEES_V3_SEED_KEY =
   "2026-soe-session-events-manual-attendees-v3";
+const SOE_SESSION_EVENTS_MANUAL_ATTENDEES_SEED_KEY =
+  "2026-soe-session-events-manual-attendees-v4";
 const MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY =
   "manual-attendance-ccs-college-v1";
 
@@ -327,10 +329,14 @@ async function hasExistingSoeSessionManualAttendance() {
   );
 }
 
-async function hasExistingSoeSessionManualAttendanceForV3() {
-  // Databases that already registered v2 must execute v3 once so rows that
-  // were skipped by the original placeholder-ID resolver are repaired.
-  if (await isDataSeederApplied(SOE_SESSION_EVENTS_MANUAL_ATTENDEES_V2_SEED_KEY)) {
+async function hasExistingSoeSessionManualAttendanceForV4() {
+  // A database that already ran v2 or v3 must execute v4 once. v4 recreates
+  // any SOE session events that were later collapsed through Review Merge and
+  // authoritatively puts this seeder's rows back on their six source sessions.
+  if (
+    (await isDataSeederApplied(SOE_SESSION_EVENTS_MANUAL_ATTENDEES_V2_SEED_KEY)) ||
+    (await isDataSeederApplied(SOE_SESSION_EVENTS_MANUAL_ATTENDEES_V3_SEED_KEY))
+  ) {
     return false;
   }
 
@@ -460,9 +466,9 @@ async function runSeeders() {
       icon: "🕘",
       label: "SOE session manual attendees",
       processing:
-        "Repairing SOE-only session attendance resolution, replacing seeded rows authoritatively, retiring legacy August 27 data, and adding shared-event exemptions only once",
+        "Restoring six SOE-only session events after accidental Review Merge, replacing seeded rows authoritatively, retiring legacy August 27 data, and adding shared-event exemptions only once",
       seeder: seedSoeSessionEventsManualAttendees,
-      bootstrapApplied: hasExistingSoeSessionManualAttendanceForV3,
+      bootstrapApplied: hasExistingSoeSessionManualAttendanceForV4,
       shouldRegister: (result) =>
         !(result as Awaited<ReturnType<typeof seedSoeSessionEventsManualAttendees>>)
           .skipped,
