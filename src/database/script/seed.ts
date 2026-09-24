@@ -9,6 +9,10 @@ import { seedLamsFrcManualAttendees } from "../seeder/frc-lams-manual-attendees.
 import { seedSoeFrcManualAttendees } from "../seeder/frc-soe-manual-attendees.seeder";
 import { seedScjeFrcManualAttendees } from "../seeder/frc-scje-manual-attendees.seeder";
 import { seedRelinkFrcManualAttendanceEvents } from "../seeder/relink-frc-manual-attendance-events.seeder";
+import {
+  seedSoeSessionEventsManualAttendees,
+  SOE_SESSION_EVENT_MANUAL_ATTENDANCE_REMARKS,
+} from "../seeder/soe-session-events-manual-attendees.seeder";
 import { seedManualAttendanceCcsCollege } from "../seeder/manual-attendance-ccs-college.seeder";
 import { closeDatabasePool, query } from "../../lib/db";
 import { consoleUi, formatDuration } from "./console-ui";
@@ -25,6 +29,8 @@ const SCJE_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-scje-frc-manual-attendees-v1";
 const SCJE_FRC_EVENT_DATES = ["2026-09-01"] as const;
 const RELINK_FRC_MANUAL_ATTENDANCE_EVENTS_SEED_KEY =
   "2026-relink-frc-manual-attendance-events-v1";
+const SOE_SESSION_EVENTS_MANUAL_ATTENDEES_SEED_KEY =
+  "2026-soe-session-events-manual-attendees-v1";
 const MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY =
   "manual-attendance-ccs-college-v1";
 
@@ -45,6 +51,7 @@ type SeederDefinition<T> = {
 type OneTimeSeederDefinition<T> = SeederDefinition<T> & {
   key: string;
   bootstrapApplied?: () => Promise<boolean>;
+  shouldRegister?: (result: unknown) => boolean;
 };
 
 type SeedHistoryRecord = {
@@ -280,6 +287,30 @@ async function hasExistingScjeFrcManualAttendance() {
   return Number(result.rows[0]?.event_count ?? 0) === SCJE_FRC_EVENT_DATES.length;
 }
 
+async function hasExistingSoeSessionManualAttendance() {
+  const result = await query<{ remark_count: string }>(
+    `
+      SELECT COUNT(DISTINCT mar.remarks)::text AS remark_count
+      FROM manual_attendance_records mar
+      JOIN school_years sy ON sy.id = mar.school_year_id
+      WHERE sy.name = $1
+        AND sy.semester = $2
+        AND mar.remarks = ANY($3::text[])
+        AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+    `,
+    [
+      "2026-2027",
+      "first_semester",
+      [...SOE_SESSION_EVENT_MANUAL_ATTENDANCE_REMARKS],
+    ],
+  );
+
+  return (
+    Number(result.rows[0]?.remark_count ?? 0) ===
+    SOE_SESSION_EVENT_MANUAL_ATTENDANCE_REMARKS.length
+  );
+}
+
 async function bootstrapPreviouslyAppliedOneTimeSeeders(
   seeders: readonly OneTimeSeederDefinition<unknown>[],
 ) {
@@ -399,6 +430,18 @@ async function runSeeders() {
       seeder: seedRelinkFrcManualAttendanceEvents,
     },
     {
+      key: SOE_SESSION_EVENTS_MANUAL_ATTENDEES_SEED_KEY,
+      icon: "🕘",
+      label: "SOE session manual attendees",
+      processing:
+        "Creating SOE-only session events, seeding manual attendance, and moving August 27 shared-event rows only once",
+      seeder: seedSoeSessionEventsManualAttendees,
+      bootstrapApplied: hasExistingSoeSessionManualAttendance,
+      shouldRegister: (result) =>
+        !(result as Awaited<ReturnType<typeof seedSoeSessionEventsManualAttendees>>)
+          .skipped,
+    },
+    {
       key: MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY,
       icon: "🏫",
       label: "Manual attendance CCS college normalization",
@@ -478,7 +521,14 @@ async function runSeeders() {
         initialState.pending.length,
         definition as SeederDefinition<unknown>,
       );
-      await registerDataSeeder(definition.key);
+      const oneTimeDefinition =
+        definition as OneTimeSeederDefinition<unknown>;
+      const shouldRegister =
+        !oneTimeDefinition.shouldRegister ||
+        oneTimeDefinition.shouldRegister(run.result);
+      if (shouldRegister) {
+        await registerDataSeeder(definition.key);
+      }
       oneTimeRuns.set(definition.key, run);
     }
   } else {
@@ -508,6 +558,11 @@ async function runSeeders() {
     RELINK_FRC_MANUAL_ATTENDANCE_EVENTS_SEED_KEY,
   ) as
     | SeederRun<Awaited<ReturnType<typeof seedRelinkFrcManualAttendanceEvents>>>
+    | undefined;
+  const soeSessionRun = oneTimeRuns.get(
+    SOE_SESSION_EVENTS_MANUAL_ATTENDEES_SEED_KEY,
+  ) as
+    | SeederRun<Awaited<ReturnType<typeof seedSoeSessionEventsManualAttendees>>>
     | undefined;
   const ccsRun = oneTimeRuns.get(MANUAL_ATTENDANCE_CCS_COLLEGE_SEED_KEY) as
     | SeederRun<Awaited<ReturnType<typeof seedManualAttendanceCcsCollege>>>
@@ -681,6 +736,64 @@ async function runSeeders() {
   } else {
     consoleUi.skipped(
       "FRC manual-attendance event relink seeder is already applied — it was not executed again.",
+    );
+  }
+
+  if (soeSessionRun) {
+    const result = soeSessionRun.result;
+    const skipSummary = `${result.skippedStrayRows} stray-date • ${result.skippedJunkRows} junk • ${result.skippedInvalidRows} invalid`;
+
+    if (result.skipped) {
+      consoleUi.warning(
+        `SOE session manual attendance remains pending — missing fixture file(s): ${result.missingFixtureFiles.join(", ")}`,
+      );
+    } else if (result.alreadySeeded) {
+      consoleUi.skipped(
+        `SOE session manual attendance was already correct — ${skipSummary}.`,
+      );
+    } else {
+      consoleUi.success(
+        `Created ${result.manualAttendanceRecordsCreated} SOE session manual attendance record(s), ${result.eventsCreated} event(s), and moved ${result.rowsMoved} legacy row(s).`,
+        soeSessionRun.durationMs,
+      );
+    }
+
+    if (!result.skipped) {
+      consoleUi.detail("Skipped source rows", skipSummary);
+    }
+    if (result.movedRowDuplicatesRemoved > 0) {
+      consoleUi.detail(
+        "Moved-row duplicates removed",
+        result.movedRowDuplicatesRemoved,
+      );
+    }
+    consoleUi.detail(
+      "Legacy Buwan ng Wika walk-in mapping",
+      `Morning Log In — ${result.legacyWalkInRowsMovedToMorningLogIn} moved • ${result.legacyWalkInDuplicatesRemoved} duplicate(s) removed`,
+    );
+    result.eventAttendeeCounts.forEach((event) => {
+      consoleUi.detail(
+        event.eventName,
+        `${event.attendeeCount} attendee(s)`,
+      );
+    });
+    if (result.unresolvedAttendees.length > 0) {
+      consoleUi.warning(
+        `Could not safely resolve ${result.unresolvedAttendees.length} SOE session attendee(s): ${result.unresolvedAttendees.join(", ")}`,
+      );
+    }
+    if (result.warnings.length > 0) {
+      result.warnings.forEach((warning) => consoleUi.warning(warning));
+    }
+    result.sharedEventExemptions.forEach((event) => {
+      consoleUi.detail(
+        `SOE exemption: ${event.eventDate} ${event.eventName}`,
+        event.exemptionCreated ? "created" : "already present",
+      );
+    });
+  } else {
+    consoleUi.skipped(
+      "SOE session manual-attendance seeder is already applied — it was not executed again.",
     );
   }
 
