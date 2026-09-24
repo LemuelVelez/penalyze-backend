@@ -331,6 +331,12 @@ function cleanText(value: unknown) {
     .trim();
 }
 
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value,
+  );
+}
+
 export function normalizeCollegeKey(value: unknown) {
   const text = cleanText(value).toLowerCase().replace(/&/g, " and ");
   const normalized = text.replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
@@ -7986,6 +7992,56 @@ export async function createEventCollegeExemptions(input: { college?: unknown; e
       ORDER BY e.event_order, e.name
     `, [schoolYearId, collegeKey]);
     return saved.rows;
+  });
+}
+
+export async function deleteEventCollegeExemptionsBulk(input: {
+  college?: unknown;
+  eventIds?: unknown;
+  schoolYearId?: unknown;
+}) {
+  const collegeLabel = cleanText(input.college);
+  const collegeKey = normalizeCollegeKey(collegeLabel);
+  const schoolYearId = cleanText(input.schoolYearId);
+  const eventIds = Array.isArray(input.eventIds)
+    ? uniqueCleanTextValues(input.eventIds.map(String))
+    : [];
+
+  if (!collegeKey || !collegeLabel) throw createValidationError("College is required.");
+  if (!schoolYearId) throw createValidationError("School year is required.");
+  if (!isUuid(schoolYearId)) throw createValidationError("School year ID is invalid.");
+  if (!eventIds.length) throw createValidationError("Select at least one event.");
+  if (eventIds.some((eventId) => !isUuid(eventId))) {
+    throw createValidationError("One or more event IDs are invalid.");
+  }
+
+  return withTransaction(async (client) => {
+    await lockAttendanceAbsenceSync(client);
+
+    const schoolYearResult = await client.query<{ id: string }>(
+      `SELECT id FROM school_years WHERE id = $1 LIMIT 1`,
+      [schoolYearId],
+    );
+    if (!schoolYearResult.rows[0]) {
+      throw createValidationError("School year not found.", 404);
+    }
+
+    const deleted = await client.query<Omit<EventCollegeExemption, "event_name">>(
+      `
+        DELETE FROM attendance_event_college_exemptions
+        WHERE school_year_id = $1
+          AND college_key = $2
+          AND event_id = ANY($3::uuid[])
+        RETURNING *
+      `,
+      [schoolYearId, collegeKey, eventIds],
+    );
+
+    const studentIds = await getCollegeStudentIds(client, collegeKey);
+    await syncAbsencesForStudents(client, studentIds, schoolYearId);
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [schoolYearId]);
+
+    return deleted.rows;
   });
 }
 

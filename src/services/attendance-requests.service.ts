@@ -652,3 +652,81 @@ export async function reviewAttendanceRequest(
     createdAttendanceCount: result.createdAttendanceCount,
   };
 }
+
+export async function removeAttendanceRequestEvent(
+  requestIdValue: unknown,
+  requestEventIdValue: unknown,
+  reviewerIdValue: unknown,
+) {
+  const requestId = cleanText(requestIdValue);
+  const requestEventId = cleanText(requestEventIdValue);
+  const reviewerId = cleanText(reviewerIdValue);
+
+  if (!requestId) throw createHttpError("Attendance request ID is required.");
+  if (!isUuid(requestId)) throw createHttpError("Attendance request ID is invalid.");
+  if (!requestEventId) throw createHttpError("Attendance request event ID is required.");
+  if (!isUuid(requestEventId)) {
+    throw createHttpError("Attendance request event ID is invalid.");
+  }
+  if (!reviewerId) throw createHttpError("Authenticated reviewer is required.", 401);
+
+  await withTransaction(async (client) => {
+    const reviewerResult = await client.query<{ id: string }>(
+      `SELECT id FROM users WHERE id = $1 LIMIT 1`,
+      [reviewerId],
+    );
+    if (!reviewerResult.rows[0]) {
+      throw createHttpError("Authenticated reviewer account was not found.", 401);
+    }
+
+    const requestResult = await client.query<AttendanceRequestRecord>(
+      `SELECT * FROM attendance_requests WHERE id = $1 FOR UPDATE`,
+      [requestId],
+    );
+    const request = requestResult.rows[0];
+    if (!request) throw createHttpError("Attendance request not found.", 404);
+    if (request.status !== "pending") {
+      throw createHttpError("Only pending requests can be edited.", 409);
+    }
+
+    const eventResult = await client.query<AttendanceRequestEventRecord>(
+      `
+        SELECT *
+        FROM attendance_request_events
+        WHERE id = $1 AND request_id = $2
+        LIMIT 1
+      `,
+      [requestEventId, requestId],
+    );
+    if (!eventResult.rows[0]) {
+      throw createHttpError("Requested event not found on this request.", 404);
+    }
+
+    const countResult = await client.query<{ count: number }>(
+      `
+        SELECT COUNT(*)::INT AS count
+        FROM attendance_request_events
+        WHERE request_id = $1
+      `,
+      [requestId],
+    );
+    if ((countResult.rows[0]?.count ?? 0) <= 1) {
+      throw createHttpError(
+        "A request must keep at least one event. Reject the request instead.",
+        409,
+      );
+    }
+
+    await client.query(
+      `DELETE FROM attendance_request_events WHERE id = $1 AND request_id = $2`,
+      [requestEventId, requestId],
+    );
+    await client.query(
+      `UPDATE attendance_requests SET updated_at = NOW() WHERE id = $1`,
+      [requestId],
+    );
+  });
+
+  return getRequestViewById(requestId);
+}
+

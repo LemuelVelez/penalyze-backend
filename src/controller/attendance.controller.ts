@@ -6,6 +6,7 @@ import {
   createEventCollegeExemptions,
   deleteAttendanceEvent,
   deleteEventCollegeExemption,
+  deleteEventCollegeExemptionsBulk,
   deleteAttendanceFinalResultsByIds,
   deleteAttendanceFinalResultsBySchoolYear,
   deleteAttendanceImport,
@@ -346,6 +347,18 @@ export async function saveEventExemptions(req: Request, res: Response, next: Nex
       createdBy: getAuthenticatedUserId(req),
     });
     res.status(201).json({ message: "College exemptions saved and fines recalculated.", data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function removeEventExemptionsBulk(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await deleteEventCollegeExemptionsBulk(req.body ?? {});
+    res.json({
+      message: "College exemptions removed and fines recalculated.",
+      data,
+    });
   } catch (error) {
     next(error);
   }

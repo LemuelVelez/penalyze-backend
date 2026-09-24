@@ -18,6 +18,7 @@ import {
   createRequest as createAttendanceRequest,
   requests as attendanceRequests,
   publicStudentRequests as publicAttendanceStudentRequests,
+  removeRequestEvent as removeAttendanceRequestEvent,
   reviewRequest as reviewAttendanceRequest,
 } from "./controller/attendance-requests.controller";
 import {
@@ -41,6 +42,7 @@ import {
   eventMergeImpact as attendanceEventMergeImpact,
   mergeEvents as mergeAttendanceEvents,
   removeEventExemption as removeAttendanceEventExemption,
+  removeEventExemptionsBulk as removeAttendanceEventExemptionsBulk,
   finalResults as attendanceFinalResults,
   imports as attendanceImports,
   importDeleteImpact as attendanceImportDeleteImpact,
@@ -242,11 +244,17 @@ app.patch(
   requireAuth,
   reviewAttendanceRequest,
 );
+app.delete(
+  "/api/attendance/requests/:id/events/:eventId",
+  requireAuth,
+  removeAttendanceRequestEvent,
+);
 
 app.get("/api/attendance/colleges", requireAuth, attendanceColleges);
 app.get("/api/attendance/event-exemptions", requireAuth, attendanceEventExemptions);
 app.post("/api/attendance/event-exemptions/impact", requireAuth, requireAdmin, attendanceEventExemptionImpact);
 app.post("/api/attendance/event-exemptions", requireAuth, requireAdmin, saveAttendanceEventExemptions);
+app.post("/api/attendance/event-exemptions/bulk-delete", requireAuth, requireAdmin, removeAttendanceEventExemptionsBulk);
 app.delete("/api/attendance/event-exemptions/:id", requireAuth, requireAdmin, removeAttendanceEventExemption);
 
 app.get("/api/attendance/events", attendanceEvents);

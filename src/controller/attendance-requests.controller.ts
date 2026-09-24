@@ -5,6 +5,7 @@ import {
   createAttendanceRequest,
   listAttendanceRequests,
   listPublicAttendanceRequestsForStudent,
+  removeAttendanceRequestEvent,
   reviewAttendanceRequest,
 } from "../services/attendance-requests.service";
 
@@ -75,6 +76,26 @@ export async function reviewRequest(
           ? "Attendance request approved."
           : "Attendance request rejected.",
       data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function removeRequestEvent(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const request = await removeAttendanceRequestEvent(
+      req.params.id,
+      req.params.eventId,
+      req.user?.sub,
+    );
+    res.json({
+      message: "Event removed from attendance request.",
+      data: request,
     });
   } catch (error) {
     next(error);
