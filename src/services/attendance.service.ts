@@ -5398,6 +5398,24 @@ export async function deleteAttendanceEvent(id: string) {
     if (!existing)
       throw createValidationError("Attendance event not found.", 404);
 
+    const pendingRequestResult = await client.query<{ count: number }>(
+      `
+        SELECT COUNT(*)::INT AS count
+        FROM attendance_request_events are
+        JOIN attendance_requests ar ON ar.id = are.request_id
+        WHERE are.event_id = $1
+          AND ar.status = 'pending'
+      `,
+      [id],
+    );
+    const pendingRequestCount = pendingRequestResult.rows[0]?.count ?? 0;
+    if (pendingRequestCount > 0) {
+      throw createValidationError(
+        `This event is linked to ${pendingRequestCount.toLocaleString()} pending attendance review request(s). Review or reject those requests before deleting the event.`,
+        409,
+      );
+    }
+
     const eventRosterCollegeKeys =
       await getAttendanceEventRosterCollegeKeys(client, [id]);
 

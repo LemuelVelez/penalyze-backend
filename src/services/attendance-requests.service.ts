@@ -572,6 +572,107 @@ export async function listPublicAttendanceRequestsForStudent(
   return result.rows;
 }
 
+async function resolveRequestEventsForApproval(
+  client: PoolClient,
+  request: AttendanceRequestRecord,
+) {
+  const eventResult = await client.query<AttendanceRequestEventWithSchoolYear>(
+    `
+      SELECT are.*, ae.school_year_id
+      FROM attendance_request_events are
+      LEFT JOIN attendance_events ae ON ae.id = are.event_id
+      WHERE are.request_id = $1
+      ORDER BY are.created_at, are.event_name
+    `,
+    [request.id],
+  );
+
+  if (!eventResult.rows.length) {
+    throw createHttpError("This request does not contain any events.", 409);
+  }
+
+  const resolvedEvents: AttendanceRequestEventWithSchoolYear[] = [];
+
+  for (const event of eventResult.rows) {
+    if (event.event_id && event.school_year_id === request.school_year_id) {
+      resolvedEvents.push(event);
+      continue;
+    }
+
+    const matchingEvent = await client.query<{
+      id: string;
+      school_year_id: string | null;
+    }>(
+      `
+        SELECT id, school_year_id
+        FROM attendance_events
+        WHERE school_year_id = $1
+          AND LOWER(REGEXP_REPLACE(TRIM(name), '\\s+', ' ', 'g')) =
+              LOWER(REGEXP_REPLACE(TRIM($2), '\\s+', ' ', 'g'))
+        ORDER BY event_order ASC, created_at ASC, id ASC
+        LIMIT 1
+      `,
+      [request.school_year_id, event.event_name],
+    );
+
+    let resolvedEvent = matchingEvent.rows[0];
+
+    if (!resolvedEvent) {
+      const restoredEvent = await client.query<{
+        id: string;
+        school_year_id: string | null;
+      }>(
+        `
+          INSERT INTO attendance_events (
+            school_year_id,
+            name,
+            description,
+            event_order
+          )
+          SELECT
+            $1,
+            $2,
+            $3,
+            COALESCE(MAX(event_order), 0) + 1
+          FROM attendance_events
+          WHERE school_year_id = $1
+          RETURNING id, school_year_id
+        `,
+        [
+          request.school_year_id,
+          event.event_name,
+          "Restored automatically from a pending attendance review request.",
+        ],
+      );
+      resolvedEvent = restoredEvent.rows[0];
+    }
+
+    if (!resolvedEvent) {
+      throw createHttpError(
+        `Unable to restore the requested event “${event.event_name}”.`,
+        409,
+      );
+    }
+
+    await client.query(
+      `
+        UPDATE attendance_request_events
+        SET event_id = $2
+        WHERE id = $1
+      `,
+      [event.id, resolvedEvent.id],
+    );
+
+    resolvedEvents.push({
+      ...event,
+      event_id: resolvedEvent.id,
+      school_year_id: resolvedEvent.school_year_id,
+    });
+  }
+
+  return resolvedEvents;
+}
+
 export async function reviewAttendanceRequest(
   requestIdValue: unknown,
   reviewerIdValue: unknown,
@@ -607,23 +708,11 @@ export async function reviewAttendanceRequest(
 
     let createdAttendanceCount = 0;
     if (status === "approved") {
-      const eventResult = await client.query<AttendanceRequestEventWithSchoolYear>(
-        `
-          SELECT are.*, ae.school_year_id
-          FROM attendance_request_events are
-          LEFT JOIN attendance_events ae ON ae.id = are.event_id
-          WHERE are.request_id = $1
-          ORDER BY are.created_at, are.event_name
-        `,
-        [request.id],
-      );
-      if (!eventResult.rows.length) {
-        throw createHttpError("This request does not contain any events.", 409);
-      }
+      const resolvedEvents = await resolveRequestEventsForApproval(client, request);
       createdAttendanceCount = await addApprovedManualAttendance(
         client,
         request,
-        eventResult.rows,
+        resolvedEvents,
       );
       await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
         request.school_year_id,
