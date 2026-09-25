@@ -9,6 +9,7 @@ import type {
 } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
 import {
+  normalizeCollegeKey,
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
 } from "./attendance.service";
 
@@ -385,14 +386,6 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
         );
       }
 
-      const evidenceUrlValue = cleanText(input.evidenceUrl);
-      if (!evidenceUrlValue) {
-        throw createHttpError(
-          "Evidence link is required for details correction requests.",
-        );
-      }
-      const evidenceUrl = normalizeEvidenceUrl(evidenceUrlValue);
-
       await client.query(
         `SELECT pg_advisory_xact_lock(hashtext(LOWER(TRIM($1))))`,
         [studentId],
@@ -453,14 +446,13 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
             current_year_level,
             current_college,
             current_program,
-            evidence_url,
             request_note
           )
           VALUES (
             'details_correction',
             $1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''),
             NULLIF($7, ''), $8, NULLIF($9, ''), NULLIF($10, ''),
-            NULLIF($11, ''), $12, NULLIF($13, '')
+            NULLIF($11, ''), NULLIF($12, '')
           )
           RETURNING *
         `,
@@ -476,7 +468,6 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
           current.year_level ?? "",
           current.college ?? "",
           current.program ?? "",
-          evidenceUrl,
           cleanText(input.note),
         ],
       );
@@ -513,6 +504,40 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       if (storedEvent?.school_year_id !== schoolYearId) {
         throw createHttpError(
           `The event “${storedEvent?.name ?? event.eventId}” does not belong to the selected school year / semester.`,
+        );
+      }
+    }
+
+    let requestCollege = cleanText(input.college);
+    if (!requestCollege) {
+      const currentStudent = await getCurrentStudentDetails(client, studentId);
+      requestCollege = currentStudent.college ?? "";
+    }
+
+    const requestCollegeKey = normalizeCollegeKey(requestCollege);
+    if (requestCollegeKey) {
+      const exemptedEventResult = await client.query<{ id: string; name: string }>(
+        `
+          SELECT e.id, e.name
+          FROM attendance_event_college_exemptions exemption
+          JOIN attendance_events e ON e.id = exemption.event_id
+          WHERE exemption.event_id = ANY($1::uuid[])
+            AND exemption.college_key = $2
+          ORDER BY e.event_order, e.event_start_at, e.created_at
+        `,
+        [eventIds, requestCollegeKey],
+      );
+
+      if (exemptedEventResult.rows.length) {
+        const eventNames = exemptedEventResult.rows
+          .map((event) => event.name)
+          .join(", ");
+        throw createHttpError(
+          `${requestCollege || "This college"} is exempted from the following event${
+            exemptedEventResult.rows.length === 1 ? "" : "s"
+          }: ${eventNames}. Remove ${
+            exemptedEventResult.rows.length === 1 ? "it" : "them"
+          } from the attendance request.`,
         );
       }
     }
