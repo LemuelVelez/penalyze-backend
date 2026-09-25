@@ -8082,39 +8082,87 @@ export async function getEventCollegeExemptionImpact(input: { college?: unknown;
   return rows.rows;
 }
 
-export async function createEventCollegeExemptions(input: { college?: unknown; eventIds?: unknown; reason?: unknown; schoolYearId?: unknown; createdBy?: unknown }) {
-  const collegeLabel = cleanText(input.college);
-  const collegeKey = normalizeCollegeKey(collegeLabel);
+export async function createEventCollegeExemptions(input: {
+  college?: unknown;
+  colleges?: unknown;
+  eventIds?: unknown;
+  reason?: unknown;
+  schoolYearId?: unknown;
+  createdBy?: unknown;
+}) {
+  const requestedCollegeLabels = Array.isArray(input.colleges)
+    ? uniqueCleanTextValues(input.colleges.map(String))
+    : [];
+  const fallbackCollegeLabel = cleanText(input.college);
+  const collegeLabels = requestedCollegeLabels.length
+    ? requestedCollegeLabels
+    : fallbackCollegeLabel
+      ? [fallbackCollegeLabel]
+      : [];
+  const normalizedCollegeCandidates = collegeLabels.map((collegeLabel) => ({
+    collegeLabel,
+    collegeKey: normalizeCollegeKey(collegeLabel),
+  }));
+  const normalizedColleges = Array.from(
+    new Map(
+      normalizedCollegeCandidates
+        .filter(
+          (college): college is { collegeLabel: string; collegeKey: string } =>
+            Boolean(college.collegeKey),
+        )
+        .map((college) => [college.collegeKey, college]),
+    ).values(),
+  );
   const schoolYearId = cleanText(input.schoolYearId);
   const createdBy = cleanText(input.createdBy) || null;
   const reason = cleanText(input.reason) || null;
-  const eventIds = Array.isArray(input.eventIds) ? uniqueCleanTextValues(input.eventIds.map(String)) : [];
-  if (!collegeKey || !collegeLabel) throw createValidationError("College is required.");
+  const eventIds = Array.isArray(input.eventIds)
+    ? uniqueCleanTextValues(input.eventIds.map(String))
+    : [];
+
+  if (!normalizedColleges.length || normalizedColleges.length !== collegeLabels.length) {
+    throw createValidationError("Select at least one valid college.");
+  }
   if (!schoolYearId) throw createValidationError("School year is required.");
   if (!eventIds.length) throw createValidationError("Select at least one event.");
+
   return withTransaction(async (client) => {
     await lockAttendanceAbsenceSync(client);
-    const eventResult = await client.query<{ id: string }>(`SELECT id FROM attendance_events WHERE id = ANY($1::uuid[]) AND school_year_id = $2`, [eventIds, schoolYearId]);
-    if (eventResult.rows.length !== eventIds.length) throw createValidationError("One or more events do not belong to the selected school year.");
-    for (const eventId of eventIds) {
-      await client.query(`
-        INSERT INTO attendance_event_college_exemptions (school_year_id, event_id, college_key, college_label, reason, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (event_id, college_key) DO UPDATE SET
-          school_year_id = EXCLUDED.school_year_id, college_label = EXCLUDED.college_label,
-          reason = EXCLUDED.reason, updated_at = NOW()
-      `, [schoolYearId, eventId, collegeKey, collegeLabel, reason, createdBy]);
+    const eventResult = await client.query<{ id: string }>(
+      `SELECT id FROM attendance_events WHERE id = ANY($1::uuid[]) AND school_year_id = $2`,
+      [eventIds, schoolYearId],
+    );
+    if (eventResult.rows.length !== eventIds.length) {
+      throw createValidationError("One or more events do not belong to the selected school year.");
     }
-    const studentIds = await getCollegeStudentIds(client, collegeKey);
-    await syncAbsencesForStudents(client, studentIds, schoolYearId);
+
+    for (const { collegeKey, collegeLabel } of normalizedColleges) {
+      for (const eventId of eventIds) {
+        await client.query(`
+          INSERT INTO attendance_event_college_exemptions (school_year_id, event_id, college_key, college_label, reason, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6)
+          ON CONFLICT (event_id, college_key) DO UPDATE SET
+            school_year_id = EXCLUDED.school_year_id, college_label = EXCLUDED.college_label,
+            reason = EXCLUDED.reason, updated_at = NOW()
+        `, [schoolYearId, eventId, collegeKey, collegeLabel, reason, createdBy]);
+      }
+    }
+
+    const affectedStudentIds = new Set<string>();
+    for (const { collegeKey } of normalizedColleges) {
+      const studentIds = await getCollegeStudentIds(client, collegeKey);
+      for (const studentId of studentIds) affectedStudentIds.add(studentId);
+    }
+    await syncAbsencesForStudents(client, Array.from(affectedStudentIds), schoolYearId);
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [schoolYearId]);
+
     const saved = await client.query<EventCollegeExemption>(`
       SELECT x.*, e.name AS event_name
       FROM attendance_event_college_exemptions x
       JOIN attendance_events e ON e.id = x.event_id
-      WHERE x.school_year_id = $1 AND x.college_key = $2
-      ORDER BY e.event_order, e.name
-    `, [schoolYearId, collegeKey]);
+      WHERE x.school_year_id = $1 AND x.college_key = ANY($2::text[])
+      ORDER BY x.college_label, e.event_order, e.name
+    `, [schoolYearId, normalizedColleges.map((college) => college.collegeKey)]);
     return saved.rows;
   });
 }
