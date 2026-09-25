@@ -245,6 +245,18 @@ export function auditMutation(req: AuthenticatedRequest, res: Response, next: Ne
   res.once("finish", () => {
     const path = requestPath(req);
     const context = getAuditContext(req.method, path);
+    const attendanceRequestType =
+      res.locals.auditAttendanceRequestType ??
+      (path === "/api/attendance/requests"
+        ? req.body?.requestType ?? req.body?.request_type
+        : null);
+    if (attendanceRequestType === "details_correction") {
+      if (req.method.toUpperCase() === "POST" && path === "/api/attendance/requests") {
+        context.action = "Submitted details correction request";
+      } else if (req.method.toUpperCase() === "PATCH" && path.endsWith("/review")) {
+        context.action = "Reviewed details correction request";
+      }
+    }
     const files = summarizeFiles(req);
     const responseActor =
       res.statusCode >= 200 &&

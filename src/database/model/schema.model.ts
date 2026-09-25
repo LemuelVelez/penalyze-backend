@@ -28,6 +28,7 @@ export type AttendanceImportProgressStage =
   | "cancelled";
 export type FineStatus = "unpaid" | "paid" | "waived";
 export type AttendanceRequestStatus = "pending" | "approved" | "rejected";
+export type AttendanceRequestType = "event_review" | "details_correction";
 export type SchoolSemester = "first_semester" | "second_semester";
 
 export type SchoolYearRecord = {
@@ -155,12 +156,18 @@ export type AttendanceRequestEventRecord = {
 export type AttendanceRequestRecord = {
   id: string;
   school_year_id: string;
+  request_type: AttendanceRequestType;
   student_id: string;
   name: string;
   year_level: string | null;
   college: string | null;
   program: string | null;
   institution: string | null;
+  current_name: string | null;
+  current_year_level: string | null;
+  current_college: string | null;
+  current_program: string | null;
+  evidence_url: string | null;
   request_note: string | null;
   status: AttendanceRequestStatus;
   reviewed_by: string | null;

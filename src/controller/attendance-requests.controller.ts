@@ -16,8 +16,12 @@ export async function createRequest(
 ) {
   try {
     const request = await createAttendanceRequest(req.body ?? {});
+    res.locals.auditAttendanceRequestType = request.request_type;
     res.status(201).json({
-      message: "Attendance review request submitted.",
+      message:
+        request.request_type === "details_correction"
+          ? "Details correction request submitted."
+          : "Attendance review request submitted.",
       data: request,
     });
   } catch (error) {
@@ -50,6 +54,7 @@ export async function requests(
   try {
     const rows = await listAttendanceRequests({
       status: req.query.status,
+      requestType: req.query.requestType ?? req.query.request_type,
       schoolYearId: req.query.schoolYearId ?? req.query.school_year_id,
       studentId: req.query.studentId ?? req.query.student_id,
     });
@@ -70,11 +75,18 @@ export async function reviewRequest(
       req.user?.sub,
       req.body ?? {},
     );
+    if (result.request) {
+      res.locals.auditAttendanceRequestType = result.request.request_type;
+    }
     res.json({
       message:
-        result.request?.status === "approved"
-          ? "Attendance request approved."
-          : "Attendance request rejected.",
+        result.request?.request_type === "details_correction"
+          ? result.request.status === "approved"
+            ? "Details correction request approved."
+            : "Details correction request rejected."
+          : result.request?.status === "approved"
+            ? "Attendance request approved."
+            : "Attendance request rejected.",
       data: result,
     });
   } catch (error) {

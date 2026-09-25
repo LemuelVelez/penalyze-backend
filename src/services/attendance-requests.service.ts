@@ -4,6 +4,7 @@ import type {
   AttendanceRequestEventRecord,
   AttendanceRequestRecord,
   AttendanceRequestStatus,
+  AttendanceRequestType,
   SchoolSemester,
 } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
@@ -17,6 +18,7 @@ type AttendanceRequestEventInput = {
 };
 
 export type AttendanceRequestInput = {
+  requestType?: unknown;
   schoolYearId?: unknown;
   studentId?: unknown;
   name?: unknown;
@@ -25,11 +27,13 @@ export type AttendanceRequestInput = {
   program?: unknown;
   institution?: unknown;
   note?: unknown;
+  evidenceUrl?: unknown;
   events?: unknown;
 };
 
 export type AttendanceRequestListOptions = {
   status?: unknown;
+  requestType?: unknown;
   schoolYearId?: unknown;
   studentId?: unknown;
 };
@@ -54,6 +58,11 @@ const REQUEST_STATUSES: AttendanceRequestStatus[] = [
   "pending",
   "approved",
   "rejected",
+];
+
+const REQUEST_TYPES: AttendanceRequestType[] = [
+  "event_review",
+  "details_correction",
 ];
 
 const ZERO_ATTENDANCE_REMARK = "Zero attendance registration from landing page.";
@@ -92,6 +101,27 @@ function normalizeRequestStatus(value: unknown, allowPending = true) {
   }
 
   return status;
+}
+
+function normalizeRequestType(value: unknown, defaultToEventReview = true) {
+  const raw = cleanText(value).toLowerCase();
+  if (!raw && defaultToEventReview) return "event_review" as AttendanceRequestType;
+
+  const requestType = raw as AttendanceRequestType;
+  if (!REQUEST_TYPES.includes(requestType)) {
+    throw createHttpError(
+      "Attendance request type must be event_review or details_correction.",
+    );
+  }
+  return requestType;
+}
+
+function normalizeComparable(value: unknown) {
+  return cleanText(value).replace(/\s+/g, " ").toLowerCase();
+}
+
+function valuesDiffer(left: unknown, right: unknown) {
+  return normalizeComparable(left) !== normalizeComparable(right);
 }
 
 function normalizeEvidenceUrl(value: unknown) {
@@ -138,6 +168,151 @@ function normalizeRequestEvents(value: unknown) {
   });
 }
 
+type CurrentStudentDetails = {
+  exists: boolean;
+  name: string;
+  year_level: string | null;
+  college: string | null;
+  program: string | null;
+  institution: string | null;
+};
+
+async function getActiveSchoolYearId(client: PoolClient) {
+  const result = await client.query<{ id: string }>(
+    `
+      SELECT id
+      FROM school_years
+      WHERE is_active = TRUE
+      ORDER BY updated_at DESC, created_at DESC
+      LIMIT 1
+    `,
+  );
+  return result.rows[0]?.id ?? null;
+}
+
+async function getCurrentStudentDetails(
+  client: PoolClient,
+  studentId: string,
+): Promise<CurrentStudentDetails> {
+  const result = await client.query<CurrentStudentDetails>(
+    `
+      WITH source_rows AS (
+        SELECT
+          1 AS priority,
+          NULLIF(TRIM(name), '') AS name,
+          NULLIF(TRIM(year_level), '') AS year_level,
+          NULLIF(TRIM(college), '') AS college,
+          NULLIF(TRIM(program), '') AS program,
+          NULLIF(TRIM(institution), '') AS institution,
+          updated_at
+        FROM students
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+
+        UNION ALL
+
+        SELECT
+          2,
+          NULLIF(TRIM(name), ''),
+          NULLIF(TRIM(year_level), ''),
+          NULLIF(TRIM(college), ''),
+          NULLIF(TRIM(program), ''),
+          NULLIF(TRIM(institution), ''),
+          updated_at
+        FROM attendance_records
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+          AND deleted_at IS NULL
+
+        UNION ALL
+
+        SELECT
+          3,
+          NULLIF(TRIM(name), ''),
+          NULLIF(TRIM(year_level), ''),
+          NULLIF(TRIM(college), ''),
+          NULLIF(TRIM(program), ''),
+          NULLIF(TRIM(institution), ''),
+          updated_at
+        FROM manual_attendance_records
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+
+        UNION ALL
+
+        SELECT
+          4,
+          NULLIF(TRIM(name), ''),
+          NULLIF(TRIM(year_level), ''),
+          NULLIF(TRIM(college), ''),
+          NULLIF(TRIM(program), ''),
+          NULLIF(TRIM(institution), ''),
+          updated_at
+        FROM attendance_final_results
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+
+        UNION ALL
+
+        SELECT
+          5,
+          NULLIF(TRIM(name), ''),
+          NULLIF(TRIM(year_level), ''),
+          NULLIF(TRIM(college), ''),
+          NULLIF(TRIM(program), ''),
+          NULLIF(TRIM(institution), ''),
+          updated_at
+        FROM calculation_results
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+
+        UNION ALL
+
+        SELECT
+          6,
+          NULLIF(TRIM(name), ''),
+          NULL::TEXT,
+          NULL::TEXT,
+          NULL::TEXT,
+          NULL::TEXT,
+          updated_at
+        FROM fines
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+      ), allowed_existence AS (
+        SELECT EXISTS (
+          SELECT 1 FROM students WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+          UNION ALL
+          SELECT 1 FROM attendance_records
+          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND deleted_at IS NULL
+          UNION ALL
+          SELECT 1 FROM manual_attendance_records
+          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+          UNION ALL
+          SELECT 1 FROM fines WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        ) AS exists
+      )
+      SELECT
+        allowed_existence.exists,
+        COALESCE((
+          SELECT name FROM source_rows
+          WHERE name IS NOT NULL
+          ORDER BY priority, updated_at DESC
+          LIMIT 1
+        ), '') AS name,
+        (SELECT year_level FROM source_rows WHERE year_level IS NOT NULL ORDER BY priority, updated_at DESC LIMIT 1) AS year_level,
+        (SELECT college FROM source_rows WHERE college IS NOT NULL ORDER BY priority, updated_at DESC LIMIT 1) AS college,
+        (SELECT program FROM source_rows WHERE program IS NOT NULL ORDER BY priority, updated_at DESC LIMIT 1) AS program,
+        (SELECT institution FROM source_rows WHERE institution IS NOT NULL ORDER BY priority, updated_at DESC LIMIT 1) AS institution
+      FROM allowed_existence
+    `,
+    [studentId],
+  );
+
+  return result.rows[0] ?? {
+    exists: false,
+    name: "",
+    year_level: null,
+    college: null,
+    program: null,
+    institution: null,
+  };
+}
+
 async function getRequestViewById(
   requestId: string,
   client?: Pick<PoolClient, "query">,
@@ -178,17 +353,23 @@ async function getRequestViewById(
 }
 
 export async function createAttendanceRequest(input: AttendanceRequestInput) {
-  const schoolYearId = cleanText(input.schoolYearId);
+  const requestType = normalizeRequestType(input.requestType);
+  const inputSchoolYearId = cleanText(input.schoolYearId);
   const studentId = cleanText(input.studentId);
-  const name = cleanText(input.name);
-  const events = normalizeRequestEvents(input.events);
 
-  if (!schoolYearId) throw createHttpError("School year / semester is required.");
-  if (!isUuid(schoolYearId)) throw createHttpError("School year / semester ID is invalid.");
+  if (inputSchoolYearId && !isUuid(inputSchoolYearId)) {
+    throw createHttpError("School year / semester ID is invalid.");
+  }
   if (!studentId) throw createHttpError("Student ID is required.");
-  if (!name) throw createHttpError("Name is required.");
 
   return withTransaction(async (client) => {
+    const schoolYearId = inputSchoolYearId || (await getActiveSchoolYearId(client));
+    if (!schoolYearId) {
+      throw createHttpError(
+        "School year / semester is required. Activate a school year / semester first.",
+      );
+    }
+
     const schoolYearResult = await client.query<{ id: string }>(
       `SELECT id FROM school_years WHERE id = $1 LIMIT 1`,
       [schoolYearId],
@@ -196,6 +377,116 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
     if (!schoolYearResult.rows[0]) {
       throw createHttpError("School year / semester was not found.", 404);
     }
+
+    if (requestType === "details_correction") {
+      if (input.events !== undefined && input.events !== null) {
+        throw createHttpError(
+          "Details correction requests cannot include attendance events.",
+        );
+      }
+
+      const evidenceUrlValue = cleanText(input.evidenceUrl);
+      if (!evidenceUrlValue) {
+        throw createHttpError(
+          "Evidence link is required for details correction requests.",
+        );
+      }
+      const evidenceUrl = normalizeEvidenceUrl(evidenceUrlValue);
+
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext(LOWER(TRIM($1))))`,
+        [studentId],
+      );
+
+      const current = await getCurrentStudentDetails(client, studentId);
+      if (!current.exists || !current.name) {
+        throw createHttpError(
+          "Student ID was not found in student, attendance, manual attendance, or fine records.",
+          404,
+        );
+      }
+
+      const requestedName = cleanText(input.name) || current.name;
+      const requestedYearLevel = cleanText(input.yearLevel) || current.year_level || "";
+      const requestedCollege = cleanText(input.college) || current.college || "";
+      const requestedProgram = cleanText(input.program) || current.program || "";
+
+      const hasChanges =
+        valuesDiffer(requestedName, current.name) ||
+        valuesDiffer(requestedYearLevel, current.year_level) ||
+        valuesDiffer(requestedCollege, current.college) ||
+        valuesDiffer(requestedProgram, current.program);
+      if (!hasChanges) {
+        throw createHttpError("No changes detected.");
+      }
+
+      const pendingResult = await client.query<{ id: string }>(
+        `
+          SELECT id
+          FROM attendance_requests
+          WHERE request_type = 'details_correction'
+            AND status = 'pending'
+            AND LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+          LIMIT 1
+        `,
+        [studentId],
+      );
+      if (pendingResult.rows[0]) {
+        throw createHttpError(
+          "A pending details correction request already exists for this Student ID.",
+          409,
+        );
+      }
+
+      const requestResult = await client.query<AttendanceRequestRecord>(
+        `
+          INSERT INTO attendance_requests (
+            request_type,
+            school_year_id,
+            student_id,
+            name,
+            year_level,
+            college,
+            program,
+            institution,
+            current_name,
+            current_year_level,
+            current_college,
+            current_program,
+            evidence_url,
+            request_note
+          )
+          VALUES (
+            'details_correction',
+            $1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''),
+            NULLIF($7, ''), $8, NULLIF($9, ''), NULLIF($10, ''),
+            NULLIF($11, ''), $12, NULLIF($13, '')
+          )
+          RETURNING *
+        `,
+        [
+          schoolYearId,
+          studentId,
+          requestedName,
+          requestedYearLevel,
+          requestedCollege,
+          requestedProgram,
+          current.institution ?? "",
+          current.name,
+          current.year_level ?? "",
+          current.college ?? "",
+          current.program ?? "",
+          evidenceUrl,
+          cleanText(input.note),
+        ],
+      );
+
+      return (await getRequestViewById(requestResult.rows[0].id, client))!;
+    }
+
+    const name = cleanText(input.name);
+    const events = normalizeRequestEvents(input.events);
+    if (!name) throw createHttpError("Name is required.");
 
     const eventIds = events.map((event) => event.eventId);
     const eventResult = await client.query<{
@@ -248,6 +539,7 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
     const requestResult = await client.query<AttendanceRequestRecord>(
       `
         INSERT INTO attendance_requests (
+          request_type,
           school_year_id,
           student_id,
           name,
@@ -257,7 +549,7 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
           institution,
           request_note
         )
-        VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''))
+        VALUES ('event_review', $1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''))
         RETURNING *
       `,
       [
@@ -298,6 +590,10 @@ export async function listAttendanceRequests(
 ) {
   const rawStatus = cleanText(options.status);
   const status = rawStatus ? normalizeRequestStatus(rawStatus) : null;
+  const rawRequestType = cleanText(options.requestType);
+  const requestType = rawRequestType
+    ? normalizeRequestType(rawRequestType, false)
+    : null;
   const schoolYearId = cleanOptionalText(options.schoolYearId);
   const studentId = cleanOptionalText(options.studentId);
 
@@ -326,14 +622,15 @@ export async function listAttendanceRequests(
       LEFT JOIN users reviewer ON reviewer.id = ar.reviewed_by
       LEFT JOIN attendance_request_events are ON are.request_id = ar.id
       WHERE ($1::TEXT IS NULL OR ar.status = $1)
-        AND ($2::UUID IS NULL OR ar.school_year_id = $2)
-        AND ($3::TEXT IS NULL OR LOWER(TRIM(ar.student_id)) = LOWER(TRIM($3)))
+        AND ($2::TEXT IS NULL OR ar.request_type = $2)
+        AND ($3::UUID IS NULL OR ar.school_year_id = $3)
+        AND ($4::TEXT IS NULL OR LOWER(TRIM(ar.student_id)) = LOWER(TRIM($4)))
       GROUP BY ar.id, sy.id, reviewer.id
       ORDER BY
         CASE ar.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,
         ar.created_at DESC
     `,
-    [status, schoolYearId, studentId],
+    [status, requestType, schoolYearId, studentId],
   );
 
   return result.rows;
@@ -509,6 +806,15 @@ export type PublicStudentAttendanceRequestStatus = {
   school_year_id: string;
   school_year_name: string;
   semester: SchoolSemester;
+  request_type: AttendanceRequestType;
+  name: string;
+  year_level: string | null;
+  college: string | null;
+  program: string | null;
+  current_name: string | null;
+  current_year_level: string | null;
+  current_college: string | null;
+  current_program: string | null;
   status: AttendanceRequestStatus;
   request_note: string | null;
   review_note: string | null;
@@ -540,6 +846,15 @@ export async function listPublicAttendanceRequestsForStudent(
         ar.school_year_id,
         sy.name AS school_year_name,
         sy.semester,
+        ar.request_type,
+        ar.name,
+        ar.year_level,
+        ar.college,
+        ar.program,
+        ar.current_name,
+        ar.current_year_level,
+        ar.current_college,
+        ar.current_program,
         ar.status,
         ar.request_note,
         ar.review_note,
@@ -673,6 +988,127 @@ async function resolveRequestEventsForApproval(
   return resolvedEvents;
 }
 
+async function applyApprovedDetailsCorrection(
+  client: PoolClient,
+  request: AttendanceRequestRecord,
+) {
+  const studentId = cleanText(request.student_id);
+  const requestedName = cleanText(request.name);
+  const requestedYearLevel = cleanText(request.year_level);
+  const requestedCollege = cleanText(request.college);
+  const requestedProgram = cleanText(request.program);
+
+  const schoolYearResult = await client.query<{ school_year_id: string }>(
+    `
+      SELECT DISTINCT school_year_id
+      FROM (
+        SELECT school_year_id FROM attendance_records
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        UNION ALL
+        SELECT school_year_id FROM manual_attendance_records
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        UNION ALL
+        SELECT school_year_id FROM attendance_final_results
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        UNION ALL
+        SELECT school_year_id FROM calculation_results
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        UNION ALL
+        SELECT school_year_id FROM fines
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        UNION ALL
+        SELECT school_year_id FROM penalty_results
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        UNION ALL
+        SELECT $2::UUID AS school_year_id
+      ) student_school_years
+      WHERE school_year_id IS NOT NULL
+    `,
+    [studentId, request.school_year_id],
+  );
+  const schoolYearIds = schoolYearResult.rows.map((row) => row.school_year_id);
+
+  let updatedRowCount = 0;
+
+  const studentResult = await client.query(
+    `
+      INSERT INTO students (
+        student_id, name, year_level, college, program, institution
+      )
+      VALUES (
+        $1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, '')
+      )
+      ON CONFLICT ((LOWER(TRIM(student_id))))
+      DO UPDATE SET
+        name = COALESCE(NULLIF(TRIM(EXCLUDED.name), ''), students.name),
+        year_level = COALESCE(EXCLUDED.year_level, students.year_level),
+        college = COALESCE(EXCLUDED.college, students.college),
+        program = COALESCE(EXCLUDED.program, students.program),
+        updated_at = NOW()
+    `,
+    [
+      studentId,
+      requestedName || request.current_name || "Unknown Student",
+      requestedYearLevel,
+      requestedCollege,
+      requestedProgram,
+      request.institution ?? "",
+    ],
+  );
+  updatedRowCount += studentResult.rowCount ?? 0;
+
+  for (const table of [
+    "attendance_records",
+    "manual_attendance_records",
+    "attendance_final_results",
+    "calculation_results",
+  ]) {
+    const result = await client.query(
+      `
+        UPDATE ${table}
+        SET
+          name = COALESCE(NULLIF(TRIM($2), ''), name),
+          year_level = COALESCE(NULLIF(TRIM($3), ''), year_level),
+          college = COALESCE(NULLIF(TRIM($4), ''), college),
+          program = COALESCE(NULLIF(TRIM($5), ''), program),
+          updated_at = NOW()
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+      `,
+      [
+        studentId,
+        requestedName,
+        requestedYearLevel,
+        requestedCollege,
+        requestedProgram,
+      ],
+    );
+    updatedRowCount += result.rowCount ?? 0;
+  }
+
+  for (const table of ["fines", "penalty_results"]) {
+    const result = await client.query(
+      `
+        UPDATE ${table}
+        SET
+          name = COALESCE(NULLIF(TRIM($2), ''), name),
+          updated_at = NOW()
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+      `,
+      [studentId, requestedName],
+    );
+    updatedRowCount += result.rowCount ?? 0;
+  }
+
+  if (schoolYearIds.length) {
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+      client,
+      schoolYearIds,
+    );
+  }
+
+  return updatedRowCount;
+}
+
 export async function reviewAttendanceRequest(
   requestIdValue: unknown,
   reviewerIdValue: unknown,
@@ -707,16 +1143,21 @@ export async function reviewAttendanceRequest(
     }
 
     let createdAttendanceCount = 0;
+    let updatedRowCount = 0;
     if (status === "approved") {
-      const resolvedEvents = await resolveRequestEventsForApproval(client, request);
-      createdAttendanceCount = await addApprovedManualAttendance(
-        client,
-        request,
-        resolvedEvents,
-      );
-      await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
-        request.school_year_id,
-      ]);
+      if (request.request_type === "details_correction") {
+        updatedRowCount = await applyApprovedDetailsCorrection(client, request);
+      } else {
+        const resolvedEvents = await resolveRequestEventsForApproval(client, request);
+        createdAttendanceCount = await addApprovedManualAttendance(
+          client,
+          request,
+          resolvedEvents,
+        );
+        await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
+          request.school_year_id,
+        ]);
+      }
     }
 
     await client.query(
@@ -733,13 +1174,13 @@ export async function reviewAttendanceRequest(
       [request.id, status, reviewerId, reviewNote],
     );
 
-    return { createdAttendanceCount };
+    return { createdAttendanceCount, updatedRowCount, requestType: request.request_type };
   });
 
-  return {
-    request: await getRequestViewById(requestId),
-    createdAttendanceCount: result.createdAttendanceCount,
-  };
+  const request = await getRequestViewById(requestId);
+  return result.requestType === "details_correction"
+    ? { request, updatedRowCount: result.updatedRowCount }
+    : { request, createdAttendanceCount: result.createdAttendanceCount };
 }
 
 export async function removeAttendanceRequestEvent(
@@ -776,6 +1217,12 @@ export async function removeAttendanceRequestEvent(
     if (!request) throw createHttpError("Attendance request not found.", 404);
     if (request.status !== "pending") {
       throw createHttpError("Only pending requests can be edited.", 409);
+    }
+    if (request.request_type === "details_correction") {
+      throw createHttpError(
+        "Details correction requests do not contain removable events.",
+        409,
+      );
     }
 
     const eventResult = await client.query<AttendanceRequestEventRecord>(
