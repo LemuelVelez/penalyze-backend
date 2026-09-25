@@ -18,6 +18,7 @@ import {
   getAttendanceRecordEventRosterCollegeSql,
   getCanonicalCollegeKeySql,
   getEventCollegeExemptionFilterSql,
+  normalizeCollegeKey,
   refreshCalculationResults,
   refreshPenaltyResultsForSchoolYearWithClient,
 } from "./attendance.service";
@@ -63,56 +64,6 @@ function uniqueCleanTextValues(values: Array<string | null | undefined>) {
     new Set(values.map((value) => String(value ?? "").trim()).filter(Boolean)),
   );
 }
-
-function normalizeAcademicScopeValue(value: unknown) {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase();
-}
-
-function buildAcademicScopeKey(
-  input: Pick<
-    ReturnType<typeof validateZeroAttendanceInput>,
-    "institution" | "college" | "program" | "yearLevel"
-  >,
-) {
-  return [input.institution, input.college, input.program, input.yearLevel]
-    .map(normalizeAcademicScopeValue)
-    .join("|");
-}
-
-function getAttendanceRecordScopeColumnSql(
-  recordAlias: string,
-  columnName: string,
-) {
-  return `
-    LOWER(TRIM(COALESCE(
-      (
-        SELECT NULLIF(TRIM(scope_student.${columnName}), '')
-        FROM students scope_student
-        WHERE LOWER(TRIM(scope_student.student_id)) = LOWER(TRIM(${recordAlias}.student_id))
-        LIMIT 1
-      ),
-      NULLIF(TRIM(${recordAlias}.${columnName}), ''),
-      ''
-    )))
-  `;
-}
-
-function getAttendanceRecordCollegeScopeSql(recordAlias: string) {
-  return `
-    CONCAT_WS(
-      '|',
-      ${getAttendanceRecordScopeColumnSql(recordAlias, "institution")},
-      ${getAttendanceRecordScopeColumnSql(recordAlias, "college")},
-      ${getAttendanceRecordScopeColumnSql(recordAlias, "program")},
-      ${getAttendanceRecordScopeColumnSql(recordAlias, "year_level")}
-    )
-  `;
-}
-
-const ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL =
-  getAttendanceRecordCollegeScopeSql("ar");
 
 function getFineTableColumnsSql(alias: string) {
   return [
@@ -490,16 +441,18 @@ async function getAttendanceEventCount(
   input: ReturnType<typeof validateZeroAttendanceInput>,
   schoolYearId: string,
 ) {
+  const collegeKey = normalizeCollegeKey(input.college);
+  if (!collegeKey) return 0;
+
   const result = await query<{ total: number }>(
     `
-      SELECT COUNT(DISTINCT ar.event_id)::INT AS total
-      FROM attendance_records ar
-      WHERE ar.event_id IS NOT NULL
-        AND ${getAttendanceRecordVisibilitySql("ar")}
-        AND ar.school_year_id = $2::uuid
-        AND ${ATTENDANCE_RECORD_COLLEGE_SCOPE_SQL} = $1::TEXT
+      WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}
+      SELECT COUNT(DISTINCT roster.event_id)::INT AS total
+      FROM event_roster_scope roster
+      WHERE roster.school_year_id = $1::uuid
+        AND roster.college_key = $2::TEXT
     `,
-    [buildAcademicScopeKey(input), schoolYearId],
+    [schoolYearId, collegeKey],
   );
 
   return Number(result.rows[0]?.total ?? 0);

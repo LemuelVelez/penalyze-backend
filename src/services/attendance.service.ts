@@ -2348,6 +2348,54 @@ export async function syncAbsencesForAttendanceRecordIds(
   );
 }
 
+async function syncZeroAttendanceFineRecordsForStudents(
+  client: PoolClient,
+  studentIds: string[],
+  schoolYearId: string | null,
+) {
+  const result = await client.query<AttendanceRecord>(
+    `
+      WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
+      target_records AS (
+        SELECT
+          ar.id,
+          COALESCE((
+            SELECT COUNT(DISTINCT roster.event_id)::INT
+            FROM event_roster_scope roster
+            WHERE roster.school_year_id IS NOT DISTINCT FROM ar.school_year_id
+              AND roster.college_key = ${getCanonicalCollegeKeySql("ar")}
+          ), 0)::INT AS no_of_absences
+        FROM attendance_records ar
+        WHERE ar.deleted_at IS NULL
+          AND ar.event_id IS NULL
+          AND LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($3::TEXT)
+          AND LOWER(TRIM(ar.student_id)) = ANY($1::TEXT[])
+          AND ($2::uuid IS NULL OR ar.school_year_id = $2::uuid)
+        ORDER BY ar.id
+        FOR UPDATE OF ar
+      )
+      UPDATE attendance_records ar
+      SET no_of_absences = target.no_of_absences,
+          updated_at = CASE
+            WHEN ar.no_of_absences IS DISTINCT FROM target.no_of_absences THEN NOW()
+            ELSE ar.updated_at
+          END
+      FROM target_records target
+      WHERE ar.id = target.id
+      RETURNING ar.*
+    `,
+    [studentIds, schoolYearId, ZERO_ATTENDANCE_REMARK],
+  );
+
+  const fines: FineRecord[] = [];
+  for (const record of result.rows) {
+    const fine = await syncFineForAttendanceRecord(client, record);
+    if (fine) fines.push(fine);
+  }
+
+  return { records: result.rows, fines };
+}
+
 export async function syncAbsencesForStudents(
   client: PoolClient,
   studentIds: string[],
@@ -2367,6 +2415,12 @@ export async function syncAbsencesForStudents(
 
   const schoolYearId = cleanText(schoolYearIdValue) || null;
   await lockAttendanceAbsenceSync(client);
+
+  const zeroAttendanceSync = await syncZeroAttendanceFineRecordsForStudents(
+    client,
+    uniqueStudentIds,
+    schoolYearId,
+  );
 
   const updatedResult = await client.query<AttendanceRecordWithEventRosterScope>(
     `
@@ -2436,7 +2490,7 @@ export async function syncAbsencesForStudents(
   const fines: FineRecord[] = [];
 
   if (!records.length) {
-    return { records, fines };
+    return zeroAttendanceSync;
   }
 
   const existingFineResult = await client.query<{
@@ -2513,7 +2567,10 @@ export async function syncAbsencesForStudents(
     if (fine) fines.push(fine);
   }
 
-  return { records, fines };
+  return {
+    records: uniqueAttendanceRecords([...records, ...zeroAttendanceSync.records]),
+    fines: uniqueFineRecords([...fines, ...zeroAttendanceSync.fines]),
+  };
 }
 
 async function listRecordsByIds(client: PoolClient, ids: string[]) {
@@ -3053,6 +3110,18 @@ async function saveAttendanceRowsWithClient(
       );
     }
 
+    const recordCollege = await getEffectiveAttendanceCollege(
+      client,
+      row.studentId,
+      row.college,
+    );
+    await assertEventCollegeNotExempt(
+      client,
+      event,
+      recordCollege,
+      "Remove the exempted college rows from the attendance file or choose a different event.",
+    );
+
     await upsertStudent(client, row);
     const record = await insertAttendanceRecord(
       client,
@@ -3499,10 +3568,63 @@ function manualRecordToAttendanceRecord(
   };
 }
 
+async function getEffectiveAttendanceCollege(
+  client: PoolClient,
+  studentIdValue: unknown,
+  collegeValue: unknown,
+) {
+  const explicitCollege = cleanText(collegeValue);
+  if (explicitCollege) return explicitCollege;
+
+  const studentId = cleanText(studentIdValue);
+  if (!studentId) return "";
+
+  const result = await client.query<{ college: string | null }>(
+    `
+      SELECT college
+      FROM students
+      WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+      ORDER BY updated_at DESC, created_at DESC, id DESC
+      LIMIT 1
+    `,
+    [studentId],
+  );
+
+  return cleanText(result.rows[0]?.college);
+}
+
+async function assertEventCollegeNotExempt(
+  client: PoolClient,
+  event: AttendanceEventRecord,
+  collegeValue: unknown,
+  removalInstruction: string,
+) {
+  const college = cleanText(collegeValue);
+  const collegeKey = normalizeCollegeKey(college);
+  if (!collegeKey) return;
+
+  const result = await client.query<{ is_allowed: boolean }>(
+    `
+      SELECT ${getEventCollegeExemptionFilterSql(
+        "$1::uuid",
+        "$2::text",
+      )} AS is_allowed
+    `,
+    [event.id, collegeKey],
+  );
+
+  if (result.rows[0]?.is_allowed === false) {
+    throw createValidationError(
+      `${college || "This college"} is exempted from the following event: ${event.name}. ${removalInstruction}`,
+    );
+  }
+}
+
 async function getManualAttendanceEvent(
   client: PoolClient,
   input: RawImportRow,
   attendanceType: "manual" | "zero_attendance",
+  collegeValue: unknown,
 ) {
   if (attendanceType === "zero_attendance") return null;
 
@@ -3514,6 +3636,12 @@ async function getManualAttendanceEvent(
   if (eventId) {
     const event = await getAttendanceEventById(client, eventId);
     if (!event) throw createValidationError("Attendance event not found.", 404);
+    await assertEventCollegeNotExempt(
+      client,
+      event,
+      collegeValue,
+      "Remove it from manual attendance.",
+    );
     return event;
   }
 
@@ -3527,11 +3655,13 @@ async function countCollegeEventsForManualRecord(
   row: ParsedAttendanceRow,
   schoolYearId: string,
 ) {
+  const collegeKey = normalizeCollegeKey(row.college);
   const scopedCount = await client.query<{ total: number }>(
     `
       SELECT COUNT(DISTINCT ae.id)::INT AS total
       FROM attendance_events ae
       WHERE ae.school_year_id = $1
+        AND ${getEventCollegeExemptionFilterSql("ae.id", "$4::text")}
         AND EXISTS (
           SELECT 1
           FROM attendance_records ar
@@ -3541,7 +3671,7 @@ async function countCollegeEventsForManualRecord(
             AND LOWER(TRIM(COALESCE(ar.program, ''))) = LOWER(TRIM(COALESCE($3, ar.program, '')))
         )
     `,
-    [schoolYearId, row.college ?? "", row.program ?? ""],
+    [schoolYearId, row.college ?? "", row.program ?? "", collegeKey],
   );
 
   const total = Number(scopedCount.rows[0]?.total ?? 0);
@@ -3550,10 +3680,11 @@ async function countCollegeEventsForManualRecord(
   const fallbackCount = await client.query<{ total: number }>(
     `
       SELECT COUNT(*)::INT AS total
-      FROM attendance_events
-      WHERE school_year_id = $1
+      FROM attendance_events ae
+      WHERE ae.school_year_id = $1
+        AND ${getEventCollegeExemptionFilterSql("ae.id", "$2::text")}
     `,
-    [schoolYearId],
+    [schoolYearId, collegeKey],
   );
 
   return Number(fallbackCount.rows[0]?.total ?? 0);
@@ -3669,7 +3800,17 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
   const attendanceType = getManualAttendanceType(input);
 
   return withTransaction(async (client) => {
-    const event = await getManualAttendanceEvent(client, input, attendanceType);
+    const recordCollege = await getEffectiveAttendanceCollege(
+      client,
+      row.studentId,
+      row.college,
+    );
+    const event = await getManualAttendanceEvent(
+      client,
+      input,
+      attendanceType,
+      recordCollege,
+    );
     const schoolYearId =
       event?.school_year_id ??
       (await resolveSchoolYearId(
@@ -3931,7 +4072,17 @@ async function updateManualAttendanceRecord(
   }
 
   const attendanceType = existingRecord.attendance_type;
-  const event = await getManualAttendanceEvent(client, input, attendanceType);
+  const recordCollege = await getEffectiveAttendanceCollege(
+    client,
+    row.studentId || existingRecord.student_id,
+    cleanText(row.college) || existingRecord.college,
+  );
+  const event = await getManualAttendanceEvent(
+    client,
+    input,
+    attendanceType,
+    recordCollege,
+  );
   const schoolYearId =
     event?.school_year_id ??
     (await resolveSchoolYearId(
@@ -5538,7 +5689,18 @@ export async function getAttendanceDashboardOverview(
       `
         SELECT COUNT(*)::INT AS total
         FROM attendance_records ar
+        LEFT JOIN attendance_imports ai
+          ON ai.id = ar.import_id
+         AND ai.deleted_at IS NULL
         WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          AND (
+            COALESCE(ar.event_id, ai.event_id) IS NULL
+            OR ${getCanonicalCollegeKeySql("ar")} IS NULL
+            OR ${getEventCollegeExemptionFilterSql(
+              "COALESCE(ar.event_id, ai.event_id)",
+              getCanonicalCollegeKeySql("ar"),
+            )}
+          )
           ${attendanceSchoolYearSql}
       `,
       params,
@@ -5547,10 +5709,21 @@ export async function getAttendanceDashboardOverview(
       `
         SELECT ${ATTENDANCE_RECORD_SELECT}
         FROM attendance_records ar
-        LEFT JOIN attendance_events ae ON ae.id = ar.event_id
+        LEFT JOIN attendance_imports ai
+          ON ai.id = ar.import_id
+         AND ai.deleted_at IS NULL
+        LEFT JOIN attendance_events ae ON ae.id = COALESCE(ar.event_id, ai.event_id)
         LEFT JOIN students s
           ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
         WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          AND (
+            COALESCE(ar.event_id, ai.event_id) IS NULL
+            OR ${getCanonicalCollegeKeySql("ar", "s")} IS NULL
+            OR ${getEventCollegeExemptionFilterSql(
+              "COALESCE(ar.event_id, ai.event_id)",
+              getCanonicalCollegeKeySql("ar", "s"),
+            )}
+          )
           ${attendanceSchoolYearSql}
         ORDER BY
           COALESCE(ar.scanned_at, ar.created_at) DESC NULLS LAST,

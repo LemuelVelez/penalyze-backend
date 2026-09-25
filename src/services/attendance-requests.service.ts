@@ -9,6 +9,7 @@ import type {
 } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
 import {
+  getEventCollegeExemptionFilterSql,
   normalizeCollegeKey,
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
 } from "./attendance.service";
@@ -1008,6 +1009,44 @@ async function resolveRequestEventsForApproval(
       event_id: resolvedEvent.id,
       school_year_id: resolvedEvent.school_year_id,
     });
+  }
+
+  let requestCollege = cleanText(request.college);
+  if (!requestCollege) {
+    const currentStudent = await getCurrentStudentDetails(client, request.student_id);
+    requestCollege = currentStudent.college ?? "";
+  }
+
+  const requestCollegeKey = normalizeCollegeKey(requestCollege);
+  const resolvedEventIds = resolvedEvents
+    .map((event) => event.event_id)
+    .filter((eventId): eventId is string => Boolean(eventId));
+
+  if (requestCollegeKey && resolvedEventIds.length) {
+    const exemptedEventResult = await client.query<{ id: string; name: string }>(
+      `
+        SELECT e.id, e.name
+        FROM attendance_events e
+        WHERE e.id = ANY($1::uuid[])
+          AND NOT (${getEventCollegeExemptionFilterSql("e.id", "$2::text")})
+        ORDER BY e.event_order, e.event_start_at, e.created_at
+      `,
+      [resolvedEventIds, requestCollegeKey],
+    );
+
+    if (exemptedEventResult.rows.length) {
+      const eventNames = exemptedEventResult.rows
+        .map((event) => event.name)
+        .join(", ");
+      throw createHttpError(
+        `${requestCollege || "This college"} is exempted from the following event${
+          exemptedEventResult.rows.length === 1 ? "" : "s"
+        }: ${eventNames}. Remove ${
+          exemptedEventResult.rows.length === 1 ? "it" : "them"
+        } from the attendance request before approving it.`,
+        409,
+      );
+    }
   }
 
   return resolvedEvents;
