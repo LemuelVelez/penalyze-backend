@@ -3,7 +3,10 @@ import "dotenv/config";
 import { PoolClient } from "pg";
 
 import { closeDatabasePool, pool } from "../../lib/db";
-import { refreshDerivedAttendanceResultsForSchoolYearsWithClient } from "../../services/attendance.service";
+import {
+  refreshDerivedAttendanceResultsForSchoolYearsWithClient,
+  syncAbsencesForStudents,
+} from "../../services/attendance.service";
 
 const DEFAULT_STUDENT_ID = "TC-24-A-00407";
 
@@ -88,6 +91,7 @@ async function run() {
       ),
     );
 
+    await syncAbsencesForStudents(client, [studentId]);
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
       undefined,
     ]);

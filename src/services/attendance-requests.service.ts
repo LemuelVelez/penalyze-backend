@@ -12,6 +12,7 @@ import {
   getEventCollegeExemptionFilterSql,
   normalizeCollegeKey,
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
+  syncAbsencesForStudents,
 } from "./attendance.service";
 
 type AttendanceRequestEventInput = {
@@ -1217,6 +1218,11 @@ export async function reviewAttendanceRequest(
           client,
           request,
           resolvedEvents,
+        );
+        await syncAbsencesForStudents(
+          client,
+          [request.student_id],
+          request.school_year_id,
         );
         await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
           request.school_year_id,
