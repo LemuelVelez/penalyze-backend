@@ -1,4 +1,5 @@
 import path from "path";
+import { TextDecoder } from "util";
 import { PoolClient } from "pg";
 
 import {
@@ -871,9 +872,32 @@ function scoreAttendanceSheetRows(sheetName: string, rows: RawImportRow[]) {
   );
 }
 
+function decodeCsvBuffer(buffer: Buffer) {
+  const csvBuffer =
+    buffer.length >= 3 &&
+    buffer[0] === 0xef &&
+    buffer[1] === 0xbb &&
+    buffer[2] === 0xbf
+      ? buffer.subarray(3)
+      : buffer;
+
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(csvBuffer);
+  } catch {
+    return new TextDecoder("windows-1252").decode(csvBuffer);
+  }
+}
+
 async function parseExcelFile(file: UploadedAttendanceFile) {
   const XLSX = loadRequiredModule<any>("xlsx");
-  const workbook = XLSX.read(file.buffer, { type: "buffer", cellDates: false });
+  const extension = getFileExtension(file.originalname);
+  const workbook =
+    extension === ".csv"
+      ? XLSX.read(decodeCsvBuffer(file.buffer), {
+          type: "string",
+          cellDates: false,
+        })
+      : XLSX.read(file.buffer, { type: "buffer", cellDates: false });
   const sheetNames = workbook.SheetNames ?? [];
 
   if (!sheetNames.length) {
@@ -1043,31 +1067,47 @@ function getScannerEventNameFromFileName(fileName: string) {
 
 function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
   const headers = getRawImportRowHeaders(rows);
-  const isScannerExport =
+  const isBarcodeScannerExport =
     headers.includes("barcode") &&
     headers.includes("format") &&
     headers.includes("scan date");
+  const isCheckInScannerExport =
+    headers.includes("name") &&
+    (headers.includes("check in date") || headers.includes("arrival date")) &&
+    (headers.includes("check in time") || headers.includes("arrival time"));
 
-  if (!isScannerExport) return null;
+  if (!isBarcodeScannerExport && !isCheckInScannerExport) return null;
 
   const transformedRows: RawImportRow[] = [];
   const scanTimes: string[] = [];
 
   rows.forEach((row) => {
-    const format = cleanText(getByAliases(row, ["format"]));
-    const type = cleanText(getByAliases(row, ["type"]));
-    if (format && format.toLowerCase() !== "qr_code") return;
-    if (type && type.toLowerCase() !== "text") return;
+    let payload: unknown;
+    let scannedAtInput: unknown;
 
-    const parsedPayload = parseScannerBarcodePayload(
-      getByAliases(row, ["barcode"]),
-    );
+    if (isBarcodeScannerExport) {
+      const format = cleanText(getByAliases(row, ["format"]));
+      const type = cleanText(getByAliases(row, ["type"]));
+      if (format && format.toLowerCase() !== "qr_code") return;
+      if (type && type.toLowerCase() !== "text") return;
+
+      payload = getByAliases(row, ["barcode"]);
+      scannedAtInput = getByAliases(row, ["scan date"]);
+    } else {
+      payload = getByAliases(row, ["name"]);
+      const scanDate = cleanText(
+        getByAliases(row, ["check in date", "arrival date"]),
+      );
+      const scanTime = cleanText(
+        getByAliases(row, ["check in time", "arrival time"]),
+      );
+      scannedAtInput = [scanDate, scanTime].filter(Boolean).join(" ");
+    }
+
+    const parsedPayload = parseScannerBarcodePayload(payload);
     if (!parsedPayload) return;
 
-    const scannedAt = normalizeOptionalTimestamp(
-      getByAliases(row, ["scan date"]),
-      "Scanned at",
-    );
+    const scannedAt = normalizeOptionalTimestamp(scannedAtInput, "Scanned at");
     if (!scannedAt.error && scannedAt.value) scanTimes.push(scannedAt.value);
 
     transformedRows.push({

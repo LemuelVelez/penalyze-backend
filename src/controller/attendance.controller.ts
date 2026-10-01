@@ -74,6 +74,7 @@ function isSupportedAttendanceUpload(
 
 export const attendanceUpload = multer({
   storage: multer.memoryStorage(),
+  defParamCharset: "utf8",
   limits: {
     fileSize: MAX_FILE_SIZE,
     files: 20,
