@@ -850,6 +850,11 @@ export type PublicStudentAttendanceRequestStatus = {
   events: Array<{ event_id: string | null; event_name: string }>;
 };
 
+type PublicStudentAttendanceRequestStatusRow =
+  PublicStudentAttendanceRequestStatus & {
+    student_college: string | null;
+  };
+
 export async function listPublicAttendanceRequestsForStudent(
   studentIdValue: unknown,
   schoolYearIdValue?: unknown,
@@ -866,7 +871,7 @@ export async function listPublicAttendanceRequestsForStudent(
     ? `AND ar.school_year_id = $${params.push(schoolYearId)}`
     : "";
 
-  const result = await query<PublicStudentAttendanceRequestStatus>(
+  const result = await query<PublicStudentAttendanceRequestStatusRow>(
     `
       SELECT
         ar.id,
@@ -882,6 +887,13 @@ export async function listPublicAttendanceRequestsForStudent(
         ar.current_year_level,
         ar.current_college,
         ar.current_program,
+        (
+          SELECT NULLIF(TRIM(student.college), '')
+          FROM students student
+          WHERE LOWER(TRIM(student.student_id)) = LOWER(TRIM(ar.student_id))
+          ORDER BY student.updated_at DESC, student.created_at DESC, student.id DESC
+          LIMIT 1
+        ) AS student_college,
         ar.status,
         ar.request_note,
         ar.review_note,
@@ -911,7 +923,73 @@ export async function listPublicAttendanceRequestsForStudent(
     params,
   );
 
-  return result.rows;
+  const eventReviewRows = result.rows.filter(
+    (request) => request.request_type === "event_review",
+  );
+  const candidateEventIds: string[] = [];
+  const candidateCollegeKeys: string[] = [];
+
+  eventReviewRows.forEach((request) => {
+    const collegeKey = normalizeCollegeKey(
+      request.student_college || request.college,
+    );
+    if (!collegeKey) return;
+
+    request.events.forEach((event) => {
+      const eventId = cleanText(event.event_id);
+      if (!eventId) return;
+      candidateEventIds.push(eventId);
+      candidateCollegeKeys.push(collegeKey);
+    });
+  });
+
+  const visibleEventPairs = new Set<string>();
+  if (candidateEventIds.length) {
+    const visibleEventResult = await query<{
+      event_id: string;
+      college_key: string;
+    }>(
+      `
+        WITH candidate_events AS (
+          SELECT *
+          FROM UNNEST($1::uuid[], $2::text[]) AS candidate(event_id, college_key)
+        )
+        SELECT candidate.event_id, candidate.college_key
+        FROM candidate_events candidate
+        WHERE ${getEventCollegeExemptionFilterSql(
+          "candidate.event_id",
+          "candidate.college_key",
+        )}
+      `,
+      [candidateEventIds, candidateCollegeKeys],
+    );
+
+    visibleEventResult.rows.forEach((event) => {
+      visibleEventPairs.add(`${event.event_id}:${event.college_key}`);
+    });
+  }
+
+  return result.rows
+    .map((request): PublicStudentAttendanceRequestStatus | null => {
+      const { student_college: studentCollege, ...publicRequest } = request;
+      if (request.request_type !== "event_review") return publicRequest;
+
+      const collegeKey = normalizeCollegeKey(studentCollege || request.college);
+      if (!collegeKey) return publicRequest;
+
+      const events = request.events.filter((event) => {
+        const eventId = cleanText(event.event_id);
+        if (!eventId) return true;
+        return visibleEventPairs.has(`${eventId}:${collegeKey}`);
+      });
+
+      if (!events.length) return null;
+      return { ...publicRequest, events };
+    })
+    .filter(
+      (request): request is PublicStudentAttendanceRequestStatus =>
+        request !== null,
+    );
 }
 
 async function resolveRequestEventsForApproval(
