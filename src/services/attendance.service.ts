@@ -7124,14 +7124,20 @@ async function refreshCalculationResultsWithClient(
 
   if (!consistencyWarnings.size) return currentResult.rows;
 
-  return currentResult.rows.map((row) => ({
-    ...row,
-    consistency_warning:
-      row.college_key &&
-      consistencyWarnings.has(`${row.school_year_id ?? "null"}::${row.college_key}`)
-        ? "Expected-event denominator mismatch detected for this college."
-        : null,
-  }));
+  return currentResult.rows.map((row) => {
+    const yearLevelKey = normalizeYearLevelKey(row.year_level);
+
+    return {
+      ...row,
+      consistency_warning:
+        row.college_key &&
+        consistencyWarnings.has(
+          `${row.school_year_id ?? "null"}::${row.college_key}::${yearLevelKey ?? "unresolved"}`,
+        )
+          ? "Expected-event denominator mismatch detected for this college and year level."
+          : null,
+    };
+  });
 }
 export async function previewCalculationResults(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
@@ -7271,33 +7277,44 @@ export async function listCalculationResults(
   const consistencyResult = await query<{
     school_year_id: string | null;
     college_key: string;
+    year_level_key: string | null;
   }>(
     `
-      SELECT school_year_id, college_key
+      SELECT
+        school_year_id,
+        college_key,
+        ${getYearLevelKeySql("year_level")} AS year_level_key
       FROM calculation_results
       WHERE ${warningClauses.join(" AND ")}
         AND college_key IS NOT NULL
-      GROUP BY school_year_id, college_key
+      GROUP BY school_year_id, college_key, ${getYearLevelKeySql("year_level")}
       HAVING COUNT(DISTINCT expected_events) > 1
     `,
     warningParams,
   );
   const inconsistentKeys = new Set(
     consistencyResult.rows.map(
-      (row) => `${row.school_year_id ?? "null"}::${row.college_key}`,
+      (row) =>
+        `${row.school_year_id ?? "null"}::${row.college_key}::${row.year_level_key ?? "unresolved"}`,
     ),
   );
 
   if (!inconsistentKeys.size) return result.rows;
 
-  return result.rows.map((row) => ({
-    ...row,
-    consistency_warning:
-      row.college_key &&
-      inconsistentKeys.has(`${row.school_year_id ?? "null"}::${row.college_key}`)
-        ? "Expected-event denominator mismatch detected for this college."
-        : null,
-  }));
+  return result.rows.map((row) => {
+    const yearLevelKey = normalizeYearLevelKey(row.year_level);
+
+    return {
+      ...row,
+      consistency_warning:
+        row.college_key &&
+        inconsistentKeys.has(
+          `${row.school_year_id ?? "null"}::${row.college_key}::${yearLevelKey ?? "unresolved"}`,
+        )
+          ? "Expected-event denominator mismatch detected for this college and year level."
+          : null,
+    };
+  });
 }
 
 export async function deleteCalculationResultsByIds(
@@ -7817,14 +7834,20 @@ async function refreshAttendanceFinalResultsWithClient(
 
   if (!consistencyWarnings.size) return currentResult.rows;
 
-  return currentResult.rows.map((row) => ({
-    ...row,
-    consistency_warning:
-      row.college_key &&
-      consistencyWarnings.has(`${row.school_year_id ?? "null"}::${row.college_key}`)
-        ? "Expected-event denominator mismatch detected for this college."
-        : null,
-  }));
+  return currentResult.rows.map((row) => {
+    const yearLevelKey = normalizeYearLevelKey(row.year_level);
+
+    return {
+      ...row,
+      consistency_warning:
+        row.college_key &&
+        consistencyWarnings.has(
+          `${row.school_year_id ?? "null"}::${row.college_key}::${yearLevelKey ?? "unresolved"}`,
+        )
+          ? "Expected-event denominator mismatch detected for this college and year level."
+          : null,
+    };
+  });
 }
 export async function refreshPenaltyResultsForSchoolYearWithClient(
   client: PoolClient,
