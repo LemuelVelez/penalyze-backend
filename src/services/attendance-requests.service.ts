@@ -10,7 +10,9 @@ import type {
 import { query, withTransaction } from "../lib/db";
 import {
   getEventCollegeExemptionFilterSql,
+  getEventYearLevelExemptionFilterSql,
   normalizeCollegeKey,
+  normalizeYearLevelKey,
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
   syncAbsencesForStudents,
 } from "./attendance.service";
@@ -544,6 +546,35 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       }
     }
 
+    let requestYearLevel = cleanText(input.yearLevel);
+    if (!requestYearLevel) {
+      const currentStudent = await getCurrentStudentDetails(client, studentId);
+      requestYearLevel = currentStudent.year_level ?? "";
+    }
+    const requestYearLevelKey = normalizeYearLevelKey(requestYearLevel);
+    if (requestYearLevelKey) {
+      const exemptedYearLevelEvents = await client.query<{ id: string; name: string }>(
+        `
+          SELECT e.id, e.name
+          FROM attendance_events e
+          WHERE e.id = ANY($1::uuid[])
+            AND NOT (${getEventYearLevelExemptionFilterSql("e.id", "$2::text", "$3::text")})
+          ORDER BY e.event_order, e.event_start_at, e.created_at
+        `,
+        [eventIds, requestYearLevelKey, requestCollegeKey],
+      );
+      if (exemptedYearLevelEvents.rows.length) {
+        const eventNames = exemptedYearLevelEvents.rows.map((event) => event.name).join(", ");
+        throw createHttpError(
+          `${requestYearLevel || "This year level"} is exempted from the following event${
+            exemptedYearLevelEvents.rows.length === 1 ? "" : "s"
+          }: ${eventNames}. Remove ${
+            exemptedYearLevelEvents.rows.length === 1 ? "it" : "them"
+          } from the attendance request.`,
+        );
+      }
+    }
+
     const duplicateResult = await client.query<{ event_id: string | null }>(
       `
         SELECT are.event_id
@@ -583,7 +614,7 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
         schoolYearId,
         studentId,
         name,
-        cleanText(input.yearLevel),
+        requestYearLevel,
         cleanText(input.college),
         cleanText(input.program),
         cleanText(input.institution),
@@ -927,19 +958,21 @@ export async function listPublicAttendanceRequestsForStudent(
     (request) => request.request_type === "event_review",
   );
   const candidateEventIds: string[] = [];
-  const candidateCollegeKeys: string[] = [];
+  const candidateCollegeKeys: Array<string | null> = [];
+  const candidateYearLevelKeys: Array<string | null> = [];
 
   eventReviewRows.forEach((request) => {
     const collegeKey = normalizeCollegeKey(
       request.student_college || request.college,
     );
-    if (!collegeKey) return;
+    const yearLevelKey = normalizeYearLevelKey(request.year_level);
 
     request.events.forEach((event) => {
       const eventId = cleanText(event.event_id);
       if (!eventId) return;
       candidateEventIds.push(eventId);
       candidateCollegeKeys.push(collegeKey);
+      candidateYearLevelKeys.push(yearLevelKey);
     });
   });
 
@@ -948,24 +981,30 @@ export async function listPublicAttendanceRequestsForStudent(
     const visibleEventResult = await query<{
       event_id: string;
       college_key: string;
+      year_level_key: string;
     }>(
       `
         WITH candidate_events AS (
           SELECT *
-          FROM UNNEST($1::uuid[], $2::text[]) AS candidate(event_id, college_key)
+          FROM UNNEST($1::uuid[], $2::text[], $3::text[]) AS candidate(event_id, college_key, year_level_key)
         )
-        SELECT candidate.event_id, candidate.college_key
+        SELECT candidate.event_id, COALESCE(candidate.college_key, '') AS college_key, COALESCE(candidate.year_level_key, '') AS year_level_key
         FROM candidate_events candidate
         WHERE ${getEventCollegeExemptionFilterSql(
           "candidate.event_id",
           "candidate.college_key",
         )}
+          AND ${getEventYearLevelExemptionFilterSql(
+            "candidate.event_id",
+            "candidate.year_level_key",
+            "candidate.college_key",
+          )}
       `,
-      [candidateEventIds, candidateCollegeKeys],
+      [candidateEventIds, candidateCollegeKeys, candidateYearLevelKeys],
     );
 
     visibleEventResult.rows.forEach((event) => {
-      visibleEventPairs.add(`${event.event_id}:${event.college_key}`);
+      visibleEventPairs.add(`${event.event_id}:${event.college_key}:${event.year_level_key}`);
     });
   }
 
@@ -974,13 +1013,13 @@ export async function listPublicAttendanceRequestsForStudent(
       const { student_college: studentCollege, ...publicRequest } = request;
       if (request.request_type !== "event_review") return publicRequest;
 
-      const collegeKey = normalizeCollegeKey(studentCollege || request.college);
-      if (!collegeKey) return publicRequest;
+      const collegeKey = normalizeCollegeKey(studentCollege || request.college) ?? "";
+      const yearLevelKey = normalizeYearLevelKey(request.year_level) ?? "";
 
       const events = request.events.filter((event) => {
         const eventId = cleanText(event.event_id);
         if (!eventId) return true;
-        return visibleEventPairs.has(`${eventId}:${collegeKey}`);
+        return visibleEventPairs.has(`${eventId}:${collegeKey}:${yearLevelKey}`);
       });
 
       if (!events.length) return null;
@@ -1128,6 +1167,31 @@ async function resolveRequestEventsForApproval(
     }
   }
 
+  const requestYearLevelKey = normalizeYearLevelKey(request.year_level);
+  if (requestYearLevelKey && resolvedEventIds.length) {
+    const exemptedYearLevelEvents = await client.query<{ id: string; name: string }>(
+      `
+        SELECT e.id, e.name
+        FROM attendance_events e
+        WHERE e.id = ANY($1::uuid[])
+          AND NOT (${getEventYearLevelExemptionFilterSql("e.id", "$2::text", "$3::text")})
+        ORDER BY e.event_order, e.event_start_at, e.created_at
+      `,
+      [resolvedEventIds, requestYearLevelKey, requestCollegeKey],
+    );
+    if (exemptedYearLevelEvents.rows.length) {
+      const eventNames = exemptedYearLevelEvents.rows.map((event) => event.name).join(", ");
+      throw createHttpError(
+        `${request.year_level || "This year level"} is exempted from the following event${
+          exemptedYearLevelEvents.rows.length === 1 ? "" : "s"
+        }: ${eventNames}. Remove ${
+          exemptedYearLevelEvents.rows.length === 1 ? "it" : "them"
+        } from the attendance request before approving it.`,
+        409,
+      );
+    }
+  }
+
   return resolvedEvents;
 }
 
@@ -1243,6 +1307,9 @@ async function applyApprovedDetailsCorrection(
   }
 
   if (schoolYearIds.length) {
+    for (const schoolYearId of schoolYearIds) {
+      await syncAbsencesForStudents(client, [studentId], schoolYearId);
+    }
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
       client,
       schoolYearIds,

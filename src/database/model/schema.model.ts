@@ -64,6 +64,20 @@ export type StudentRecord = {
   updated_at: Date;
 };
 
+export type AttendanceEventYearLevelExemptionRecord = {
+  id: string;
+  school_year_id: string | null;
+  event_id: string;
+  year_level_key: string;
+  year_level_label: string;
+  college_key: string | null;
+  college_label: string | null;
+  reason: string | null;
+  created_by: string | null;
+  created_at: Date | string;
+  updated_at: Date | string;
+};
+
 export type AttendanceEventRecord = {
   id: string;
   school_year_id: string | null;
@@ -73,6 +87,8 @@ export type AttendanceEventRecord = {
   description: string | null;
   attendees_count: number;
   event_order: number;
+  exempted_colleges?: Array<{ id: string; college_key: string; college_label: string }>;
+  exempted_year_levels?: AttendanceEventYearLevelExemptionRecord[];
   created_at: Date;
   updated_at: Date;
 };

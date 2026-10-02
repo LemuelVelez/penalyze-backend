@@ -5,6 +5,7 @@ import test from "node:test";
 import * as XLSX from "xlsx";
 
 import {
+  normalizeYearLevelKey,
   previewAttendanceFileBase,
   type UploadedAttendanceFile,
 } from "./attendance.service";
@@ -112,4 +113,25 @@ test("xlsx parsing keeps the existing buffer path", async () => {
   );
 
   assert.equal(preview.rows[0]?.name, "Boñito");
+});
+
+
+test("normalizes supported year level variants", () => {
+  const variants: Array<[string, string]> = [
+    ["1st Year", "1"], ["First Year", "1"], ["1", "1"], ["Year 1", "1"], ["1st yr", "1"], ["I", "1"],
+    ["2nd Year", "2"], ["Second Year", "2"], ["2", "2"], ["Year 2", "2"], ["2nd yr", "2"], ["II", "2"],
+    ["3rd Year", "3"], ["Third Year", "3"], ["3", "3"], ["Year 3", "3"], ["3rd yr", "3"], ["III", "3"],
+    ["4th Year", "4"], ["Fourth Year", "4"], ["4", "4"], ["Year 4", "4"], ["4th yr", "4"], ["IV", "4"],
+    ["5th Year", "5"], ["Fifth Year", "5"], ["5", "5"], ["Year 5", "5"], ["5th yr", "5"], ["V", "5"],
+  ];
+
+  for (const [value, expected] of variants) {
+    assert.equal(normalizeYearLevelKey(value), expected, value);
+    assert.equal(normalizeYearLevelKey(`  ${value.toUpperCase()}  `), expected, `case/spacing: ${value}`);
+  }
+
+  assert.equal(normalizeYearLevelKey("6th Year"), null);
+  assert.equal(normalizeYearLevelKey("Graduate"), null);
+  assert.equal(normalizeYearLevelKey(""), null);
+  assert.equal(normalizeYearLevelKey(null), null);
 });

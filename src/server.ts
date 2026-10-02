@@ -39,10 +39,14 @@ import {
   eventDuplicateGroups as attendanceEventDuplicateGroups,
   eventExemptions as attendanceEventExemptions,
   eventExemptionImpact as attendanceEventExemptionImpact,
+  eventYearLevelExemptions as attendanceEventYearLevelExemptions,
+  eventYearLevelExemptionImpact as attendanceEventYearLevelExemptionImpact,
   eventMergeImpact as attendanceEventMergeImpact,
   mergeEvents as mergeAttendanceEvents,
   removeEventExemption as removeAttendanceEventExemption,
   removeEventExemptionsBulk as removeAttendanceEventExemptionsBulk,
+  removeEventYearLevelExemption as removeAttendanceEventYearLevelExemption,
+  removeEventYearLevelExemptionsBulk as removeAttendanceEventYearLevelExemptionsBulk,
   finalResults as attendanceFinalResults,
   imports as attendanceImports,
   importDeleteImpact as attendanceImportDeleteImpact,
@@ -56,6 +60,7 @@ import {
   refreshFinalResults as refreshAttendanceFinalResults,
   saveEvent as saveAttendanceEvent,
   saveEventExemptions as saveAttendanceEventExemptions,
+  saveEventYearLevelExemptions as saveAttendanceEventYearLevelExemptions,
   saveImport,
   saveImportWithProgress,
   showImport,
@@ -256,6 +261,12 @@ app.post("/api/attendance/event-exemptions/impact", requireAuth, requireAdmin, a
 app.post("/api/attendance/event-exemptions", requireAuth, requireAdmin, saveAttendanceEventExemptions);
 app.post("/api/attendance/event-exemptions/bulk-delete", requireAuth, requireAdmin, removeAttendanceEventExemptionsBulk);
 app.delete("/api/attendance/event-exemptions/:id", requireAuth, requireAdmin, removeAttendanceEventExemption);
+
+app.get("/api/attendance/event-year-level-exemptions", requireAuth, attendanceEventYearLevelExemptions);
+app.post("/api/attendance/event-year-level-exemptions/impact", requireAuth, requireAdmin, attendanceEventYearLevelExemptionImpact);
+app.post("/api/attendance/event-year-level-exemptions", requireAuth, requireAdmin, saveAttendanceEventYearLevelExemptions);
+app.post("/api/attendance/event-year-level-exemptions/bulk-delete", requireAuth, requireAdmin, removeAttendanceEventYearLevelExemptionsBulk);
+app.delete("/api/attendance/event-year-level-exemptions/:id", requireAuth, requireAdmin, removeAttendanceEventYearLevelExemption);
 
 app.get("/api/attendance/events", attendanceEvents);
 app.get(

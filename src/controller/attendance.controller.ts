@@ -4,9 +4,12 @@ import multer from "multer";
 import {
   createAttendanceEvent,
   createEventCollegeExemptions,
+  createEventYearLevelExemptions,
   deleteAttendanceEvent,
   deleteEventCollegeExemption,
   deleteEventCollegeExemptionsBulk,
+  deleteEventYearLevelExemption,
+  deleteEventYearLevelExemptionsBulk,
   deleteAttendanceFinalResultsByIds,
   deleteAttendanceFinalResultsBySchoolYear,
   deleteAttendanceImport,
@@ -24,9 +27,11 @@ import {
   deleteManualAttendanceRecordsBySchoolYear,
   getAttendanceImport,
   getEventCollegeExemptionImpact,
+  getEventYearLevelExemptionImpact,
   listAttendanceEvents,
   listAttendanceColleges,
   listEventCollegeExemptions,
+  listEventYearLevelExemptions,
   listAttendanceEventDuplicateGroups,
   listAttendanceFinalResults,
   listCalculationResults,
@@ -370,6 +375,60 @@ export async function removeEventExemption(req: Request, res: Response, next: Ne
     const id = getRouteParam(req, "id");
     const data = await deleteEventCollegeExemption(id);
     res.json({ message: "College exemption removed and fines recalculated.", data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function eventYearLevelExemptions(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await listEventYearLevelExemptions({
+      schoolYearId: req.query.schoolYearId ?? req.query.school_year_id,
+      eventId: req.query.eventId ?? req.query.event_id,
+      yearLevel: req.query.yearLevel ?? req.query.year_level,
+      college: req.query.college,
+    });
+    res.json({ data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function eventYearLevelExemptionImpact(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await getEventYearLevelExemptionImpact(req.body ?? {});
+    res.json({ data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function saveEventYearLevelExemptions(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await createEventYearLevelExemptions({
+      ...(req.body ?? {}),
+      createdBy: getAuthenticatedUserId(req),
+    });
+    res.status(201).json({ message: "Year level exemptions saved and fines recalculated.", data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function removeEventYearLevelExemptionsBulk(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await deleteEventYearLevelExemptionsBulk(req.body ?? {});
+    res.json({ message: "Year level exemptions removed and fines recalculated.", data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function removeEventYearLevelExemption(req: Request, res: Response, next: NextFunction) {
+  try {
+    const id = getRouteParam(req, "id");
+    const data = await deleteEventYearLevelExemption(id);
+    res.json({ message: "Year level exemption removed and fines recalculated.", data });
   } catch (error) {
     next(error);
   }

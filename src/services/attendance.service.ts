@@ -370,6 +370,31 @@ export function normalizeCollegeKey(value: unknown) {
   return normalized || null;
 }
 
+// Keep this normalization in sync with getYearLevelKeySql() and the frontend helper.
+export function normalizeYearLevelKey(value: unknown): string | null {
+  const normalized = cleanText(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const aliases: Record<string, string> = {
+    "1": "1", "1styear": "1", "1styr": "1", "firstyear": "1", "firstyr": "1", "year1": "1", i: "1",
+    "2": "2", "2ndyear": "2", "2ndyr": "2", "secondyear": "2", "secondyr": "2", "year2": "2", ii: "2",
+    "3": "3", "3rdyear": "3", "3rdyr": "3", "thirdyear": "3", "thirdyr": "3", "year3": "3", iii: "3",
+    "4": "4", "4thyear": "4", "4thyr": "4", "fourthyear": "4", "fourthyr": "4", "year4": "4", iv: "4",
+    "5": "5", "5thyear": "5", "5thyr": "5", "fifthyear": "5", "fifthyr": "5", "year5": "5", v: "5",
+  };
+  return aliases[normalized] ?? null;
+}
+
+export function getYearLevelKeySql(valueExpr: string) {
+  const normalized = `REGEXP_REPLACE(LOWER(TRIM(COALESCE(${valueExpr}, ''))), '[^a-z0-9]+', '', 'g')`;
+  return `(CASE
+    WHEN ${normalized} IN ('1', '1styear', '1styr', 'firstyear', 'firstyr', 'year1', 'i') THEN '1'
+    WHEN ${normalized} IN ('2', '2ndyear', '2ndyr', 'secondyear', 'secondyr', 'year2', 'ii') THEN '2'
+    WHEN ${normalized} IN ('3', '3rdyear', '3rdyr', 'thirdyear', 'thirdyr', 'year3', 'iii') THEN '3'
+    WHEN ${normalized} IN ('4', '4thyear', '4thyr', 'fourthyear', 'fourthyr', 'year4', 'iv') THEN '4'
+    WHEN ${normalized} IN ('5', '5thyear', '5thyr', 'fifthyear', 'fifthyr', 'year5', 'v') THEN '5'
+    ELSE NULL
+  END)`;
+}
+
 export function getEventCollegeExemptionFilterSql(
   eventExpr: string,
   collegeKeyExpr: string,
@@ -380,6 +405,29 @@ export function getEventCollegeExemptionFilterSql(
     WHERE exemption.event_id = ${eventExpr}
       AND exemption.college_key = ${collegeKeyExpr}
   )`;
+}
+
+export function getEventYearLevelExemptionFilterSql(
+  eventExpr: string,
+  yearLevelKeyExpr: string,
+  collegeKeyExpr: string,
+) {
+  return `NOT EXISTS (
+    SELECT 1
+    FROM attendance_event_year_level_exemptions year_exemption
+    WHERE year_exemption.event_id = ${eventExpr}
+      AND year_exemption.year_level_key = ${yearLevelKeyExpr}
+      AND (year_exemption.college_key IS NULL OR year_exemption.college_key = ${collegeKeyExpr})
+  )`;
+}
+
+export function getEventStudentExemptionFilterSql(
+  eventExpr: string,
+  yearLevelKeyExpr: string,
+  collegeKeyExpr: string,
+) {
+  return `(${getEventCollegeExemptionFilterSql(eventExpr, collegeKeyExpr)}
+    AND ${getEventYearLevelExemptionFilterSql(eventExpr, yearLevelKeyExpr, collegeKeyExpr)})`;
 }
 
 function cleanOptionalText(value: unknown) {
@@ -1645,7 +1693,8 @@ async function getAttendanceEventById(client: PoolClient, id: string) {
       SELECT
         e.*,
         COUNT(DISTINCT ar.student_id)::INT AS attendees_count,
-        COALESCE(exemptions.items, '[]'::jsonb) AS exempted_colleges
+        COALESCE(exemptions.items, '[]'::jsonb) AS exempted_colleges,
+        COALESCE(year_exemptions.items, '[]'::jsonb) AS exempted_year_levels
       FROM attendance_events e
       LEFT JOIN attendance_records ar ON ar.event_id = e.id AND ar.deleted_at IS NULL
       LEFT JOIN LATERAL (
@@ -1657,8 +1706,19 @@ async function getAttendanceEventById(client: PoolClient, id: string) {
         FROM attendance_event_college_exemptions x
         WHERE x.event_id = e.id
       ) exemptions ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+          'id', x.id,
+          'year_level_key', x.year_level_key,
+          'year_level_label', x.year_level_label,
+          'college_key', x.college_key,
+          'college_label', x.college_label
+        ) ORDER BY x.year_level_key, x.college_label NULLS FIRST) AS items
+        FROM attendance_event_year_level_exemptions x
+        WHERE x.event_id = e.id
+      ) year_exemptions ON TRUE
       WHERE e.id = $1
-      GROUP BY e.id, exemptions.items
+      GROUP BY e.id, exemptions.items, year_exemptions.items
       LIMIT 1
     `,
     [id],
@@ -2102,6 +2162,67 @@ export function getCanonicalCollegeKeySql(
   )`;
 }
 
+export function getCanonicalYearLevelKeySql(
+  recordAlias: string,
+  studentAlias?: string,
+) {
+  const studentYearLevelSql = studentAlias
+    ? `NULLIF(TRIM(${studentAlias}.year_level), '')`
+    : `NULL`;
+
+  return getYearLevelKeySql(
+    `COALESCE(NULLIF(TRIM(${recordAlias}.year_level), ''), ${studentYearLevelSql})`,
+  );
+}
+
+export function getResolvedStudentYearLevelKeySql(
+  studentIdExpr: string,
+  schoolYearIdExpr: string,
+) {
+  const attendanceKey = getYearLevelKeySql('year_scope_ar.year_level');
+  const manualKey = getYearLevelKeySql('year_scope_mar.year_level');
+  const fallbackKey = getYearLevelKeySql('year_scope_student.year_level');
+  return `COALESCE(
+    (
+      SELECT year_scope.year_level_key
+      FROM (
+        SELECT
+          ${attendanceKey} AS year_level_key,
+          COALESCE(year_scope_ar.scanned_at, year_scope_ar.updated_at, year_scope_ar.created_at) AS sort_at,
+          year_scope_ar.updated_at,
+          year_scope_ar.created_at,
+          year_scope_ar.id
+        FROM attendance_records year_scope_ar
+        WHERE year_scope_ar.deleted_at IS NULL
+          AND year_scope_ar.school_year_id IS NOT DISTINCT FROM ${schoolYearIdExpr}
+          AND LOWER(TRIM(year_scope_ar.student_id)) = LOWER(TRIM(${studentIdExpr}))
+
+        UNION ALL
+
+        SELECT
+          ${manualKey} AS year_level_key,
+          COALESCE(year_scope_mar.scanned_at, year_scope_mar.updated_at, year_scope_mar.created_at) AS sort_at,
+          year_scope_mar.updated_at,
+          year_scope_mar.created_at,
+          year_scope_mar.id
+        FROM manual_attendance_records year_scope_mar
+        WHERE year_scope_mar.school_year_id IS NOT DISTINCT FROM ${schoolYearIdExpr}
+          AND LOWER(TRIM(year_scope_mar.student_id)) = LOWER(TRIM(${studentIdExpr}))
+      ) year_scope
+      WHERE year_scope.year_level_key IS NOT NULL
+      ORDER BY year_scope.sort_at DESC NULLS LAST, year_scope.updated_at DESC, year_scope.created_at DESC, year_scope.id DESC
+      LIMIT 1
+    ),
+    (
+      SELECT ${fallbackKey}
+      FROM students year_scope_student
+      WHERE LOWER(TRIM(year_scope_student.student_id)) = LOWER(TRIM(${studentIdExpr}))
+      ORDER BY year_scope_student.updated_at DESC, year_scope_student.created_at DESC, year_scope_student.id DESC
+      LIMIT 1
+    )
+  )`;
+}
+
 export function getAttendanceRecordEventRosterCollegeSql(recordAlias: string) {
   return getCanonicalCollegeKeySql(recordAlias);
 }
@@ -2132,13 +2253,11 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
       AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
       AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
-      AND (
-        ${getCanonicalCollegeKeySql("ar", "participation_student")} IS NULL
-        OR ${getEventCollegeExemptionFilterSql(
-          "COALESCE(ar.event_id, ai.event_id)",
-          getCanonicalCollegeKeySql("ar", "participation_student"),
-        )}
-      )
+      AND ${getEventStudentExemptionFilterSql(
+        "COALESCE(ar.event_id, ai.event_id)",
+        getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
+        getCanonicalCollegeKeySql("ar", "participation_student"),
+      )}
 
     UNION
 
@@ -2153,13 +2272,11 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
       AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
       AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
-      AND (
-        ${getCanonicalCollegeKeySql("mar", "participation_manual_student")} IS NULL
-        OR ${getEventCollegeExemptionFilterSql(
-          "mar.event_id",
-          getCanonicalCollegeKeySql("mar", "participation_manual_student"),
-        )}
-      )
+      AND ${getEventStudentExemptionFilterSql(
+        "mar.event_id",
+        getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
+        getCanonicalCollegeKeySql("mar", "participation_manual_student"),
+      )}
   )
 `
 export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
@@ -2175,7 +2292,11 @@ export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
       AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
       AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
-      AND ${getEventCollegeExemptionFilterSql("COALESCE(ar.event_id, ai.event_id)", ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL)}
+      AND ${getEventStudentExemptionFilterSql(
+        "COALESCE(ar.event_id, ai.event_id)",
+        getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
+        ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL,
+      )}
 
     UNION
 
@@ -2188,7 +2309,11 @@ export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
       AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
       AND ${MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
-      AND ${getEventCollegeExemptionFilterSql("mar.event_id", MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL)}
+      AND ${getEventStudentExemptionFilterSql(
+        "mar.event_id",
+        getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
+        MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL,
+      )}
   )
 `;
 const ATTENDANCE_ABSENCE_SYNC_LOCK_SQL =
@@ -2326,7 +2451,11 @@ async function getAttendanceEventRosterCollegeKeys(
         AND ar.deleted_at IS NULL
         AND (
           ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} IS NULL
-          OR ${getEventCollegeExemptionFilterSql("ar.event_id", ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL)}
+          OR ${getEventStudentExemptionFilterSql(
+            "ar.event_id",
+            getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
+            ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL,
+          )}
         )
     `,
     [uniqueEventIds],
@@ -2404,6 +2533,11 @@ async function syncZeroAttendanceFineRecordsForStudents(
             FROM event_roster_scope roster
             WHERE roster.school_year_id IS NOT DISTINCT FROM ar.school_year_id
               AND roster.college_key = ${getCanonicalCollegeKeySql("ar")}
+              AND ${getEventYearLevelExemptionFilterSql(
+                "roster.event_id",
+                getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
+                getCanonicalCollegeKeySql("ar"),
+              )}
           ), 0)::INT AS no_of_absences
         FROM attendance_records ar
         WHERE ar.deleted_at IS NULL
@@ -2470,7 +2604,8 @@ export async function syncAbsencesForStudents(
         SELECT DISTINCT
           LOWER(TRIM(ar.student_id)) AS student_key,
           ar.school_year_id,
-          ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key
+          ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key,
+          ${getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id")} AS year_level_key
         FROM attendance_records ar
         WHERE ar.deleted_at IS NULL
           AND ar.event_id IS NOT NULL
@@ -2481,6 +2616,7 @@ export async function syncAbsencesForStudents(
         SELECT
           ss.student_key,
           ss.college_key,
+          ss.year_level_key,
           ss.school_year_id,
           GREATEST(
             COUNT(DISTINCT roster.event_id)::INT -
@@ -2491,11 +2627,16 @@ export async function syncAbsencesForStudents(
         LEFT JOIN event_roster_scope roster
           ON roster.college_key = ss.college_key
          AND roster.school_year_id IS NOT DISTINCT FROM ss.school_year_id
+         AND ${getEventYearLevelExemptionFilterSql(
+           "roster.event_id",
+           "ss.year_level_key",
+           "ss.college_key",
+         )}
         LEFT JOIN event_participation attended
           ON attended.normalized_student_id = ss.student_key
           AND attended.event_id = roster.event_id
           AND attended.school_year_id IS NOT DISTINCT FROM ss.school_year_id
-        GROUP BY ss.student_key, ss.college_key, ss.school_year_id
+        GROUP BY ss.student_key, ss.college_key, ss.year_level_key, ss.school_year_id
       ),
       target_records AS (
         SELECT
@@ -3107,6 +3248,7 @@ async function saveAttendanceRowsWithClient(
     }));
   const mergeResult = mergeAttendanceImportRowsByStudentAndEvent(validRows, input);
   const rowsToSave = mergeResult.rows;
+  await assertImportYearLevelsNotExempt(client, rowsToSave, defaultEvent, input);
   const stageCounts = {
     parsed: preview.rowsTotal,
     normalized: preview.rows.length,
@@ -3159,7 +3301,8 @@ async function saveAttendanceRowsWithClient(
       client,
       event,
       recordCollege,
-      "Remove the exempted college rows from the attendance file or choose a different event.",
+      row.yearLevel,
+      "Remove the exempted college or year-level rows from the attendance file or choose a different event.",
     );
 
     await upsertStudent(client, row);
@@ -3637,27 +3780,130 @@ async function assertEventCollegeNotExempt(
   client: PoolClient,
   event: AttendanceEventRecord,
   collegeValue: unknown,
+  yearLevelValue: unknown,
   removalInstruction: string,
 ) {
   const college = cleanText(collegeValue);
   const collegeKey = normalizeCollegeKey(college);
-  if (!collegeKey) return;
+  const yearLevel = cleanText(yearLevelValue);
+  const yearLevelKey = normalizeYearLevelKey(yearLevel);
 
-  const result = await client.query<{ is_allowed: boolean }>(
-    `
-      SELECT ${getEventCollegeExemptionFilterSql(
-        "$1::uuid",
-        "$2::text",
-      )} AS is_allowed
-    `,
-    [event.id, collegeKey],
+  if (collegeKey) {
+    const collegeResult = await client.query<{ is_allowed: boolean }>(
+      `
+        SELECT ${getEventCollegeExemptionFilterSql(
+          "$1::uuid",
+          "$2::text",
+        )} AS is_allowed
+      `,
+      [event.id, collegeKey],
+    );
+
+    if (collegeResult.rows[0]?.is_allowed === false) {
+      throw createValidationError(
+        `${college || "This college"} is exempted from the following event: ${event.name}. ${removalInstruction}`,
+      );
+    }
+  }
+
+  if (yearLevelKey) {
+    const yearResult = await client.query<{ is_allowed: boolean }>(
+      `
+        SELECT ${getEventYearLevelExemptionFilterSql(
+          "$1::uuid",
+          "$2::text",
+          "$3::text",
+        )} AS is_allowed
+      `,
+      [event.id, yearLevelKey, collegeKey],
+    );
+
+    if (yearResult.rows[0]?.is_allowed === false) {
+      throw createValidationError(
+        `${yearLevel || getCanonicalYearLevelLabel(yearLevelKey)} is exempted from the following event: ${event.name}. 1 row is affected. ${removalInstruction}`,
+      );
+    }
+  }
+}
+
+async function assertImportYearLevelsNotExempt(
+  client: PoolClient,
+  rows: ParsedAttendanceRow[],
+  defaultEvent: AttendanceEventRecord | null,
+  input: SaveRowsInput,
+) {
+  const affected = new Map<
+    string,
+    { eventName: string; yearLevelLabel: string; rowCount: number }
+  >();
+
+  for (const row of rows) {
+    const yearLevelKey = normalizeYearLevelKey(row.yearLevel);
+    if (!yearLevelKey) continue;
+
+    const event =
+      row.eventName && !defaultEvent
+        ? await findOrCreateAttendanceEvent(
+            client,
+            {
+              ...input,
+              eventName: row.eventName,
+              eventStartAt: row.eventStartAt ?? input.eventStartAt,
+              eventEndAt: row.eventEndAt ?? input.eventEndAt,
+            },
+            row.eventName,
+          )
+        : defaultEvent;
+    if (!event) continue;
+
+    const college = await getEffectiveAttendanceCollege(
+      client,
+      row.studentId,
+      row.college,
+    );
+    const collegeKey = normalizeCollegeKey(college);
+    const allowedResult = await client.query<{ is_allowed: boolean }>(
+      `
+        SELECT ${getEventYearLevelExemptionFilterSql(
+          "$1::uuid",
+          "$2::text",
+          "$3::text",
+        )} AS is_allowed
+      `,
+      [event.id, yearLevelKey, collegeKey],
+    );
+    if (allowedResult.rows[0]?.is_allowed !== false) continue;
+
+    const yearLevelLabel = getCanonicalYearLevelLabel(yearLevelKey);
+    const key = `${event.id}:${yearLevelKey}`;
+    const current = affected.get(key);
+    affected.set(key, {
+      eventName: event.name,
+      yearLevelLabel,
+      rowCount: (current?.rowCount ?? 0) + 1,
+    });
+  }
+
+  if (!affected.size) return;
+
+  const details = Array.from(affected.values())
+    .map(
+      (item) =>
+        `${item.yearLevelLabel} from ${item.eventName} (${item.rowCount} ${
+          item.rowCount === 1 ? "row" : "rows"
+        })`,
+    )
+    .join(", ");
+  const totalRows = Array.from(affected.values()).reduce(
+    (sum, item) => sum + item.rowCount,
+    0,
   );
 
-  if (result.rows[0]?.is_allowed === false) {
-    throw createValidationError(
-      `${college || "This college"} is exempted from the following event: ${event.name}. ${removalInstruction}`,
-    );
-  }
+  throw createValidationError(
+    `Year level exemption blocks ${totalRows} ${
+      totalRows === 1 ? "row" : "rows"
+    }: ${details}. Remove the exempted year-level rows from the attendance file or choose a different event.`,
+  );
 }
 
 async function getManualAttendanceEvent(
@@ -3665,6 +3911,7 @@ async function getManualAttendanceEvent(
   input: RawImportRow,
   attendanceType: "manual" | "zero_attendance",
   collegeValue: unknown,
+  yearLevelValue: unknown,
 ) {
   if (attendanceType === "zero_attendance") return null;
 
@@ -3680,6 +3927,7 @@ async function getManualAttendanceEvent(
       client,
       event,
       collegeValue,
+      yearLevelValue,
       "Remove it from manual attendance.",
     );
     return event;
@@ -3696,12 +3944,14 @@ async function countCollegeEventsForManualRecord(
   schoolYearId: string,
 ) {
   const collegeKey = normalizeCollegeKey(row.college);
+  const yearLevelKey = normalizeYearLevelKey(row.yearLevel);
   const scopedCount = await client.query<{ total: number }>(
     `
       SELECT COUNT(DISTINCT ae.id)::INT AS total
       FROM attendance_events ae
       WHERE ae.school_year_id = $1
         AND ${getEventCollegeExemptionFilterSql("ae.id", "$4::text")}
+        AND ${getEventYearLevelExemptionFilterSql("ae.id", "$5::text", "$4::text")}
         AND EXISTS (
           SELECT 1
           FROM attendance_records ar
@@ -3711,7 +3961,7 @@ async function countCollegeEventsForManualRecord(
             AND LOWER(TRIM(COALESCE(ar.program, ''))) = LOWER(TRIM(COALESCE($3, ar.program, '')))
         )
     `,
-    [schoolYearId, row.college ?? "", row.program ?? "", collegeKey],
+    [schoolYearId, row.college ?? "", row.program ?? "", collegeKey, yearLevelKey],
   );
 
   const total = Number(scopedCount.rows[0]?.total ?? 0);
@@ -3723,8 +3973,9 @@ async function countCollegeEventsForManualRecord(
       FROM attendance_events ae
       WHERE ae.school_year_id = $1
         AND ${getEventCollegeExemptionFilterSql("ae.id", "$2::text")}
+        AND ${getEventYearLevelExemptionFilterSql("ae.id", "$3::text", "$2::text")}
     `,
-    [schoolYearId, collegeKey],
+    [schoolYearId, collegeKey, yearLevelKey],
   );
 
   return Number(fallbackCount.rows[0]?.total ?? 0);
@@ -3850,6 +4101,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
       input,
       attendanceType,
       recordCollege,
+      row.yearLevel,
     );
     const schoolYearId =
       event?.school_year_id ??
@@ -4122,6 +4374,7 @@ async function updateManualAttendanceRecord(
     input,
     attendanceType,
     recordCollege,
+    cleanText(row.yearLevel) || existingRecord.year_level,
   );
   const schoolYearId =
     event?.school_year_id ??
@@ -5445,7 +5698,8 @@ export async function listAttendanceEvents(
       SELECT
         e.*,
         COUNT(DISTINCT attendee.normalized_student_id)::INT AS attendees_count,
-        COALESCE(exemptions.items, '[]'::jsonb) AS exempted_colleges
+        COALESCE(exemptions.items, '[]'::jsonb) AS exempted_colleges,
+        COALESCE(year_exemptions.items, '[]'::jsonb) AS exempted_year_levels
       FROM attendance_events e
       LEFT JOIN LATERAL (
         SELECT LOWER(TRIM(ar.student_id)) AS normalized_student_id
@@ -5467,8 +5721,19 @@ export async function listAttendanceEvents(
         FROM attendance_event_college_exemptions x
         WHERE x.event_id = e.id
       ) exemptions ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+          'id', x.id,
+          'year_level_key', x.year_level_key,
+          'year_level_label', x.year_level_label,
+          'college_key', x.college_key,
+          'college_label', x.college_label
+        ) ORDER BY x.year_level_key, x.college_label NULLS FIRST) AS items
+        FROM attendance_event_year_level_exemptions x
+        WHERE x.event_id = e.id
+      ) year_exemptions ON TRUE
       ${schoolYearId ? "WHERE e.school_year_id = $3" : ""}
-      GROUP BY e.id, exemptions.items
+      GROUP BY e.id, exemptions.items, year_exemptions.items
       ORDER BY e.event_order ASC NULLS LAST, COALESCE(e.event_start_at, e.event_end_at, e.created_at) ASC, e.created_at ASC
       LIMIT $1 OFFSET $2
     `,
@@ -5619,6 +5884,14 @@ export async function updateAttendanceEvent(
         `,
         [id, nextSchoolYearId],
       );
+      await client.query(
+        `
+          UPDATE attendance_event_year_level_exemptions
+          SET school_year_id = $2, updated_at = NOW()
+          WHERE event_id = $1
+        `,
+        [id, nextSchoolYearId],
+      );
       await resequenceAttendanceEvents(client, existing.school_year_id);
     }
 
@@ -5735,9 +6008,9 @@ export async function getAttendanceDashboardOverview(
         WHERE ${getAttendanceRecordVisibilitySql("ar")}
           AND (
             COALESCE(ar.event_id, ai.event_id) IS NULL
-            OR ${getCanonicalCollegeKeySql("ar")} IS NULL
-            OR ${getEventCollegeExemptionFilterSql(
+            OR ${getEventStudentExemptionFilterSql(
               "COALESCE(ar.event_id, ai.event_id)",
+              getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
               getCanonicalCollegeKeySql("ar"),
             )}
           )
@@ -5758,9 +6031,9 @@ export async function getAttendanceDashboardOverview(
         WHERE ${getAttendanceRecordVisibilitySql("ar")}
           AND (
             COALESCE(ar.event_id, ai.event_id) IS NULL
-            OR ${getCanonicalCollegeKeySql("ar", "s")} IS NULL
-            OR ${getEventCollegeExemptionFilterSql(
+            OR ${getEventStudentExemptionFilterSql(
               "COALESCE(ar.event_id, ai.event_id)",
+              getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
               getCanonicalCollegeKeySql("ar", "s"),
             )}
           )
@@ -6200,6 +6473,7 @@ async function assertExpectedEventConsistencyWithClient(
   const violations = await client.query<{
     school_year_id: string | null;
     college_key: string;
+    year_level_key: string | null;
     expected_event_values: number[];
     student_count: number;
   }>(
@@ -6207,13 +6481,14 @@ async function assertExpectedEventConsistencyWithClient(
       SELECT
         school_year_id,
         college_key,
+        ${getYearLevelKeySql("year_level")} AS year_level_key,
         ARRAY_AGG(DISTINCT expected_events ORDER BY expected_events) AS expected_event_values,
         COUNT(*)::INT AS student_count
       FROM ${table}
       WHERE ($1::uuid IS NULL OR school_year_id = $1::uuid)
         AND college_key IS NOT NULL
         ${scopeClause}
-      GROUP BY school_year_id, college_key
+      GROUP BY school_year_id, college_key, ${getYearLevelKeySql("year_level")}
       HAVING COUNT(DISTINCT expected_events) > 1
     `,
     params,
@@ -6252,7 +6527,7 @@ async function assertExpectedEventConsistencyWithClient(
 
   return new Set(
     violations.rows.map(
-      (row) => `${row.school_year_id ?? "null"}::${row.college_key}`,
+      (row) => `${row.school_year_id ?? "null"}::${row.college_key}::${row.year_level_key ?? "unresolved"}`,
     ),
   );
 }
@@ -6348,9 +6623,10 @@ async function refreshCalculationResultsWithClient(
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
           ${getCanonicalCollegeKeySql("ar", "s")} AS college_key,
           CASE
-            WHEN ${getCanonicalCollegeKeySql("ar", "s")} IS NOT NULL
-              AND NOT (${getEventCollegeExemptionFilterSql(
+            WHEN COALESCE(ar.event_id, ai.event_id) IS NOT NULL
+              AND NOT (${getEventStudentExemptionFilterSql(
                 "COALESCE(ar.event_id, ai.event_id)",
+                getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
                 getCanonicalCollegeKeySql("ar", "s"),
               )})
             THEN NULL
@@ -6381,9 +6657,10 @@ async function refreshCalculationResultsWithClient(
             WHEN mar.attendance_type = 'zero_attendance'
               OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT)
               OR (
-                ${getCanonicalCollegeKeySql("mar", "s")} IS NOT NULL
-                AND NOT (${getEventCollegeExemptionFilterSql(
+                mar.event_id IS NOT NULL
+                AND NOT (${getEventStudentExemptionFilterSql(
                   "mar.event_id",
+                  getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
                   getCanonicalCollegeKeySql("mar", "s"),
                 )})
               )
@@ -6452,7 +6729,11 @@ async function refreshCalculationResultsWithClient(
             WHEN COALESCE(colleges.college_key_count, 0) = 1
               THEN colleges.college_key
             ELSE NULL
-          END AS college_key
+          END AS college_key,
+          ${getResolvedStudentYearLevelKeySql(
+            "keys.normalized_student_id",
+            "keys.school_year_id",
+          )} AS year_level_key
         FROM selected_student_keys keys
         LEFT JOIN canonical_students s
           ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
@@ -6461,13 +6742,20 @@ async function refreshCalculationResultsWithClient(
          AND colleges.normalized_student_id = keys.normalized_student_id
       ), expected_event_totals AS (
         SELECT
-          school_year_id,
-          college_key,
-          COUNT(DISTINCT event_id)::INT AS expected_events
-        FROM event_roster_scope
-        WHERE college_key IS NOT NULL
-          AND ($1::uuid IS NULL OR school_year_id = $1::uuid)
-        GROUP BY school_year_id, college_key
+          student.school_year_id,
+          student.normalized_student_id,
+          COUNT(DISTINCT roster.event_id)::INT AS expected_events
+        FROM student_event_scope student
+        LEFT JOIN event_roster_scope roster
+          ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
+         AND roster.college_key = student.college_key
+         AND ${getEventYearLevelExemptionFilterSql(
+           "roster.event_id",
+           "student.year_level_key",
+           "student.college_key",
+         )}
+        WHERE ($1::uuid IS NULL OR student.school_year_id = $1::uuid)
+        GROUP BY student.school_year_id, student.normalized_student_id
       ), expected_attended_event_totals AS (
         SELECT
           student.school_year_id,
@@ -6477,6 +6765,11 @@ async function refreshCalculationResultsWithClient(
         LEFT JOIN event_roster_scope roster
           ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
          AND roster.college_key = student.college_key
+         AND ${getEventYearLevelExemptionFilterSql(
+           "roster.event_id",
+           "student.year_level_key",
+           "student.college_key",
+         )}
         LEFT JOIN event_participation participation
           ON participation.school_year_id IS NOT DISTINCT FROM student.school_year_id
          AND participation.normalized_student_id = student.normalized_student_id
@@ -6501,7 +6794,18 @@ async function refreshCalculationResultsWithClient(
           COALESCE(selected_imports.import_ids, ARRAY[]::uuid[]) AS import_ids,
           COALESCE(imported.student_id, manual.student_id, keys.normalized_student_id) AS student_id,
           COALESCE(imported.name, manual.name, keys.normalized_student_id) AS name,
-          COALESCE(imported.year_level, manual.year_level) AS year_level,
+          COALESCE(
+            CASE scope.year_level_key
+              WHEN '1' THEN '1st Year'
+              WHEN '2' THEN '2nd Year'
+              WHEN '3' THEN '3rd Year'
+              WHEN '4' THEN '4th Year'
+              WHEN '5' THEN '5th Year'
+              ELSE NULL
+            END,
+            imported.year_level,
+            manual.year_level
+          ) AS year_level,
           COALESCE(imported.college, manual.college) AS college,
           COALESCE(imported.program, manual.program) AS program,
           COALESCE(imported.institution, manual.institution) AS institution,
@@ -6557,7 +6861,7 @@ async function refreshCalculationResultsWithClient(
          AND scope.normalized_student_id = keys.normalized_student_id
         LEFT JOIN expected_event_totals expected
           ON expected.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-         AND expected.college_key = scope.college_key
+         AND expected.normalized_student_id = keys.normalized_student_id
         LEFT JOIN expected_attended_event_totals attended
           ON attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
          AND attended.normalized_student_id = keys.normalized_student_id
@@ -7130,9 +7434,10 @@ async function refreshAttendanceFinalResultsWithClient(
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
           ${getCanonicalCollegeKeySql("ar", "s")} AS college_key,
           CASE
-            WHEN ${getCanonicalCollegeKeySql("ar", "s")} IS NOT NULL
-              AND NOT (${getEventCollegeExemptionFilterSql(
+            WHEN COALESCE(ar.event_id, ai.event_id) IS NOT NULL
+              AND NOT (${getEventStudentExemptionFilterSql(
                 "COALESCE(ar.event_id, ai.event_id)",
+                getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
                 getCanonicalCollegeKeySql("ar", "s"),
               )})
             THEN NULL
@@ -7163,9 +7468,10 @@ async function refreshAttendanceFinalResultsWithClient(
             WHEN mar.attendance_type = 'zero_attendance'
               OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($2::TEXT)
               OR (
-                ${getCanonicalCollegeKeySql("mar", "s")} IS NOT NULL
-                AND NOT (${getEventCollegeExemptionFilterSql(
+                mar.event_id IS NOT NULL
+                AND NOT (${getEventStudentExemptionFilterSql(
                   "mar.event_id",
+                  getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
                   getCanonicalCollegeKeySql("mar", "s"),
                 )})
               )
@@ -7238,7 +7544,11 @@ async function refreshAttendanceFinalResultsWithClient(
             WHEN COALESCE(colleges.college_key_count, 0) = 1
               THEN colleges.college_key
             ELSE NULL
-          END AS college_key
+          END AS college_key,
+          ${getResolvedStudentYearLevelKeySql(
+            "keys.normalized_student_id",
+            "keys.school_year_id",
+          )} AS year_level_key
         FROM student_keys keys
         LEFT JOIN canonical_students s
           ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
@@ -7247,13 +7557,20 @@ async function refreshAttendanceFinalResultsWithClient(
          AND colleges.normalized_student_id = keys.normalized_student_id
       ), expected_event_totals AS (
         SELECT
-          school_year_id,
-          college_key,
-          COUNT(DISTINCT event_id)::INT AS expected_events
-        FROM event_roster_scope
-        WHERE college_key IS NOT NULL
-          AND ($1::uuid IS NULL OR school_year_id = $1::uuid)
-        GROUP BY school_year_id, college_key
+          student.school_year_id,
+          student.normalized_student_id,
+          COUNT(DISTINCT roster.event_id)::INT AS expected_events
+        FROM student_event_scope student
+        LEFT JOIN event_roster_scope roster
+          ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
+         AND roster.college_key = student.college_key
+         AND ${getEventYearLevelExemptionFilterSql(
+           "roster.event_id",
+           "student.year_level_key",
+           "student.college_key",
+         )}
+        WHERE ($1::uuid IS NULL OR student.school_year_id = $1::uuid)
+        GROUP BY student.school_year_id, student.normalized_student_id
       ), expected_attended_event_totals AS (
         SELECT
           student.school_year_id,
@@ -7263,6 +7580,11 @@ async function refreshAttendanceFinalResultsWithClient(
         LEFT JOIN event_roster_scope roster
           ON roster.school_year_id IS NOT DISTINCT FROM student.school_year_id
          AND roster.college_key = student.college_key
+         AND ${getEventYearLevelExemptionFilterSql(
+           "roster.event_id",
+           "student.year_level_key",
+           "student.college_key",
+         )}
         LEFT JOIN event_participation participation
           ON participation.school_year_id IS NOT DISTINCT FROM student.school_year_id
          AND participation.normalized_student_id = student.normalized_student_id
@@ -7273,7 +7595,19 @@ async function refreshAttendanceFinalResultsWithClient(
           keys.school_year_id,
           COALESCE(imported.student_id, manual.student_id, keys.normalized_student_id) AS student_id,
           COALESCE(imported.name, manual.name, keys.normalized_student_id) AS name,
-          COALESCE(imported.year_level, manual.year_level, '') AS year_level,
+          COALESCE(
+            CASE scope.year_level_key
+              WHEN '1' THEN '1st Year'
+              WHEN '2' THEN '2nd Year'
+              WHEN '3' THEN '3rd Year'
+              WHEN '4' THEN '4th Year'
+              WHEN '5' THEN '5th Year'
+              ELSE NULL
+            END,
+            imported.year_level,
+            manual.year_level,
+            ''
+          ) AS year_level,
           COALESCE(imported.college, manual.college, '') AS college,
           COALESCE(imported.program, manual.program, '') AS program,
           COALESCE(imported.institution, manual.institution, '') AS institution,
@@ -7316,7 +7650,7 @@ async function refreshAttendanceFinalResultsWithClient(
          AND scope.normalized_student_id = keys.normalized_student_id
         LEFT JOIN expected_event_totals expected
           ON expected.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-         AND expected.college_key = scope.college_key
+         AND expected.normalized_student_id = keys.normalized_student_id
         LEFT JOIN expected_attended_event_totals attended
           ON attended.school_year_id IS NOT DISTINCT FROM keys.school_year_id
          AND attended.normalized_student_id = keys.normalized_student_id
@@ -7723,6 +8057,11 @@ export async function listAttendanceFinalResults(
         JOIN attendance_events expected_event ON expected_event.id = roster.event_id
         WHERE roster.school_year_id IS NOT DISTINCT FROM afr.school_year_id
           AND roster.college_key = afr.college_key
+          AND ${getEventYearLevelExemptionFilterSql(
+            "roster.event_id",
+            getResolvedStudentYearLevelKeySql("afr.student_id", "afr.school_year_id"),
+            "afr.college_key",
+          )}
           AND NOT EXISTS (
             SELECT 1
             FROM attendance_records attended_record
@@ -7781,7 +8120,11 @@ export async function listAttendanceFinalResults(
             AND detail_record.school_year_id IS NOT DISTINCT FROM afr.school_year_id
             AND COALESCE(detail_record.event_id, detail_import.event_id) IS NOT NULL
             AND ${getCanonicalCollegeKeySql("detail_record", "detail_student")} = afr.college_key
-            AND ${getEventCollegeExemptionFilterSql("COALESCE(detail_record.event_id, detail_import.event_id)", getCanonicalCollegeKeySql("detail_record", "detail_student"))}
+            AND ${getEventStudentExemptionFilterSql(
+              "COALESCE(detail_record.event_id, detail_import.event_id)",
+              getResolvedStudentYearLevelKeySql("detail_record.student_id", "detail_record.school_year_id"),
+              getCanonicalCollegeKeySql("detail_record", "detail_student"),
+            )}
 
           UNION
 
@@ -7795,9 +8138,18 @@ export async function listAttendanceFinalResults(
             AND COALESCE(detail_manual.attendance_type, 'manual') <> 'zero_attendance'
             AND LOWER(TRIM(COALESCE(detail_manual.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
             AND ${getCanonicalCollegeKeySql("detail_manual", "detail_manual_student")} = afr.college_key
-            AND ${getEventCollegeExemptionFilterSql("detail_manual.event_id", getCanonicalCollegeKeySql("detail_manual", "detail_manual_student"))}
+            AND ${getEventStudentExemptionFilterSql(
+              "detail_manual.event_id",
+              getResolvedStudentYearLevelKeySql("detail_manual.student_id", "detail_manual.school_year_id"),
+              getCanonicalCollegeKeySql("detail_manual", "detail_manual_student"),
+            )}
         ) roster
         JOIN attendance_events expected_event ON expected_event.id = roster.event_id
+          AND ${getEventYearLevelExemptionFilterSql(
+            "roster.event_id",
+            getResolvedStudentYearLevelKeySql("afr.student_id", "afr.school_year_id"),
+            "afr.college_key",
+          )}
         LEFT JOIN LATERAL (
           SELECT source_record.source,
                  source_record.record_id,
@@ -8183,6 +8535,11 @@ export async function getEventCollegeExemptionImpact(input: { college?: unknown;
       WHERE ${getAttendanceRecordVisibilitySql("ar")}
         AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
         AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
+        AND ${getEventYearLevelExemptionFilterSql(
+          "COALESCE(ar.event_id, ai.event_id)",
+          getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
+          ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL,
+        )}
 
       UNION
 
@@ -8195,6 +8552,11 @@ export async function getEventCollegeExemptionImpact(input: { college?: unknown;
         AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
         AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
         AND ${MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
+        AND ${getEventYearLevelExemptionFilterSql(
+          "mar.event_id",
+          getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
+          MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL,
+        )}
     ), college_students AS (
       SELECT DISTINCT LOWER(TRIM(student_id)) AS student_key
       FROM (
@@ -8224,6 +8586,11 @@ export async function getEventCollegeExemptionImpact(input: { college?: unknown;
         AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
         AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
         AND ${getCanonicalCollegeKeySql("ar")} = $1
+        AND ${getEventYearLevelExemptionFilterSql(
+          "COALESCE(ar.event_id, ai.event_id)",
+          getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
+          getCanonicalCollegeKeySql("ar"),
+        )}
 
       UNION
 
@@ -8236,8 +8603,16 @@ export async function getEventCollegeExemptionImpact(input: { college?: unknown;
         AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
         AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
         AND ${getCanonicalCollegeKeySql("mar")} = $1
+        AND ${getEventYearLevelExemptionFilterSql(
+          "mar.event_id",
+          getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
+          getCanonicalCollegeKeySql("mar"),
+        )}
     ), current_final AS (
-      SELECT LOWER(TRIM(student_id)) AS student_key, total_absences
+      SELECT
+        LOWER(TRIM(student_id)) AS student_key,
+        total_absences,
+        ${getResolvedStudentYearLevelKeySql("afr.student_id", "afr.school_year_id")} AS year_level_key
       FROM attendance_final_results afr
       WHERE school_year_id = $2
         AND college_key = $1
@@ -8257,14 +8632,30 @@ export async function getEventCollegeExemptionImpact(input: { college?: unknown;
           AND exemption.id IS NULL
           AND cf.total_absences > 0
           AND attended.student_key IS NULL
+          AND ${getEventYearLevelExemptionFilterSql(
+            "e.id",
+            "cf.year_level_key",
+            "$1::text",
+          )}
         THEN cs.student_key
       END), 0)::INT AS students_losing_absence,
       COALESCE(COUNT(DISTINCT CASE
-        WHEN roster.event_id IS NOT NULL THEN cp.student_key
+        WHEN roster.event_id IS NOT NULL
+          AND ${getEventYearLevelExemptionFilterSql(
+            "e.id",
+            "cf.year_level_key",
+            "$1::text",
+          )}
+        THEN cp.student_key
       END), 0)::INT AS penalties_before,
       COALESCE(COUNT(DISTINCT CASE
         WHEN roster.event_id IS NOT NULL
           AND cp.student_key IS NOT NULL
+          AND ${getEventYearLevelExemptionFilterSql(
+            "e.id",
+            "cf.year_level_key",
+            "$1::text",
+          )}
           AND GREATEST(
             COALESCE(cf.total_absences, 0)
               - CASE WHEN exemption.id IS NULL AND attended.student_key IS NULL THEN 1 ELSE 0 END,
@@ -8445,6 +8836,387 @@ export async function deleteEventCollegeExemption(idValue: unknown) {
     const studentIds = await getCollegeStudentIds(client, exemption.college_key);
     await syncAbsencesForStudents(client, studentIds, exemption.school_year_id);
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [exemption.school_year_id]);
+    return exemption;
+  });
+}
+
+export type EventYearLevelExemption = {
+  id: string;
+  school_year_id: string | null;
+  event_id: string;
+  event_name: string;
+  year_level_key: string;
+  year_level_label: string;
+  college_key: string | null;
+  college_label: string | null;
+  reason: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+function getCanonicalYearLevelLabel(yearLevelKey: string) {
+  return ({
+    "1": "1st Year",
+    "2": "2nd Year",
+    "3": "3rd Year",
+    "4": "4th Year",
+    "5": "5th Year",
+  } as Record<string, string>)[yearLevelKey] ?? yearLevelKey;
+}
+
+export async function listEventYearLevelExemptions(options: {
+  schoolYearId?: unknown;
+  eventId?: unknown;
+  yearLevel?: unknown;
+  college?: unknown;
+} = {}) {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  const schoolYearId = cleanText(options.schoolYearId);
+  const eventId = cleanText(options.eventId);
+  const yearLevelKey = normalizeYearLevelKey(options.yearLevel);
+  const collegeValue = cleanText(options.college);
+  const collegeKey = normalizeCollegeKey(collegeValue);
+
+  if (schoolYearId) {
+    params.push(schoolYearId);
+    clauses.push(`x.school_year_id = $${params.length}`);
+  }
+  if (eventId) {
+    params.push(eventId);
+    clauses.push(`x.event_id = $${params.length}`);
+  }
+  if (yearLevelKey) {
+    params.push(yearLevelKey);
+    clauses.push(`x.year_level_key = $${params.length}`);
+  }
+  if (collegeValue) {
+    params.push(collegeKey);
+    clauses.push(`x.college_key IS NOT DISTINCT FROM $${params.length}::text`);
+  }
+
+  const result = await query<EventYearLevelExemption>(`
+    SELECT x.*, e.name AS event_name
+    FROM attendance_event_year_level_exemptions x
+    JOIN attendance_events e ON e.id = x.event_id
+    ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+    ORDER BY x.year_level_key, x.college_label NULLS FIRST, e.event_order, e.name
+  `, params);
+  return result.rows;
+}
+
+async function getYearLevelStudentIds(
+  client: PoolClient,
+  yearLevelKey: string,
+  schoolYearId: string,
+  collegeKey?: string | null,
+) {
+  const result = await client.query<{ student_id: string }>(`
+    WITH candidates AS (
+      SELECT student_id FROM students
+      UNION
+      SELECT student_id FROM attendance_records
+      WHERE deleted_at IS NULL AND school_year_id = $2::uuid
+      UNION
+      SELECT student_id FROM manual_attendance_records
+      WHERE school_year_id = $2::uuid
+    )
+    SELECT DISTINCT candidate.student_id
+    FROM candidates candidate
+    WHERE NULLIF(TRIM(candidate.student_id), '') IS NOT NULL
+      AND ${getResolvedStudentYearLevelKeySql("candidate.student_id", "$2::uuid")} = $1::text
+      AND (
+        $3::text IS NULL
+        OR EXISTS (
+          SELECT 1
+          FROM students college_student
+          WHERE LOWER(TRIM(college_student.student_id)) = LOWER(TRIM(candidate.student_id))
+            AND ${getCanonicalCollegeKeySql("college_student", "college_student")} = $3::text
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM attendance_records college_ar
+          WHERE college_ar.deleted_at IS NULL
+            AND college_ar.school_year_id = $2::uuid
+            AND LOWER(TRIM(college_ar.student_id)) = LOWER(TRIM(candidate.student_id))
+            AND ${getCanonicalCollegeKeySql("college_ar")} = $3::text
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM manual_attendance_records college_mar
+          WHERE college_mar.school_year_id = $2::uuid
+            AND LOWER(TRIM(college_mar.student_id)) = LOWER(TRIM(candidate.student_id))
+            AND ${getCanonicalCollegeKeySql("college_mar")} = $3::text
+        )
+      )
+  `, [yearLevelKey, schoolYearId, collegeKey ?? null]);
+
+  return uniqueCleanTextValues(result.rows.map((row) => row.student_id));
+}
+
+export async function getEventYearLevelExemptionImpact(input: {
+  yearLevel?: unknown;
+  college?: unknown;
+  eventIds?: unknown;
+  schoolYearId?: unknown;
+}) {
+  const yearLevelKey = normalizeYearLevelKey(input.yearLevel);
+  const collegeLabel = cleanText(input.college);
+  const collegeKey = collegeLabel ? normalizeCollegeKey(collegeLabel) : null;
+  const schoolYearId = cleanText(input.schoolYearId);
+  const eventIds = Array.isArray(input.eventIds)
+    ? uniqueCleanTextValues(input.eventIds.map(String))
+    : [];
+
+  if (!yearLevelKey) throw createValidationError("Year level is required.");
+  if (collegeLabel && !collegeKey) throw createValidationError("College is invalid.");
+  if (!schoolYearId) throw createValidationError("School year is required.");
+  if (!eventIds.length) return [] as EventExemptionImpact[];
+
+  const rows = await query<EventExemptionImpact>(`
+    WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
+    year_students AS (
+      SELECT DISTINCT
+        afr.school_year_id,
+        LOWER(TRIM(afr.student_id)) AS student_key,
+        afr.student_id,
+        afr.college_key,
+        afr.total_absences
+      FROM attendance_final_results afr
+      WHERE afr.school_year_id = $2::uuid
+        AND ${getAttendanceFinalResultVisibilitySql("afr")}
+        AND ${getResolvedStudentYearLevelKeySql("afr.student_id", "afr.school_year_id")} = $1::text
+        AND ($3::text IS NULL OR afr.college_key = $3::text)
+    ), attendance AS (
+      SELECT DISTINCT COALESCE(ar.event_id, ai.event_id) AS event_id, LOWER(TRIM(ar.student_id)) AS student_key
+      FROM attendance_records ar
+      LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
+      WHERE ${getAttendanceRecordVisibilitySql("ar")}
+        AND ar.school_year_id = $2::uuid
+      UNION
+      SELECT DISTINCT mar.event_id, LOWER(TRIM(mar.student_id)) AS student_key
+      FROM manual_attendance_records mar
+      WHERE mar.school_year_id = $2::uuid
+        AND mar.event_id IS NOT NULL
+        AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+        AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+    )
+    SELECT
+      e.id AS event_id,
+      e.name AS event_name,
+      COUNT(DISTINCT a.student_key)::INT AS students_attended,
+      COUNT(DISTINCT CASE
+        WHEN ys.total_absences > 0
+          AND a.student_key IS NULL
+          AND roster.event_id IS NOT NULL
+          AND ${getEventCollegeExemptionFilterSql("e.id", "ys.college_key")}
+          AND ${getEventYearLevelExemptionFilterSql("e.id", "$1::text", "ys.college_key")}
+        THEN ys.student_key
+      END)::INT AS students_losing_absence,
+      COUNT(DISTINCT CASE WHEN ys.total_absences > 0 THEN ys.student_key END)::INT AS penalties_before,
+      COUNT(DISTINCT CASE
+        WHEN GREATEST(
+          ys.total_absences - CASE
+            WHEN a.student_key IS NULL
+              AND roster.event_id IS NOT NULL
+              AND ${getEventCollegeExemptionFilterSql("e.id", "ys.college_key")}
+              AND ${getEventYearLevelExemptionFilterSql("e.id", "$1::text", "ys.college_key")}
+            THEN 1 ELSE 0 END,
+          0
+        ) > 0 THEN ys.student_key
+      END)::INT AS penalties_after,
+      COALESCE(BOOL_OR(existing.id IS NOT NULL), FALSE) AS already_exempted,
+      COALESCE(BOOL_OR(roster.event_id IS NOT NULL), FALSE) AS in_roster_scope
+    FROM attendance_events e
+    LEFT JOIN year_students ys ON TRUE
+    LEFT JOIN event_roster_scope roster
+      ON roster.event_id = e.id
+     AND roster.school_year_id = e.school_year_id
+     AND roster.college_key = ys.college_key
+    LEFT JOIN attendance a ON a.event_id = e.id AND a.student_key = ys.student_key
+    LEFT JOIN attendance_event_year_level_exemptions existing
+      ON existing.event_id = e.id
+     AND existing.year_level_key = $1::text
+     AND existing.college_key IS NOT DISTINCT FROM $3::text
+    WHERE e.id = ANY($4::uuid[])
+      AND e.school_year_id = $2::uuid
+    GROUP BY e.id
+    ORDER BY e.event_order, e.name
+  `, [yearLevelKey, schoolYearId, collegeKey, eventIds]);
+
+  return rows.rows;
+}
+
+export async function createEventYearLevelExemptions(input: {
+  yearLevels?: unknown;
+  college?: unknown;
+  eventIds?: unknown;
+  reason?: unknown;
+  schoolYearId?: unknown;
+  createdBy?: unknown;
+}) {
+  const requestedYearLevels = Array.isArray(input.yearLevels)
+    ? uniqueCleanTextValues(input.yearLevels.map(String))
+    : [];
+  const normalizedYearLevels = Array.from(new Set(
+    requestedYearLevels.map(normalizeYearLevelKey).filter((key): key is string => Boolean(key)),
+  ));
+  const collegeLabel = cleanText(input.college) || null;
+  const collegeKey = collegeLabel ? normalizeCollegeKey(collegeLabel) : null;
+  const schoolYearId = cleanText(input.schoolYearId);
+  const createdBy = cleanText(input.createdBy) || null;
+  const reason = cleanText(input.reason) || null;
+  const eventIds = Array.isArray(input.eventIds)
+    ? uniqueCleanTextValues(input.eventIds.map(String))
+    : [];
+
+  if (!requestedYearLevels.length || normalizedYearLevels.length !== requestedYearLevels.length) {
+    throw createValidationError("Select at least one valid year level.");
+  }
+  if (collegeLabel && !collegeKey) throw createValidationError("College is invalid.");
+  if (!schoolYearId) throw createValidationError("School year is required.");
+  if (!eventIds.length) throw createValidationError("Select at least one event.");
+
+  return withTransaction(async (client) => {
+    await lockAttendanceAbsenceSync(client);
+    const eventResult = await client.query<{ id: string }>(
+      `SELECT id FROM attendance_events WHERE id = ANY($1::uuid[]) AND school_year_id = $2`,
+      [eventIds, schoolYearId],
+    );
+    if (eventResult.rows.length !== eventIds.length) {
+      throw createValidationError("One or more events do not belong to the selected school year.");
+    }
+
+    for (const yearLevelKey of normalizedYearLevels) {
+      const yearLevelLabel = getCanonicalYearLevelLabel(yearLevelKey);
+      for (const eventId of eventIds) {
+        const updated = await client.query(
+          `
+            UPDATE attendance_event_year_level_exemptions
+            SET school_year_id = $1,
+                year_level_label = $4,
+                college_label = $6,
+                reason = $7,
+                updated_at = NOW()
+            WHERE event_id = $2
+              AND year_level_key = $3
+              AND college_key IS NOT DISTINCT FROM $5::text
+          `,
+          [schoolYearId, eventId, yearLevelKey, yearLevelLabel, collegeKey, collegeLabel, reason],
+        );
+        if (!updated.rowCount) {
+          await client.query(
+            `
+              INSERT INTO attendance_event_year_level_exemptions (
+                school_year_id, event_id, year_level_key, year_level_label,
+                college_key, college_label, reason, created_by
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            `,
+            [schoolYearId, eventId, yearLevelKey, yearLevelLabel, collegeKey, collegeLabel, reason, createdBy],
+          );
+        }
+      }
+    }
+
+    const affectedStudentIds = new Set<string>();
+    for (const yearLevelKey of normalizedYearLevels) {
+      const studentIds = await getYearLevelStudentIds(client, yearLevelKey, schoolYearId, collegeKey);
+      studentIds.forEach((studentId) => affectedStudentIds.add(studentId));
+    }
+    await syncAbsencesForStudents(client, Array.from(affectedStudentIds), schoolYearId);
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [schoolYearId]);
+
+    const saved = await client.query<EventYearLevelExemption>(`
+      SELECT x.*, e.name AS event_name
+      FROM attendance_event_year_level_exemptions x
+      JOIN attendance_events e ON e.id = x.event_id
+      WHERE x.school_year_id = $1
+        AND x.year_level_key = ANY($2::text[])
+        AND x.college_key IS NOT DISTINCT FROM $3::text
+      ORDER BY x.year_level_key, e.event_order, e.name
+    `, [schoolYearId, normalizedYearLevels, collegeKey]);
+    return saved.rows;
+  });
+}
+
+export async function deleteEventYearLevelExemptionsBulk(input: {
+  yearLevels?: unknown;
+  college?: unknown;
+  eventIds?: unknown;
+  schoolYearId?: unknown;
+}) {
+  const requestedYearLevels = Array.isArray(input.yearLevels)
+    ? uniqueCleanTextValues(input.yearLevels.map(String))
+    : [];
+  const yearLevelKeys = Array.from(new Set(
+    requestedYearLevels.map(normalizeYearLevelKey).filter((key): key is string => Boolean(key)),
+  ));
+  const collegeLabel = cleanText(input.college) || null;
+  const collegeKey = collegeLabel ? normalizeCollegeKey(collegeLabel) : null;
+  const schoolYearId = cleanText(input.schoolYearId);
+  const eventIds = Array.isArray(input.eventIds)
+    ? uniqueCleanTextValues(input.eventIds.map(String))
+    : [];
+
+  if (!yearLevelKeys.length || yearLevelKeys.length !== requestedYearLevels.length) {
+    throw createValidationError("Select at least one valid year level.");
+  }
+  if (collegeLabel && !collegeKey) throw createValidationError("College is invalid.");
+  if (!schoolYearId || !isUuid(schoolYearId)) throw createValidationError("School year ID is invalid.");
+  if (!eventIds.length || eventIds.some((eventId) => !isUuid(eventId))) {
+    throw createValidationError("Select valid event IDs.");
+  }
+
+  return withTransaction(async (client) => {
+    await lockAttendanceAbsenceSync(client);
+    const deleted = await client.query<Omit<EventYearLevelExemption, "event_name">>(`
+      DELETE FROM attendance_event_year_level_exemptions
+      WHERE school_year_id = $1
+        AND year_level_key = ANY($2::text[])
+        AND college_key IS NOT DISTINCT FROM $3::text
+        AND event_id = ANY($4::uuid[])
+      RETURNING *
+    `, [schoolYearId, yearLevelKeys, collegeKey, eventIds]);
+
+    const affectedStudentIds = new Set<string>();
+    for (const yearLevelKey of yearLevelKeys) {
+      const studentIds = await getYearLevelStudentIds(client, yearLevelKey, schoolYearId, collegeKey);
+      studentIds.forEach((studentId) => affectedStudentIds.add(studentId));
+    }
+    await syncAbsencesForStudents(client, Array.from(affectedStudentIds), schoolYearId);
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [schoolYearId]);
+    return deleted.rows;
+  });
+}
+
+export async function deleteEventYearLevelExemption(idValue: unknown) {
+  const id = cleanText(idValue);
+  if (!id) throw createValidationError("Exemption ID is required.");
+
+  return withTransaction(async (client) => {
+    await lockAttendanceAbsenceSync(client);
+    const found = await client.query<EventYearLevelExemption>(`
+      SELECT x.*, e.name AS event_name
+      FROM attendance_event_year_level_exemptions x
+      JOIN attendance_events e ON e.id = x.event_id
+      WHERE x.id = $1
+      FOR UPDATE OF x
+    `, [id]);
+    const exemption = found.rows[0];
+    if (!exemption) throw createValidationError("Event year level exemption not found.", 404);
+
+    await client.query(`DELETE FROM attendance_event_year_level_exemptions WHERE id = $1`, [id]);
+    if (exemption.school_year_id) {
+      const studentIds = await getYearLevelStudentIds(
+        client,
+        exemption.year_level_key,
+        exemption.school_year_id,
+        exemption.college_key,
+      );
+      await syncAbsencesForStudents(client, studentIds, exemption.school_year_id);
+      await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [exemption.school_year_id]);
+    }
     return exemption;
   });
 }
