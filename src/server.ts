@@ -24,6 +24,7 @@ import {
 import {
   attendanceUpload,
   calculationResults as attendanceCalculationResults,
+  calculationStatus as attendanceCalculationStatus,
   colleges as attendanceColleges,
   deleteCalculationResultRows as deleteAttendanceCalculationResults,
   deleteEvent as deleteAttendanceEvent,
@@ -299,6 +300,10 @@ app.post(
   refreshAttendanceFinalResults,
 );
 app.get("/api/attendance/calculation-results", attendanceCalculationResults);
+app.post(
+  "/api/attendance/calculation-results/status",
+  attendanceCalculationStatus,
+);
 app.delete(
   "/api/attendance/calculation-results",
   deleteAttendanceCalculationResults,

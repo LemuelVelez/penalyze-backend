@@ -26,6 +26,7 @@ import {
   deleteManualAttendanceRecordsByIds,
   deleteManualAttendanceRecordsBySchoolYear,
   getAttendanceImport,
+  getCalculationStatus,
   getEventCollegeExemptionImpact,
   getEventYearLevelExemptionImpact,
   listAttendanceEvents,
@@ -952,6 +953,26 @@ export async function refreshFinalResults(
     });
 
     res.json({ message: "Final attendance results refreshed.", data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function calculationStatus(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const status = await getCalculationStatus({
+      schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+      importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
+      sourceTypes: parseCalculationSourceTypes(
+        req.body?.sourceTypes ?? req.body?.source_types,
+      ),
+    });
+
+    res.json({ data: status });
   } catch (error) {
     next(error);
   }

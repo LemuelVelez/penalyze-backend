@@ -151,6 +151,20 @@ export type DeletedCalculationResultsResult = {
   deletedRecords: CalculationResultRecord[];
 };
 
+export type CalculationStatus = {
+  calculationScopeKey: string;
+  pending: boolean;
+  hasSourceData: boolean;
+  hasSavedResults: boolean;
+  sourceRecordCount: number;
+  savedSourceRecordCount: number;
+  sourceStudentCount: number;
+  savedResultCount: number;
+  latestSourceUpdatedAt: Date | string | null;
+  lastCalculatedAt: Date | string | null;
+  revision: string;
+};
+
 export type DeletedManualAttendanceRecordsResult = {
   deletedCount: number;
   deletedRecords: ManualAttendanceRecord[];
@@ -7139,9 +7153,175 @@ async function refreshCalculationResultsWithClient(
     };
   });
 }
+export async function getCalculationStatus(
+  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
+): Promise<CalculationStatus> {
+  const schoolYearId = cleanText(options.schoolYearId) || null;
+  const importIds = normalizeImportIds(options.importIds ?? []);
+  const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
+  const sourceFlags = getCalculationSourceFlags(sourceTypes);
+  const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
+
+  const result = await query<{
+    source_record_count: string | number;
+    source_student_count: string | number;
+    latest_source_updated_at: Date | string | null;
+    saved_result_count: string | number;
+    saved_source_record_count: string | number;
+    last_calculated_at: Date | string | null;
+  }>(
+    `
+      WITH selected_imported_records AS (
+        SELECT
+          ar.school_year_id,
+          ar.id,
+          LOWER(TRIM(ar.student_id)) AS normalized_student_id,
+          ar.updated_at
+        FROM attendance_records ar
+        WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+          AND (
+            (
+              $5::BOOLEAN
+              AND ar.import_id IS NOT NULL
+              AND (CARDINALITY($2::uuid[]) = 0 OR ar.import_id = ANY($2::uuid[]))
+            )
+            OR (
+              $7::BOOLEAN
+              AND LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($4::TEXT)
+            )
+          )
+      ), selected_manual_records AS (
+        SELECT
+          mar.school_year_id,
+          mar.id,
+          LOWER(TRIM(mar.student_id)) AS normalized_student_id,
+          mar.updated_at
+        FROM manual_attendance_records mar
+        WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+          AND (
+            (
+              $6::BOOLEAN
+              AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+              AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($4::TEXT)
+            )
+            OR (
+              $7::BOOLEAN
+              AND (
+                mar.attendance_type = 'zero_attendance'
+                OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT)
+              )
+            )
+          )
+      ), selected_sources AS (
+        SELECT
+          'imported'::TEXT AS source_kind,
+          school_year_id,
+          id,
+          normalized_student_id,
+          updated_at
+        FROM selected_imported_records
+        UNION ALL
+        SELECT
+          'manual'::TEXT AS source_kind,
+          school_year_id,
+          id,
+          normalized_student_id,
+          updated_at
+        FROM selected_manual_records
+      ), current_stats AS (
+        SELECT
+          COUNT(*)::BIGINT AS source_record_count,
+          COUNT(DISTINCT CONCAT(COALESCE(school_year_id::TEXT, 'null'), '::', normalized_student_id))::BIGINT AS source_student_count,
+          MAX(updated_at) AS latest_source_updated_at
+        FROM selected_sources
+      ), saved_stats AS (
+        SELECT
+          COUNT(*)::BIGINT AS saved_result_count,
+          COALESCE(SUM(cr.source_record_count), 0)::BIGINT AS saved_source_record_count,
+          MAX(cr.calculated_at) AS last_calculated_at
+        FROM calculation_results cr
+        WHERE ($1::uuid IS NULL OR cr.school_year_id = $1::uuid)
+          AND cr.calculation_scope_key = $3::TEXT
+      )
+      SELECT
+        current_stats.source_record_count,
+        current_stats.source_student_count,
+        current_stats.latest_source_updated_at,
+        saved_stats.saved_result_count,
+        saved_stats.saved_source_record_count,
+        saved_stats.last_calculated_at
+      FROM current_stats
+      CROSS JOIN saved_stats
+    `,
+    [
+      schoolYearId,
+      importIds,
+      calculationScopeKey,
+      ZERO_ATTENDANCE_REMARK,
+      sourceFlags.includeImported,
+      sourceFlags.includeManual,
+      sourceFlags.includeZeroAttendance,
+    ],
+  );
+
+  const row = result.rows[0];
+  const sourceRecordCount = Number(row?.source_record_count ?? 0);
+  const sourceStudentCount = Number(row?.source_student_count ?? 0);
+  const savedResultCount = Number(row?.saved_result_count ?? 0);
+  const savedSourceRecordCount = Number(row?.saved_source_record_count ?? 0);
+  const latestSourceUpdatedAt = row?.latest_source_updated_at ?? null;
+  const lastCalculatedAt = row?.last_calculated_at ?? null;
+  const hasSourceData = sourceRecordCount > 0;
+  const hasSavedResults = savedResultCount > 0;
+
+  const latestInputTime = latestSourceUpdatedAt
+    ? new Date(latestSourceUpdatedAt).getTime()
+    : 0;
+  const lastCalculatedTime = lastCalculatedAt
+    ? new Date(lastCalculatedAt).getTime()
+    : 0;
+  const sourceShapeChanged =
+    sourceRecordCount !== savedSourceRecordCount ||
+    sourceStudentCount !== savedResultCount;
+  const pending = hasSavedResults
+    ? sourceShapeChanged || latestInputTime > lastCalculatedTime
+    : hasSourceData;
+  const revision = [
+    calculationScopeKey,
+    schoolYearId ?? "all",
+    sourceRecordCount,
+    sourceStudentCount,
+    latestSourceUpdatedAt ? new Date(latestSourceUpdatedAt).toISOString() : "none",
+  ].join("|");
+
+  return {
+    calculationScopeKey,
+    pending,
+    hasSourceData,
+    hasSavedResults,
+    sourceRecordCount,
+    savedSourceRecordCount,
+    sourceStudentCount,
+    savedResultCount,
+    latestSourceUpdatedAt,
+    lastCalculatedAt,
+    revision,
+  };
+}
+
 export async function previewCalculationResults(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
 ) {
+  const status = await getCalculationStatus(options);
+
+  if (!status.pending) {
+    throw createValidationError(
+      "Calculation is already up to date. Add or change attendance data before calculating again.",
+      409,
+    );
+  }
+
   const client = await pool.connect();
 
   try {
@@ -7173,6 +7353,15 @@ export async function previewCalculationResults(
 export async function refreshCalculationResults(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
 ) {
+  const status = await getCalculationStatus(options);
+
+  if (!status.pending) {
+    throw createValidationError(
+      "Calculation is already up to date. Add or change attendance data before calculating again.",
+      409,
+    );
+  }
+
   return withTransaction(async (client) => {
     const importIds = normalizeImportIds(options.importIds ?? []);
     const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
