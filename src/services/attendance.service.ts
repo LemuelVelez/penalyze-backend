@@ -7335,6 +7335,32 @@ export async function getCalculationStatus(
   };
 }
 
+async function prepareCalculationPreviewTable(client: PoolClient) {
+  // The calculation engine intentionally uses the unqualified table name
+  // `calculation_results`. A temporary table with the same name shadows the
+  // persisted public table for this connection only, allowing preview to run
+  // the exact same calculation SQL without mutating or locking saved results.
+  //
+  // Do not copy CHECK/FK constraints: preview rows should show the computed
+  // result even when persisted schema constraints are temporarily behind the
+  // application during a deployment. The unique index is required by the
+  // engine's ON CONFLICT target.
+  await client.query(`
+    CREATE TEMP TABLE calculation_results
+    (LIKE public.calculation_results INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY)
+    ON COMMIT DROP
+  `);
+
+  await client.query(`
+    CREATE UNIQUE INDEX calculation_results_preview_scope_student
+    ON calculation_results (
+      school_year_id,
+      calculation_scope_key,
+      (LOWER(TRIM(student_id)))
+    )
+  `);
+}
+
 export async function previewCalculationResults(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
 ) {
@@ -7351,6 +7377,7 @@ export async function previewCalculationResults(
 
   try {
     await client.query("BEGIN");
+    await prepareCalculationPreviewTable(client);
 
     const importIds = normalizeImportIds(options.importIds ?? []);
     const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
