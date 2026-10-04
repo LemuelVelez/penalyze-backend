@@ -1,4 +1,5 @@
 import path from "path";
+import { createHash } from "crypto";
 import { TextDecoder } from "util";
 import { PoolClient } from "pg";
 
@@ -6303,6 +6304,8 @@ function normalizeCalculationSourceTypes(value: unknown) {
   );
 }
 
+const MAX_RAW_CALCULATION_SCOPE_KEY_BYTES = 2048;
+
 function getCalculationScopeKey(
   importIds: string[],
   sourceTypes?: CalculationSourceType[],
@@ -6317,9 +6320,26 @@ function getCalculationScopeKey(
     return "school_year";
   }
 
+  const sourceKey = normalizedSourceTypes.join(",") || "none";
+  const importKey = normalizedImportIds.join(",") || "all";
+  const rawScopeKey = [`sources:${sourceKey}`, `imports:${importKey}`].join("|");
+
+  // calculation_scope_key participates in a composite B-tree unique index with
+  // school_year_id and normalized student_id. A large selection can contain
+  // enough UUIDs for the raw scope string to exceed PostgreSQL's per-index-row
+  // size limit. Keep legacy/readable keys for normal selections, but collapse
+  // oversized scopes to a deterministic digest. The same helper is used by
+  // preview, status, save, list, and delete queries, so the hashed key remains
+  // stable throughout the complete calculation lifecycle.
+  if (Buffer.byteLength(rawScopeKey, "utf8") <= MAX_RAW_CALCULATION_SCOPE_KEY_BYTES) {
+    return rawScopeKey;
+  }
+
+  const digest = createHash("sha256").update(rawScopeKey).digest("hex");
   return [
-    `sources:${normalizedSourceTypes.join(",") || "none"}`,
-    `imports:${normalizedImportIds.join(",") || "all"}`,
+    `sources:${sourceKey}`,
+    `imports:sha256:${digest}`,
+    `count:${normalizedImportIds.length}`,
   ].join("|");
 }
 
