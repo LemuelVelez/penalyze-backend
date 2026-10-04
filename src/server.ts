@@ -63,7 +63,9 @@ import {
   refreshFinalResults as refreshAttendanceFinalResults,
   saveEvent as saveAttendanceEvent,
   saveEventExemptions as saveAttendanceEventExemptions,
+  saveEventExemptionsWithProgress as saveAttendanceEventExemptionsWithProgress,
   saveEventYearLevelExemptions as saveAttendanceEventYearLevelExemptions,
+  saveEventYearLevelExemptionsWithProgress as saveAttendanceEventYearLevelExemptionsWithProgress,
   saveImport,
   saveImportWithProgress,
   showImport,
@@ -267,6 +269,12 @@ app.get("/api/attendance/colleges", requireAuth, attendanceColleges);
 app.get("/api/attendance/event-exemptions", requireAuth, attendanceEventExemptions);
 app.post("/api/attendance/event-exemptions/impact", requireAuth, requireAdmin, attendanceEventExemptionImpact);
 app.post("/api/attendance/event-exemptions", requireAuth, requireAdmin, saveAttendanceEventExemptions);
+app.post(
+  "/api/attendance/event-exemptions/progress",
+  requireAuth,
+  requireAdmin,
+  saveAttendanceEventExemptionsWithProgress,
+);
 app.post("/api/attendance/event-exemptions/bulk-delete", requireAuth, requireAdmin, removeAttendanceEventExemptionsBulk);
 app.post(
   "/api/attendance/event-exemptions/remove-selected/progress",
@@ -279,6 +287,12 @@ app.delete("/api/attendance/event-exemptions/:id", requireAuth, requireAdmin, re
 app.get("/api/attendance/event-year-level-exemptions", requireAuth, attendanceEventYearLevelExemptions);
 app.post("/api/attendance/event-year-level-exemptions/impact", requireAuth, requireAdmin, attendanceEventYearLevelExemptionImpact);
 app.post("/api/attendance/event-year-level-exemptions", requireAuth, requireAdmin, saveAttendanceEventYearLevelExemptions);
+app.post(
+  "/api/attendance/event-year-level-exemptions/progress",
+  requireAuth,
+  requireAdmin,
+  saveAttendanceEventYearLevelExemptionsWithProgress,
+);
 app.post("/api/attendance/event-year-level-exemptions/bulk-delete", requireAuth, requireAdmin, removeAttendanceEventYearLevelExemptionsBulk);
 app.delete("/api/attendance/event-year-level-exemptions/:id", requireAuth, requireAdmin, removeAttendanceEventYearLevelExemption);
 

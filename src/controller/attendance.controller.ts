@@ -336,6 +336,42 @@ export async function saveEventExemptions(req: Request, res: Response, next: Nex
   }
 }
 
+export async function saveEventExemptionsWithProgress(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    prepareProgressStream(res, 201);
+    const data = await createEventCollegeExemptions({
+      ...(req.body ?? {}),
+      createdBy: getAuthenticatedUserId(req),
+      onProgress: (progress) => {
+        writeProgressStreamMessage(res, { type: "progress", progress });
+      },
+    });
+
+    writeProgressStreamMessage(res, {
+      type: "success",
+      message: "College exemptions saved and fines recalculated.",
+      data,
+    });
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      res.locals.auditOutcome = "failed";
+      writeProgressStreamMessage(res, {
+        type: "error",
+        message: getErrorMessage(error, "Unable to save college exemptions."),
+      });
+      res.end();
+      return;
+    }
+
+    next(error);
+  }
+}
+
 export async function removeEventExemptionsBulk(req: Request, res: Response, next: NextFunction) {
   try {
     const data = await deleteEventCollegeExemptionsBulk(req.body ?? {});
@@ -424,6 +460,42 @@ export async function saveEventYearLevelExemptions(req: Request, res: Response, 
     });
     res.status(201).json({ message: "Year level exemptions saved and fines recalculated.", data });
   } catch (error) {
+    next(error);
+  }
+}
+
+export async function saveEventYearLevelExemptionsWithProgress(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    prepareProgressStream(res, 201);
+    const data = await createEventYearLevelExemptions({
+      ...(req.body ?? {}),
+      createdBy: getAuthenticatedUserId(req),
+      onProgress: (progress) => {
+        writeProgressStreamMessage(res, { type: "progress", progress });
+      },
+    });
+
+    writeProgressStreamMessage(res, {
+      type: "success",
+      message: "Year level exemptions saved and fines recalculated.",
+      data,
+    });
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      res.locals.auditOutcome = "failed";
+      writeProgressStreamMessage(res, {
+        type: "error",
+        message: getErrorMessage(error, "Unable to save year level exemptions."),
+      });
+      res.end();
+      return;
+    }
+
     next(error);
   }
 }

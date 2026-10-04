@@ -8668,6 +8668,23 @@ export type EventCollegeExemption = {
   updated_at: string;
 };
 
+export type SaveEventExemptionsProgress = {
+  stage:
+    | "validating"
+    | "waiting_for_lock"
+    | "saving_exemptions"
+    | "collecting_students"
+    | "syncing_absences"
+    | "refreshing_final_results"
+    | "refreshing_calculations"
+    | "refreshing_penalties"
+    | "finalizing";
+  percent: number;
+  message: string;
+  completed?: number;
+  total?: number;
+};
+
 export type EventExemptionImpact = {
   event_id: string;
   event_name: string;
@@ -8925,6 +8942,7 @@ export async function createEventCollegeExemptions(input: {
   reason?: unknown;
   schoolYearId?: unknown;
   createdBy?: unknown;
+  onProgress?: (progress: SaveEventExemptionsProgress) => void;
 }) {
   const requestedCollegeLabels = Array.isArray(input.colleges)
     ? uniqueCleanTextValues(input.colleges.map(String))
@@ -8962,7 +8980,25 @@ export async function createEventCollegeExemptions(input: {
   if (!schoolYearId) throw createValidationError("School year is required.");
   if (!eventIds.length) throw createValidationError("Select at least one event.");
 
+  const emit = (progress: SaveEventExemptionsProgress) => {
+    input.onProgress?.(progress);
+  };
+  const totalExemptions = normalizedColleges.length * eventIds.length;
+
+  emit({
+    stage: "validating",
+    percent: 5,
+    message: `Validating ${normalizedColleges.length} college${normalizedColleges.length === 1 ? "" : "s"} and ${eventIds.length} event${eventIds.length === 1 ? "" : "s"}.`,
+    completed: 0,
+    total: totalExemptions,
+  });
+
   return withTransaction(async (client) => {
+    emit({
+      stage: "waiting_for_lock",
+      percent: 10,
+      message: "Waiting for attendance recalculation access.",
+    });
     await lockAttendanceAbsenceSync(client);
     const eventResult = await client.query<{ id: string }>(
       `SELECT id FROM attendance_events WHERE id = ANY($1::uuid[]) AND school_year_id = $2`,
@@ -8972,8 +9008,16 @@ export async function createEventCollegeExemptions(input: {
       throw createValidationError("One or more events do not belong to the selected school year.");
     }
 
+    let completedExemptions = 0;
     for (const { collegeKey, collegeLabel } of normalizedColleges) {
       for (const eventId of eventIds) {
+        emit({
+          stage: "saving_exemptions",
+          percent: 18 + Math.floor((completedExemptions / Math.max(totalExemptions, 1)) * 12),
+          message: `Saving ${collegeLabel} exemption ${completedExemptions + 1} of ${totalExemptions}.`,
+          completed: completedExemptions,
+          total: totalExemptions,
+        });
         await client.query(`
           INSERT INTO attendance_event_college_exemptions (school_year_id, event_id, college_key, college_label, reason, created_by)
           VALUES ($1, $2, $3, $4, $5, $6)
@@ -8981,16 +9025,65 @@ export async function createEventCollegeExemptions(input: {
             school_year_id = EXCLUDED.school_year_id, college_label = EXCLUDED.college_label,
             reason = EXCLUDED.reason, updated_at = NOW()
         `, [schoolYearId, eventId, collegeKey, collegeLabel, reason, createdBy]);
+        completedExemptions += 1;
       }
     }
 
+    emit({
+      stage: "collecting_students",
+      percent: 32,
+      message: "Finding students affected by the new exemptions.",
+      completed: completedExemptions,
+      total: totalExemptions,
+    });
     const affectedStudentIds = new Set<string>();
     for (const { collegeKey } of normalizedColleges) {
       const studentIds = await getCollegeStudentIds(client, collegeKey);
       for (const studentId of studentIds) affectedStudentIds.add(studentId);
     }
+
+    emit({
+      stage: "syncing_absences",
+      percent: 40,
+      message: `Recalculating absences for ${affectedStudentIds.size} affected student${affectedStudentIds.size === 1 ? "" : "s"}.`,
+    });
     await syncAbsencesForStudents(client, Array.from(affectedStudentIds), schoolYearId);
-    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [schoolYearId]);
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+      client,
+      [schoolYearId],
+      (progress) => {
+        const progressMap = {
+          refreshing_final_results: {
+            percent: 56,
+            message: "Refreshing final attendance results.",
+          },
+          refreshing_calculations: {
+            percent: 72,
+            message: "Refreshing attendance calculations.",
+          },
+          refreshing_penalties: {
+            percent: 88,
+            message: "Refreshing fines and penalties.",
+          },
+        } as const;
+        const mapped = progressMap[progress.stage];
+        emit({
+          stage: progress.stage,
+          percent: mapped.percent,
+          message: mapped.message,
+          completed: progress.scopeIndex,
+          total: progress.scopeTotal,
+        });
+      },
+    );
+
+    emit({
+      stage: "finalizing",
+      percent: 97,
+      message: "Finalizing saved college exemptions.",
+      completed: totalExemptions,
+      total: totalExemptions,
+    });
 
     const saved = await client.query<EventCollegeExemption>(`
       SELECT x.*, e.name AS event_name
@@ -9527,6 +9620,7 @@ export async function createEventYearLevelExemptions(input: {
   reason?: unknown;
   schoolYearId?: unknown;
   createdBy?: unknown;
+  onProgress?: (progress: SaveEventExemptionsProgress) => void;
 }) {
   const requestedYearLevels = Array.isArray(input.yearLevels)
     ? uniqueCleanTextValues(input.yearLevels.map(String))
@@ -9550,7 +9644,25 @@ export async function createEventYearLevelExemptions(input: {
   if (!schoolYearId) throw createValidationError("School year is required.");
   if (!eventIds.length) throw createValidationError("Select at least one event.");
 
+  const emit = (progress: SaveEventExemptionsProgress) => {
+    input.onProgress?.(progress);
+  };
+  const totalExemptions = normalizedYearLevels.length * eventIds.length;
+
+  emit({
+    stage: "validating",
+    percent: 5,
+    message: `Validating ${normalizedYearLevels.length} year level${normalizedYearLevels.length === 1 ? "" : "s"} and ${eventIds.length} event${eventIds.length === 1 ? "" : "s"}.`,
+    completed: 0,
+    total: totalExemptions,
+  });
+
   return withTransaction(async (client) => {
+    emit({
+      stage: "waiting_for_lock",
+      percent: 10,
+      message: "Waiting for attendance recalculation access.",
+    });
     await lockAttendanceAbsenceSync(client);
     const eventResult = await client.query<{ id: string }>(
       `SELECT id FROM attendance_events WHERE id = ANY($1::uuid[]) AND school_year_id = $2`,
@@ -9560,9 +9672,17 @@ export async function createEventYearLevelExemptions(input: {
       throw createValidationError("One or more events do not belong to the selected school year.");
     }
 
+    let completedExemptions = 0;
     for (const yearLevelKey of normalizedYearLevels) {
       const yearLevelLabel = getCanonicalYearLevelLabel(yearLevelKey);
       for (const eventId of eventIds) {
+        emit({
+          stage: "saving_exemptions",
+          percent: 18 + Math.floor((completedExemptions / Math.max(totalExemptions, 1)) * 12),
+          message: `Saving ${yearLevelLabel} exemption ${completedExemptions + 1} of ${totalExemptions}.`,
+          completed: completedExemptions,
+          total: totalExemptions,
+        });
         const updated = await client.query(
           `
             UPDATE attendance_event_year_level_exemptions
@@ -9588,16 +9708,65 @@ export async function createEventYearLevelExemptions(input: {
             [schoolYearId, eventId, yearLevelKey, yearLevelLabel, collegeKey, collegeLabel, reason, createdBy],
           );
         }
+        completedExemptions += 1;
       }
     }
 
+    emit({
+      stage: "collecting_students",
+      percent: 32,
+      message: "Finding students affected by the new exemptions.",
+      completed: completedExemptions,
+      total: totalExemptions,
+    });
     const affectedStudentIds = new Set<string>();
     for (const yearLevelKey of normalizedYearLevels) {
       const studentIds = await getYearLevelStudentIds(client, yearLevelKey, schoolYearId, collegeKey);
       studentIds.forEach((studentId) => affectedStudentIds.add(studentId));
     }
+
+    emit({
+      stage: "syncing_absences",
+      percent: 40,
+      message: `Recalculating absences for ${affectedStudentIds.size} affected student${affectedStudentIds.size === 1 ? "" : "s"}.`,
+    });
     await syncAbsencesForStudents(client, Array.from(affectedStudentIds), schoolYearId);
-    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [schoolYearId]);
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+      client,
+      [schoolYearId],
+      (progress) => {
+        const progressMap = {
+          refreshing_final_results: {
+            percent: 56,
+            message: "Refreshing final attendance results.",
+          },
+          refreshing_calculations: {
+            percent: 72,
+            message: "Refreshing attendance calculations.",
+          },
+          refreshing_penalties: {
+            percent: 88,
+            message: "Refreshing fines and penalties.",
+          },
+        } as const;
+        const mapped = progressMap[progress.stage];
+        emit({
+          stage: progress.stage,
+          percent: mapped.percent,
+          message: mapped.message,
+          completed: progress.scopeIndex,
+          total: progress.scopeTotal,
+        });
+      },
+    );
+
+    emit({
+      stage: "finalizing",
+      percent: 97,
+      message: "Finalizing saved year level exemptions.",
+      completed: totalExemptions,
+      total: totalExemptions,
+    });
 
     const saved = await client.query<EventYearLevelExemption>(`
       SELECT x.*, e.name AS event_name
