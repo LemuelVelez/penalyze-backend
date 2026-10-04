@@ -83,6 +83,7 @@ type SaveRowsInput = {
   eventDescription?: string;
   resumeImportId?: string;
   forceCreateEvent?: boolean;
+  allowExemptedRows?: boolean;
   mergeIntoEventId?: string;
   mergeIntoBatchIndex?: number;
   keepEventName?: "existing" | "incoming";
@@ -3282,7 +3283,9 @@ async function saveAttendanceRowsWithClient(
     }));
   const mergeResult = mergeAttendanceImportRowsByStudentAndEvent(validRows, input);
   const rowsToSave = mergeResult.rows;
-  await assertImportYearLevelsNotExempt(client, rowsToSave, defaultEvent, input);
+  if (!input.allowExemptedRows) {
+    await assertImportYearLevelsNotExempt(client, rowsToSave, defaultEvent, input);
+  }
   const stageCounts = {
     parsed: preview.rowsTotal,
     normalized: preview.rows.length,
@@ -3331,13 +3334,15 @@ async function saveAttendanceRowsWithClient(
       row.studentId,
       row.college,
     );
-    await assertEventCollegeNotExempt(
-      client,
-      event,
-      recordCollege,
-      row.yearLevel,
-      "Remove the exempted college or year-level rows from the attendance file or choose a different event.",
-    );
+    if (!input.allowExemptedRows) {
+      await assertEventCollegeNotExempt(
+        client,
+        event,
+        recordCollege,
+        row.yearLevel,
+        "Remove the exempted college or year-level rows from the attendance file or choose a different event.",
+      );
+    }
 
     await upsertStudent(client, row);
     const record = await insertAttendanceRecord(

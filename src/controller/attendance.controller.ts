@@ -227,6 +227,7 @@ function getEventPayload(req: Request) {
     mergeIntoEventId: req.body?.mergeIntoEventId,
     mergeIntoBatchIndex: parseOptionalIndex(req.body?.mergeIntoBatchIndex),
     forceCreateEvent: parseOptionalBoolean(req.body?.forceCreateEvent),
+    allowExemptedRows: parseOptionalBoolean(req.body?.allowExemptedRows),
     keepEventName: req.body?.keepEventName,
     keepEventSchedule: req.body?.keepEventSchedule,
   };
@@ -284,6 +285,9 @@ function getEventPayloadForFile(
     forceCreateEvent:
       parseOptionalBoolean(filePayload.forceCreateEvent) ??
       commonPayload.forceCreateEvent,
+    allowExemptedRows:
+      parseOptionalBoolean(filePayload.allowExemptedRows) ??
+      commonPayload.allowExemptedRows,
     keepEventName: filePayload.keepEventName ?? commonPayload.keepEventName,
     keepEventSchedule:
       filePayload.keepEventSchedule ?? commonPayload.keepEventSchedule,
