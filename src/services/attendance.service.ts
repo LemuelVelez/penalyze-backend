@@ -6585,9 +6585,7 @@ async function refreshCalculationResultsWithClient(
 
   await client.query(
     `
-      WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
-      ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
-      canonical_students AS (
+      WITH canonical_students AS (
         SELECT DISTINCT ON (LOWER(TRIM(student_id)))
           id,
           student_id,
@@ -6605,8 +6603,157 @@ async function refreshCalculationResultsWithClient(
           updated_at DESC,
           created_at DESC,
           id DESC
-      ),
-      selected_imported_records AS (
+      ), calculation_year_level_candidates AS MATERIALIZED (
+        SELECT
+          ar.school_year_id,
+          LOWER(TRIM(ar.student_id)) AS normalized_student_id,
+          ${getYearLevelKeySql("ar.year_level")} AS year_level_key,
+          COALESCE(ar.scanned_at, ar.updated_at, ar.created_at) AS sort_at,
+          ar.updated_at,
+          ar.created_at,
+          ar.id
+        FROM attendance_records ar
+        WHERE ar.deleted_at IS NULL
+          AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
+          AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+
+        UNION ALL
+
+        SELECT
+          mar.school_year_id,
+          LOWER(TRIM(mar.student_id)) AS normalized_student_id,
+          ${getYearLevelKeySql("mar.year_level")} AS year_level_key,
+          COALESCE(mar.scanned_at, mar.updated_at, mar.created_at) AS sort_at,
+          mar.updated_at,
+          mar.created_at,
+          mar.id
+        FROM manual_attendance_records mar
+        WHERE NULLIF(TRIM(mar.student_id), '') IS NOT NULL
+          AND ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+      ), calculation_latest_year_levels AS MATERIALIZED (
+        SELECT DISTINCT ON (school_year_id, normalized_student_id)
+          school_year_id,
+          normalized_student_id,
+          year_level_key
+        FROM calculation_year_level_candidates
+        WHERE year_level_key IS NOT NULL
+        ORDER BY
+          school_year_id,
+          normalized_student_id,
+          sort_at DESC NULLS LAST,
+          updated_at DESC,
+          created_at DESC,
+          id DESC
+      ), calculation_resolved_year_levels AS MATERIALIZED (
+        SELECT
+          keys.school_year_id,
+          keys.normalized_student_id,
+          COALESCE(
+            latest.year_level_key,
+            ${getYearLevelKeySql("student.year_level")}
+          ) AS year_level_key
+        FROM (
+          SELECT DISTINCT school_year_id, normalized_student_id
+          FROM calculation_year_level_candidates
+        ) keys
+        LEFT JOIN calculation_latest_year_levels latest
+          ON latest.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND latest.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN canonical_students student
+          ON LOWER(TRIM(student.student_id)) = keys.normalized_student_id
+      ), event_participation AS MATERIALIZED (
+        SELECT DISTINCT
+          ar.school_year_id,
+          COALESCE(ar.event_id, ai.event_id) AS event_id,
+          LOWER(TRIM(ar.student_id)) AS normalized_student_id
+        FROM attendance_records ar
+        LEFT JOIN attendance_imports ai
+          ON ai.id = ar.import_id
+         AND ai.deleted_at IS NULL
+        LEFT JOIN canonical_students participation_student
+          ON LOWER(TRIM(participation_student.student_id)) = LOWER(TRIM(ar.student_id))
+        LEFT JOIN calculation_resolved_year_levels participation_year_level
+          ON participation_year_level.school_year_id IS NOT DISTINCT FROM ar.school_year_id
+         AND participation_year_level.normalized_student_id = LOWER(TRIM(ar.student_id))
+        WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+          AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
+          AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
+          AND ${getEventStudentExemptionFilterSql(
+            "COALESCE(ar.event_id, ai.event_id)",
+            "participation_year_level.year_level_key",
+            getCanonicalCollegeKeySql("ar", "participation_student"),
+          )}
+
+        UNION
+
+        SELECT DISTINCT
+          mar.school_year_id,
+          mar.event_id,
+          LOWER(TRIM(mar.student_id)) AS normalized_student_id
+        FROM manual_attendance_records mar
+        LEFT JOIN canonical_students participation_manual_student
+          ON LOWER(TRIM(participation_manual_student.student_id)) = LOWER(TRIM(mar.student_id))
+        LEFT JOIN calculation_resolved_year_levels participation_manual_year_level
+          ON participation_manual_year_level.school_year_id IS NOT DISTINCT FROM mar.school_year_id
+         AND participation_manual_year_level.normalized_student_id = LOWER(TRIM(mar.student_id))
+        WHERE mar.event_id IS NOT NULL
+          AND ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+          AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+          AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
+          AND ${getEventStudentExemptionFilterSql(
+            "mar.event_id",
+            "participation_manual_year_level.year_level_key",
+            getCanonicalCollegeKeySql("mar", "participation_manual_student"),
+          )}
+      ), event_roster_scope AS MATERIALIZED (
+        SELECT DISTINCT
+          ar.school_year_id,
+          COALESCE(ar.event_id, ai.event_id) AS event_id,
+          ${getCanonicalCollegeKeySql("ar", "roster_student")} AS college_key
+        FROM attendance_records ar
+        LEFT JOIN attendance_imports ai
+          ON ai.id = ar.import_id
+         AND ai.deleted_at IS NULL
+        LEFT JOIN canonical_students roster_student
+          ON LOWER(TRIM(roster_student.student_id)) = LOWER(TRIM(ar.student_id))
+        LEFT JOIN calculation_resolved_year_levels roster_year_level
+          ON roster_year_level.school_year_id IS NOT DISTINCT FROM ar.school_year_id
+         AND roster_year_level.normalized_student_id = LOWER(TRIM(ar.student_id))
+        WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+          AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
+          AND ${getCanonicalCollegeKeySql("ar", "roster_student")} IS NOT NULL
+          AND ${getEventStudentExemptionFilterSql(
+            "COALESCE(ar.event_id, ai.event_id)",
+            "roster_year_level.year_level_key",
+            getCanonicalCollegeKeySql("ar", "roster_student"),
+          )}
+
+        UNION
+
+        SELECT DISTINCT
+          mar.school_year_id,
+          mar.event_id,
+          ${getCanonicalCollegeKeySql("mar", "roster_manual_student")} AS college_key
+        FROM manual_attendance_records mar
+        LEFT JOIN canonical_students roster_manual_student
+          ON LOWER(TRIM(roster_manual_student.student_id)) = LOWER(TRIM(mar.student_id))
+        LEFT JOIN calculation_resolved_year_levels roster_manual_year_level
+          ON roster_manual_year_level.school_year_id IS NOT DISTINCT FROM mar.school_year_id
+         AND roster_manual_year_level.normalized_student_id = LOWER(TRIM(mar.student_id))
+        WHERE mar.event_id IS NOT NULL
+          AND ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+          AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+          AND ${getCanonicalCollegeKeySql("mar", "roster_manual_student")} IS NOT NULL
+          AND ${getEventStudentExemptionFilterSql(
+            "mar.event_id",
+            "roster_manual_year_level.year_level_key",
+            getCanonicalCollegeKeySql("mar", "roster_manual_student"),
+          )}
+      ), selected_imported_records AS (
         SELECT
           ar.school_year_id,
           ar.import_id,
@@ -6665,7 +6812,7 @@ async function refreshCalculationResultsWithClient(
             WHEN COALESCE(ar.event_id, ai.event_id) IS NOT NULL
               AND NOT (${getEventStudentExemptionFilterSql(
                 "COALESCE(ar.event_id, ai.event_id)",
-                getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
+                "imported_year_level.year_level_key",
                 getCanonicalCollegeKeySql("ar", "s"),
               )})
             THEN NULL
@@ -6679,6 +6826,9 @@ async function refreshCalculationResultsWithClient(
           ON ai.id = ar.import_id
          AND ai.deleted_at IS NULL
         LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+        LEFT JOIN calculation_resolved_year_levels imported_year_level
+          ON imported_year_level.school_year_id IS NOT DISTINCT FROM ar.school_year_id
+         AND imported_year_level.normalized_student_id = LOWER(TRIM(ar.student_id))
         WHERE ${getAttendanceRecordVisibilitySql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
       ), all_manual_records AS (
@@ -6699,7 +6849,7 @@ async function refreshCalculationResultsWithClient(
                 mar.event_id IS NOT NULL
                 AND NOT (${getEventStudentExemptionFilterSql(
                   "mar.event_id",
-                  getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
+                  "manual_year_level.year_level_key",
                   getCanonicalCollegeKeySql("mar", "s"),
                 )})
               )
@@ -6711,6 +6861,9 @@ async function refreshCalculationResultsWithClient(
           mar.updated_at
         FROM manual_attendance_records mar
         LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
+        LEFT JOIN calculation_resolved_year_levels manual_year_level
+          ON manual_year_level.school_year_id IS NOT DISTINCT FROM mar.school_year_id
+         AND manual_year_level.normalized_student_id = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
       ), imported_totals AS (
         SELECT
@@ -6769,13 +6922,13 @@ async function refreshCalculationResultsWithClient(
               THEN colleges.college_key
             ELSE NULL
           END AS college_key,
-          ${getResolvedStudentYearLevelKeySql(
-            "keys.normalized_student_id",
-            "keys.school_year_id",
-          )} AS year_level_key
+          resolved_year_level.year_level_key
         FROM selected_student_keys keys
         LEFT JOIN canonical_students s
           ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
+        LEFT JOIN calculation_resolved_year_levels resolved_year_level
+          ON resolved_year_level.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND resolved_year_level.normalized_student_id = keys.normalized_student_id
         LEFT JOIN student_college_totals colleges
           ON colleges.school_year_id IS NOT DISTINCT FROM keys.school_year_id
          AND colleges.normalized_student_id = keys.normalized_student_id
@@ -7346,9 +7499,17 @@ async function prepareCalculationPreviewTable(client: PoolClient) {
   // application during a deployment. The unique index is required by the
   // engine's ON CONFLICT target.
   await client.query(`
-    CREATE TEMP TABLE calculation_results
-    (LIKE public.calculation_results INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY)
-    ON COMMIT DROP
+    CREATE TEMP TABLE calculation_results ON COMMIT DROP AS
+    SELECT *
+    FROM public.calculation_results
+    WITH NO DATA
+  `);
+
+  await client.query(`
+    ALTER TABLE calculation_results
+      ALTER COLUMN id SET DEFAULT gen_random_uuid(),
+      ALTER COLUMN created_at SET DEFAULT NOW(),
+      ALTER COLUMN updated_at SET DEFAULT NOW()
   `);
 
   await client.query(`
@@ -7377,7 +7538,19 @@ export async function previewCalculationResults(
 
   try {
     await client.query("BEGIN");
-    await prepareCalculationPreviewTable(client);
+
+    try {
+      await prepareCalculationPreviewTable(client);
+    } catch (previewTableError) {
+      // Some managed PostgreSQL roles disallow temporary tables. Preview still
+      // remains safe because the fallback transaction is always rolled back.
+      await client.query("ROLLBACK");
+      console.warn(
+        "Calculation preview temp table is unavailable; using rollback-only preview:",
+        previewTableError,
+      );
+      await client.query("BEGIN");
+    }
 
     const importIds = normalizeImportIds(options.importIds ?? []);
     const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
@@ -7395,6 +7568,23 @@ export async function previewCalculationResults(
     } catch (rollbackError) {
       console.error("Failed to rollback calculation preview transaction:", rollbackError);
     }
+
+    const databaseError = error as {
+      code?: unknown;
+      detail?: unknown;
+      constraint?: unknown;
+      table?: unknown;
+    };
+    console.error("Calculation preview failed:", {
+      code: databaseError?.code ?? null,
+      message: error instanceof Error ? error.message : String(error),
+      detail: databaseError?.detail ?? null,
+      constraint: databaseError?.constraint ?? null,
+      table: databaseError?.table ?? null,
+      schoolYearId: cleanText(options.schoolYearId) || null,
+      importCount: normalizeImportIds(options.importIds ?? []).length,
+      sourceTypes: normalizeCalculationSourceTypes(options.sourceTypes ?? []),
+    });
 
     throw error;
   } finally {
