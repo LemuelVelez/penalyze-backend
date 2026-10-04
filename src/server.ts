@@ -20,6 +20,7 @@ import {
   publicStudentRequests as publicAttendanceStudentRequests,
   removeRequestEvent as removeAttendanceRequestEvent,
   reviewRequest as reviewAttendanceRequest,
+  reviewRequestWithProgress as reviewAttendanceRequestWithProgress,
 } from "./controller/attendance-requests.controller";
 import {
   attendanceUpload,
@@ -46,6 +47,7 @@ import {
   mergeEvents as mergeAttendanceEvents,
   removeEventExemption as removeAttendanceEventExemption,
   removeEventExemptionsBulk as removeAttendanceEventExemptionsBulk,
+  removeSelectedEventExemptionsWithProgress as removeSelectedAttendanceEventExemptionsWithProgress,
   removeEventYearLevelExemption as removeAttendanceEventYearLevelExemption,
   removeEventYearLevelExemptionsBulk as removeAttendanceEventYearLevelExemptionsBulk,
   finalResults as attendanceFinalResults,
@@ -250,6 +252,11 @@ app.patch(
   requireAuth,
   reviewAttendanceRequest,
 );
+app.patch(
+  "/api/attendance/requests/:id/review/progress",
+  requireAuth,
+  reviewAttendanceRequestWithProgress,
+);
 app.delete(
   "/api/attendance/requests/:id/events/:eventId",
   requireAuth,
@@ -261,6 +268,12 @@ app.get("/api/attendance/event-exemptions", requireAuth, attendanceEventExemptio
 app.post("/api/attendance/event-exemptions/impact", requireAuth, requireAdmin, attendanceEventExemptionImpact);
 app.post("/api/attendance/event-exemptions", requireAuth, requireAdmin, saveAttendanceEventExemptions);
 app.post("/api/attendance/event-exemptions/bulk-delete", requireAuth, requireAdmin, removeAttendanceEventExemptionsBulk);
+app.post(
+  "/api/attendance/event-exemptions/remove-selected/progress",
+  requireAuth,
+  requireAdmin,
+  removeSelectedAttendanceEventExemptionsWithProgress,
+);
 app.delete("/api/attendance/event-exemptions/:id", requireAuth, requireAdmin, removeAttendanceEventExemption);
 
 app.get("/api/attendance/event-year-level-exemptions", requireAuth, attendanceEventYearLevelExemptions);

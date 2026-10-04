@@ -8,6 +8,7 @@ import {
   deleteAttendanceEvent,
   deleteEventCollegeExemption,
   deleteEventCollegeExemptionsBulk,
+  deleteEventExemptionsByIds,
   deleteEventYearLevelExemption,
   deleteEventYearLevelExemptionsBulk,
   deleteAttendanceFinalResultsByIds,
@@ -57,6 +58,7 @@ import {
   AttendanceImportProgress,
 } from "../database/model/schema.model";
 import type { AuthenticatedRequest } from "./auth.controller";
+import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
 
 const MAX_FILE_SIZE = Number(
   process.env.ATTENDANCE_UPLOAD_MAX_BYTES ?? 10 * 1024 * 1024,
@@ -288,33 +290,8 @@ function getEventPayloadForFile(
   };
 }
 
-type AttendanceImportProgressStreamMessage =
-  | { type: "progress"; progress: AttendanceImportProgress }
-  | { type: "success"; message: string; data: unknown }
-  | { type: "error"; message: string };
-
 function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
-}
-
-function prepareProgressStream(res: Response) {
-  res.status(201);
-  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-
-  if (typeof res.flushHeaders === "function") {
-    res.flushHeaders();
-  }
-}
-
-function writeProgressStreamMessage(
-  res: Response,
-  message: AttendanceImportProgressStreamMessage,
-) {
-  if (res.destroyed || res.writableEnded) return;
-  res.write(`${JSON.stringify(message)}\n`);
 }
 
 export async function colleges(req: Request, res: Response, next: NextFunction) {
@@ -377,6 +354,41 @@ export async function removeEventExemption(req: Request, res: Response, next: Ne
     const data = await deleteEventCollegeExemption(id);
     res.json({ message: "College exemption removed and fines recalculated.", data });
   } catch (error) {
+    next(error);
+  }
+}
+
+export async function removeSelectedEventExemptionsWithProgress(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    prepareProgressStream(res, 200);
+    const data = await deleteEventExemptionsByIds({
+      ...(req.body ?? {}),
+      onProgress: (progress) => {
+        writeProgressStreamMessage(res, { type: "progress", progress });
+      },
+    });
+
+    writeProgressStreamMessage(res, {
+      type: "success",
+      message: "Selected exemptions removed and fines recalculated.",
+      data,
+    });
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      res.locals.auditOutcome = "failed";
+      writeProgressStreamMessage(res, {
+        type: "error",
+        message: getErrorMessage(error, "Unable to remove selected exemptions."),
+      });
+      res.end();
+      return;
+    }
+
     next(error);
   }
 }
@@ -771,7 +783,7 @@ export async function saveImportWithProgress(
       return;
     }
 
-    prepareProgressStream(res);
+    prepareProgressStream(res, 201);
 
     const isCancelled = () =>
       clientCancelled || res.destroyed || res.writableEnded;
@@ -835,6 +847,7 @@ export async function saveImportWithProgress(
     res.end();
   } catch (error) {
     if (res.headersSent) {
+      res.locals.auditOutcome = "failed";
       writeProgressStreamMessage(res, {
         type: "error",
         message: getErrorMessage(error, "Unable to save attendance import."),

@@ -13,6 +13,7 @@ import {
   getEventYearLevelExemptionFilterSql,
   normalizeCollegeKey,
   normalizeYearLevelKey,
+  lockAttendanceAbsenceSync,
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
   syncAbsencesForStudents,
 } from "./attendance.service";
@@ -47,6 +48,28 @@ export type AttendanceRequestReviewInput = {
   status?: unknown;
   reviewNote?: unknown;
 };
+
+export type AttendanceRequestReviewProgress = {
+  stage:
+    | "validating"
+    | "resolving_events"
+    | "adding_attendance"
+    | "waiting_for_lock"
+    | "syncing_absences"
+    | "updating_records"
+    | "refreshing_final_results"
+    | "refreshing_calculations"
+    | "refreshing_penalties"
+    | "finalizing";
+  percent: number;
+  message: string;
+  completed?: number;
+  total?: number;
+};
+
+type AttendanceRequestReviewProgressCallback = (
+  progress: AttendanceRequestReviewProgress,
+) => void;
 
 type AttendanceRequestView = AttendanceRequestRecord & {
   school_year_name: string;
@@ -698,6 +721,11 @@ async function addApprovedManualAttendance(
   client: PoolClient,
   request: AttendanceRequestRecord,
   events: AttendanceRequestEventWithSchoolYear[],
+  onEventProgress?: (
+    event: AttendanceRequestEventWithSchoolYear,
+    index: number,
+    total: number,
+  ) => void,
 ) {
   const studentId = cleanText(request.student_id);
   const studentValues = [
@@ -755,7 +783,9 @@ async function addApprovedManualAttendance(
 
   let createdAttendanceCount = 0;
 
-  for (const event of events) {
+  for (let eventIndex = 0; eventIndex < events.length; eventIndex += 1) {
+    const event = events[eventIndex];
+    onEventProgress?.(event, eventIndex + 1, events.length);
     if (!event.event_id || event.school_year_id !== request.school_year_id) {
       throw createHttpError(
         `The requested event “${event.event_name}” is no longer available in this school year / semester. Reject the request or restore the event before approving it.`,
@@ -1198,6 +1228,7 @@ async function resolveRequestEventsForApproval(
 async function applyApprovedDetailsCorrection(
   client: PoolClient,
   request: AttendanceRequestRecord,
+  onProgress?: AttendanceRequestReviewProgressCallback,
 ) {
   const studentId = cleanText(request.student_id);
   const requestedName = cleanText(request.name);
@@ -1234,6 +1265,12 @@ async function applyApprovedDetailsCorrection(
     [studentId, request.school_year_id],
   );
   const schoolYearIds = schoolYearResult.rows.map((row) => row.school_year_id);
+
+  onProgress?.({
+    stage: "updating_records",
+    percent: 14,
+    message: "Updating student details across attendance records.",
+  });
 
   let updatedRowCount = 0;
 
@@ -1306,23 +1343,93 @@ async function applyApprovedDetailsCorrection(
     updatedRowCount += result.rowCount ?? 0;
   }
 
-  if (schoolYearIds.length) {
-    for (const schoolYearId of schoolYearIds) {
-      await syncAbsencesForStudents(client, [studentId], schoolYearId);
-    }
+  const scopeTotal = schoolYearIds.length;
+  const scopeSpan = scopeTotal ? 72 / scopeTotal : 0;
+
+  for (let index = 0; index < schoolYearIds.length; index += 1) {
+    const schoolYearId = schoolYearIds[index];
+    const completed = index + 1;
+    const basePercent = 20 + index * scopeSpan;
+    const scopeLabel = `(${completed} of ${scopeTotal})`;
+
+    onProgress?.({
+      stage: "syncing_absences",
+      percent: Math.round(basePercent),
+      message: `Syncing absences ${scopeLabel}.`,
+      completed,
+      total: scopeTotal,
+    });
+    await lockAttendanceAbsenceSync(client);
+    await syncAbsencesForStudents(client, [studentId], schoolYearId);
+
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
       client,
-      schoolYearIds,
+      [schoolYearId],
+      (progress) => {
+        const offsets = {
+          refreshing_final_results: 0.28,
+          refreshing_calculations: 0.56,
+          refreshing_penalties: 0.8,
+        } as const;
+        const labels = {
+          refreshing_final_results: "Refreshing final attendance results",
+          refreshing_calculations: "Refreshing attendance calculations",
+          refreshing_penalties: "Refreshing fines and penalties",
+        } as const;
+
+        onProgress?.({
+          stage: progress.stage,
+          percent: Math.round(basePercent + scopeSpan * offsets[progress.stage]),
+          message: `${labels[progress.stage]} ${scopeLabel}.`,
+          completed,
+          total: scopeTotal,
+        });
+      },
     );
   }
 
   return updatedRowCount;
 }
 
+export async function preflightAttendanceRequestReview(
+  requestIdValue: unknown,
+  reviewerIdValue: unknown,
+  input: AttendanceRequestReviewInput,
+) {
+  const requestId = cleanText(requestIdValue);
+  const reviewerId = cleanText(reviewerIdValue);
+  normalizeRequestStatus(input.status, false);
+
+  if (!requestId) throw createHttpError("Attendance request ID is required.");
+  if (!isUuid(requestId)) throw createHttpError("Attendance request ID is invalid.");
+  if (!reviewerId) throw createHttpError("Authenticated reviewer is required.", 401);
+
+  const [reviewerResult, requestResult] = await Promise.all([
+    query<{ id: string }>(`SELECT id FROM users WHERE id = $1 LIMIT 1`, [reviewerId]),
+    query<Pick<AttendanceRequestRecord, "id" | "status" | "request_type">>(
+      `SELECT id, status, request_type FROM attendance_requests WHERE id = $1 LIMIT 1`,
+      [requestId],
+    ),
+  ]);
+
+  if (!reviewerResult.rows[0]) {
+    throw createHttpError("Authenticated reviewer account was not found.", 401);
+  }
+
+  const request = requestResult.rows[0];
+  if (!request) throw createHttpError("Attendance request not found.", 404);
+  if (request.status !== "pending") {
+    throw createHttpError("This attendance request has already been reviewed.", 409);
+  }
+
+  return request;
+}
+
 export async function reviewAttendanceRequest(
   requestIdValue: unknown,
   reviewerIdValue: unknown,
   input: AttendanceRequestReviewInput,
+  onProgress?: AttendanceRequestReviewProgressCallback,
 ) {
   const requestId = cleanText(requestIdValue);
   const reviewerId = cleanText(reviewerIdValue);
@@ -1332,6 +1439,25 @@ export async function reviewAttendanceRequest(
   if (!requestId) throw createHttpError("Attendance request ID is required.");
   if (!isUuid(requestId)) throw createHttpError("Attendance request ID is invalid.");
   if (!reviewerId) throw createHttpError("Authenticated reviewer is required.", 401);
+
+  let lastProgressPercent = 0;
+  const emit = (
+    progress: Omit<AttendanceRequestReviewProgress, "percent"> & { percent: number },
+  ) => {
+    if (!onProgress) return;
+    const percent = Math.max(
+      lastProgressPercent,
+      Math.min(100, Math.round(progress.percent)),
+    );
+    lastProgressPercent = percent;
+    onProgress({ ...progress, percent });
+  };
+
+  emit({
+    stage: "validating",
+    percent: 4,
+    message: "Validating the attendance request and reviewer.",
+  });
 
   const result = await withTransaction(async (client) => {
     const reviewerResult = await client.query<{ id: string }>(
@@ -1356,24 +1482,94 @@ export async function reviewAttendanceRequest(
     let updatedRowCount = 0;
     if (status === "approved") {
       if (request.request_type === "details_correction") {
-        updatedRowCount = await applyApprovedDetailsCorrection(client, request);
+        updatedRowCount = await applyApprovedDetailsCorrection(
+          client,
+          request,
+          emit,
+        );
       } else {
+        emit({
+          stage: "resolving_events",
+          percent: 12,
+          message: "Resolving requested events and checking exemptions.",
+        });
         const resolvedEvents = await resolveRequestEventsForApproval(client, request);
+
         createdAttendanceCount = await addApprovedManualAttendance(
           client,
           request,
           resolvedEvents,
+          (event, index, total) => {
+            const eventPercent = total
+              ? 17 + (index / total) * 17
+              : 34;
+            emit({
+              stage: "adding_attendance",
+              percent: eventPercent,
+              message: `Adding event ${index} of ${total}: ${event.event_name}`,
+              completed: index,
+              total,
+            });
+          },
         );
+
+        emit({
+          stage: "waiting_for_lock",
+          percent: 36,
+          message: "Waiting for attendance recalculation access.",
+        });
+        await lockAttendanceAbsenceSync(client);
+
+        emit({
+          stage: "syncing_absences",
+          percent: 42,
+          message: "Recalculating the student's absences.",
+        });
         await syncAbsencesForStudents(
           client,
           [request.student_id],
           request.school_year_id,
         );
-        await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
-          request.school_year_id,
-        ]);
+
+        await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+          client,
+          [request.school_year_id],
+          (progress) => {
+            const progressMap = {
+              refreshing_final_results: {
+                percent: 54,
+                message: "Refreshing final attendance results.",
+              },
+              refreshing_calculations: {
+                percent: 72,
+                message: "Refreshing attendance calculations.",
+              },
+              refreshing_penalties: {
+                percent: 89,
+                message: "Refreshing fines and penalties.",
+              },
+            } as const;
+            const mapped = progressMap[progress.stage];
+            emit({
+              stage: progress.stage,
+              percent: mapped.percent,
+              message: mapped.message,
+              completed: progress.scopeIndex,
+              total: progress.scopeTotal,
+            });
+          },
+        );
       }
     }
+
+    emit({
+      stage: "finalizing",
+      percent: status === "approved" ? 96 : 90,
+      message:
+        status === "approved"
+          ? "Finalizing the approved request."
+          : "Finalizing the rejected request.",
+    });
 
     await client.query(
       `
@@ -1392,7 +1588,20 @@ export async function reviewAttendanceRequest(
     return { createdAttendanceCount, updatedRowCount, requestType: request.request_type };
   });
 
+  emit({
+    stage: "finalizing",
+    percent: 98,
+    message: "Request saved. Loading the updated request.",
+  });
+
   const request = await getRequestViewById(requestId);
+
+  emit({
+    stage: "finalizing",
+    percent: 100,
+    message: "Attendance request review completed.",
+  });
+
   return result.requestType === "details_correction"
     ? { request, updatedRowCount: result.updatedRowCount }
     : { request, createdAttendanceCount: result.createdAttendanceCount };

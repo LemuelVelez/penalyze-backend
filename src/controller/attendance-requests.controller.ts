@@ -6,8 +6,10 @@ import {
   listAttendanceRequests,
   listPublicAttendanceRequestsForStudent,
   removeAttendanceRequestEvent,
+  preflightAttendanceRequestReview,
   reviewAttendanceRequest,
 } from "../services/attendance-requests.service";
+import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
 
 export async function createRequest(
   req: Request,
@@ -64,6 +66,16 @@ export async function requests(
   }
 }
 
+function getReviewSuccessMessage(result: Awaited<ReturnType<typeof reviewAttendanceRequest>>) {
+  return result.request?.request_type === "details_correction"
+    ? result.request.status === "approved"
+      ? "Details correction request approved."
+      : "Details correction request rejected."
+    : result.request?.status === "approved"
+      ? "Attendance request approved."
+      : "Attendance request rejected.";
+}
+
 export async function reviewRequest(
   req: AuthenticatedRequest,
   res: Response,
@@ -79,17 +91,60 @@ export async function reviewRequest(
       res.locals.auditAttendanceRequestType = result.request.request_type;
     }
     res.json({
-      message:
-        result.request?.request_type === "details_correction"
-          ? result.request.status === "approved"
-            ? "Details correction request approved."
-            : "Details correction request rejected."
-          : result.request?.status === "approved"
-            ? "Attendance request approved."
-            : "Attendance request rejected.",
+      message: getReviewSuccessMessage(result),
       data: result,
     });
   } catch (error) {
+    next(error);
+  }
+}
+
+export async function reviewRequestWithProgress(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const preflight = await preflightAttendanceRequestReview(
+      req.params.id,
+      req.user?.sub,
+      req.body ?? {},
+    );
+    res.locals.auditAttendanceRequestType = preflight.request_type;
+
+    prepareProgressStream(res, 200);
+    const result = await reviewAttendanceRequest(
+      req.params.id,
+      req.user?.sub,
+      req.body ?? {},
+      (progress) => {
+        writeProgressStreamMessage(res, { type: "progress", progress });
+      },
+    );
+
+    if (result.request) {
+      res.locals.auditAttendanceRequestType = result.request.request_type;
+    }
+    writeProgressStreamMessage(res, {
+      type: "success",
+      message: getReviewSuccessMessage(result),
+      data: result,
+    });
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      res.locals.auditOutcome = "failed";
+      writeProgressStreamMessage(res, {
+        type: "error",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Unable to review attendance request.",
+      });
+      res.end();
+      return;
+    }
+
     next(error);
   }
 }

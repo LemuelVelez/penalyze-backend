@@ -61,10 +61,11 @@ function getAuditContext(method: string, path: string): AuditContext {
     { matches: (m, p) => m === "DELETE" && p.endsWith("/records"), action: "Deleted school year records", resourceType: "school year records" },
     { matches: (m, p) => m === "DELETE" && /^\/api\/school-years\//.test(p), action: "Deleted school year", resourceType: "school year" },
     { matches: (m, p) => m === "POST" && p === "/api/attendance/requests", action: "Submitted attendance request", resourceType: "attendance request" },
-    { matches: (m, p) => m === "PATCH" && p.endsWith("/review"), action: "Reviewed attendance request", resourceType: "attendance request" },
+    { matches: (m, p) => m === "PATCH" && (p.endsWith("/review") || p.endsWith("/review/progress")), action: "Reviewed attendance request", resourceType: "attendance request" },
     { matches: (m, p) => m === "DELETE" && /^\/api\/attendance\/requests\/[^/]+\/events\/[^/]+$/.test(p), action: "Removed event from attendance request", resourceType: "attendance request" },
     { matches: (m, p) => m === "POST" && p === "/api/attendance/event-exemptions", action: "Created attendance event college exemptions", resourceType: "attendance event college exemption" },
     { matches: (m, p) => m === "POST" && p === "/api/attendance/event-exemptions/bulk-delete", action: "Removed attendance event college exemptions (bulk)", resourceType: "attendance event college exemption" },
+    { matches: (m, p) => m === "POST" && p === "/api/attendance/event-exemptions/remove-selected/progress", action: "Removed selected attendance event exemptions", resourceType: "attendance event exemption" },
     { matches: (m, p) => m === "DELETE" && /^\/api\/attendance\/event-exemptions\//.test(p), action: "Removed attendance event college exemption", resourceType: "attendance event college exemption" },
     { matches: (m, p) => m === "POST" && p === "/api/attendance/event-year-level-exemptions/impact", action: "Previewed attendance event year level exemption impact", resourceType: "attendance event year level exemption" },
     { matches: (m, p) => m === "POST" && p === "/api/attendance/event-year-level-exemptions", action: "Created attendance event year level exemptions", resourceType: "attendance event year level exemption" },
@@ -257,7 +258,7 @@ export function auditMutation(req: AuthenticatedRequest, res: Response, next: Ne
     if (attendanceRequestType === "details_correction") {
       if (req.method.toUpperCase() === "POST" && path === "/api/attendance/requests") {
         context.action = "Submitted details correction request";
-      } else if (req.method.toUpperCase() === "PATCH" && path.endsWith("/review")) {
+      } else if (req.method.toUpperCase() === "PATCH" && (path.endsWith("/review") || path.endsWith("/review/progress"))) {
         context.action = "Reviewed details correction request";
       }
     }
@@ -270,7 +271,12 @@ export function auditMutation(req: AuthenticatedRequest, res: Response, next: Ne
         : null;
     const actor = req.user ?? responseActor;
     const details = {
-      outcome: res.statusCode >= 200 && res.statusCode < 400 ? "success" : "failed",
+      outcome:
+        res.locals.auditOutcome === "failed"
+          ? "failed"
+          : res.statusCode >= 200 && res.statusCode < 400
+            ? "success"
+            : "failed",
       durationMs: Date.now() - startedAt,
       ...(Object.keys(req.query ?? {}).length ? { query: sanitizeValue(req.query) } : {}),
       ...(req.body && Object.keys(req.body).length ? { body: sanitizeValue(req.body) } : {}),

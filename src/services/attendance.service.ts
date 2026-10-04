@@ -2359,9 +2359,17 @@ function uniqueCleanTextValues(values: Array<string | null | undefined>) {
   );
 }
 
+export type DerivedAttendanceRefreshProgress = {
+  stage: "refreshing_final_results" | "refreshing_calculations" | "refreshing_penalties";
+  schoolYearId?: string;
+  scopeIndex: number;
+  scopeTotal: number;
+};
+
 export async function refreshDerivedAttendanceResultsForSchoolYearsWithClient(
   client: PoolClient,
   schoolYearIds: Array<string | null | undefined>,
+  onProgress?: (progress: DerivedAttendanceRefreshProgress) => void,
 ) {
   const hasUnscopedSchoolYear = schoolYearIds.some(
     (schoolYearId) => !cleanText(schoolYearId),
@@ -2370,9 +2378,21 @@ export async function refreshDerivedAttendanceResultsForSchoolYearsWithClient(
     ? [undefined]
     : uniqueCleanTextValues(schoolYearIds).map((schoolYearId) => schoolYearId);
 
-  for (const schoolYearId of scopes) {
+  for (let scopeIndex = 0; scopeIndex < scopes.length; scopeIndex += 1) {
+    const schoolYearId = scopes[scopeIndex];
+    const progressBase = {
+      schoolYearId,
+      scopeIndex: scopeIndex + 1,
+      scopeTotal: scopes.length,
+    };
+
+    onProgress?.({ ...progressBase, stage: "refreshing_final_results" });
     await refreshAttendanceFinalResultsWithClient(client, { schoolYearId });
+
+    onProgress?.({ ...progressBase, stage: "refreshing_calculations" });
     await refreshCalculationResultsWithClient(client, { schoolYearId });
+
+    onProgress?.({ ...progressBase, stage: "refreshing_penalties" });
     await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
   }
 }
@@ -9165,6 +9185,246 @@ async function getYearLevelStudentIds(
   `, [yearLevelKey, schoolYearId, collegeKey ?? null]);
 
   return uniqueCleanTextValues(result.rows.map((row) => row.student_id));
+}
+
+export type RemoveSelectedEventExemptionsProgress = {
+  stage:
+    | "validating"
+    | "waiting_for_lock"
+    | "removing_exemptions"
+    | "syncing_absences"
+    | "refreshing_final_results"
+    | "refreshing_calculations"
+    | "refreshing_penalties"
+    | "finalizing";
+  percent: number;
+  message: string;
+  completed?: number;
+  total?: number;
+};
+
+export async function deleteEventExemptionsByIds(input: {
+  schoolYearId?: unknown;
+  collegeExemptionIds?: unknown;
+  yearLevelExemptionIds?: unknown;
+  onProgress?: (progress: RemoveSelectedEventExemptionsProgress) => void;
+}) {
+  const schoolYearId = cleanText(input.schoolYearId);
+  const collegeExemptionIds = Array.isArray(input.collegeExemptionIds)
+    ? uniqueCleanTextValues(input.collegeExemptionIds.map(String))
+    : [];
+  const yearLevelExemptionIds = Array.isArray(input.yearLevelExemptionIds)
+    ? uniqueCleanTextValues(input.yearLevelExemptionIds.map(String))
+    : [];
+  const allIds = [...collegeExemptionIds, ...yearLevelExemptionIds];
+
+  if (!schoolYearId || !isUuid(schoolYearId)) {
+    throw createValidationError("School year ID is invalid.");
+  }
+  if (!allIds.length) {
+    throw createValidationError("Select at least one exemption to remove.");
+  }
+  if (allIds.some((id) => !isUuid(id))) {
+    throw createValidationError("One or more exemption IDs are invalid.");
+  }
+
+  const emit = (progress: RemoveSelectedEventExemptionsProgress) => {
+    input.onProgress?.(progress);
+  };
+
+  emit({
+    stage: "validating",
+    percent: 5,
+    message: "Validating selected exemptions.",
+    completed: 0,
+    total: allIds.length,
+  });
+
+  const result = await withTransaction(async (client) => {
+    emit({
+      stage: "waiting_for_lock",
+      percent: 10,
+      message: "Waiting for attendance recalculation access.",
+    });
+    await lockAttendanceAbsenceSync(client);
+
+    const schoolYearResult = await client.query<{ id: string }>(
+      `SELECT id FROM school_years WHERE id = $1 LIMIT 1`,
+      [schoolYearId],
+    );
+    if (!schoolYearResult.rows[0]) {
+      throw createValidationError("School year not found.", 404);
+    }
+
+    const collegeRows = collegeExemptionIds.length
+      ? (
+          await client.query<EventCollegeExemption>(
+            `
+              SELECT x.*, e.name AS event_name
+              FROM attendance_event_college_exemptions x
+              JOIN attendance_events e ON e.id = x.event_id
+              WHERE x.id = ANY($1::uuid[])
+              FOR UPDATE OF x
+            `,
+            [collegeExemptionIds],
+          )
+        ).rows
+      : [];
+
+    const yearLevelRows = yearLevelExemptionIds.length
+      ? (
+          await client.query<EventYearLevelExemption>(
+            `
+              SELECT x.*, e.name AS event_name
+              FROM attendance_event_year_level_exemptions x
+              JOIN attendance_events e ON e.id = x.event_id
+              WHERE x.id = ANY($1::uuid[])
+              FOR UPDATE OF x
+            `,
+            [yearLevelExemptionIds],
+          )
+        ).rows
+      : [];
+
+    const foundCollegeIds = new Set(collegeRows.map((row) => row.id));
+    const foundYearLevelIds = new Set(yearLevelRows.map((row) => row.id));
+    const missingIds = [
+      ...collegeExemptionIds.filter((id) => !foundCollegeIds.has(id)),
+      ...yearLevelExemptionIds.filter((id) => !foundYearLevelIds.has(id)),
+    ];
+    if (missingIds.length) {
+      throw createValidationError(
+        `Selected exemption${missingIds.length === 1 ? "" : "s"} not found: ${missingIds.join(", ")}.`,
+        404,
+      );
+    }
+
+    const wrongSchoolYearIds = [
+      ...collegeRows
+        .filter((row) => row.school_year_id !== schoolYearId)
+        .map((row) => row.id),
+      ...yearLevelRows
+        .filter((row) => row.school_year_id !== schoolYearId)
+        .map((row) => row.id),
+    ];
+    if (wrongSchoolYearIds.length) {
+      throw createValidationError(
+        `Selected exemption${wrongSchoolYearIds.length === 1 ? "" : "s"} do not belong to the selected school year: ${wrongSchoolYearIds.join(", ")}.`,
+        409,
+      );
+    }
+
+    emit({
+      stage: "removing_exemptions",
+      percent: 24,
+      message: `Removing ${allIds.length} selected exemption${allIds.length === 1 ? "" : "s"}.`,
+      completed: 0,
+      total: allIds.length,
+    });
+
+    if (collegeExemptionIds.length) {
+      await client.query(
+        `DELETE FROM attendance_event_college_exemptions WHERE id = ANY($1::uuid[])`,
+        [collegeExemptionIds],
+      );
+    }
+    if (yearLevelExemptionIds.length) {
+      await client.query(
+        `DELETE FROM attendance_event_year_level_exemptions WHERE id = ANY($1::uuid[])`,
+        [yearLevelExemptionIds],
+      );
+    }
+
+    const affectedStudentIds = new Set<string>();
+    for (const collegeKey of Array.from(new Set(collegeRows.map((row) => row.college_key)))) {
+      const studentIds = await getCollegeStudentIds(client, collegeKey);
+      studentIds.forEach((studentId) => affectedStudentIds.add(studentId));
+    }
+
+    const yearLevelScopes = new Map<
+      string,
+      { yearLevelKey: string; collegeKey: string | null }
+    >();
+    for (const row of yearLevelRows) {
+      const scopeKey = `${row.year_level_key}\u0000${row.college_key ?? ""}`;
+      yearLevelScopes.set(scopeKey, {
+        yearLevelKey: row.year_level_key,
+        collegeKey: row.college_key,
+      });
+    }
+    for (const scope of yearLevelScopes.values()) {
+      const studentIds = await getYearLevelStudentIds(
+        client,
+        scope.yearLevelKey,
+        schoolYearId,
+        scope.collegeKey,
+      );
+      studentIds.forEach((studentId) => affectedStudentIds.add(studentId));
+    }
+
+    emit({
+      stage: "syncing_absences",
+      percent: 38,
+      message: `Recalculating absences for ${affectedStudentIds.size} affected student${affectedStudentIds.size === 1 ? "" : "s"}.`,
+    });
+    await syncAbsencesForStudents(
+      client,
+      Array.from(affectedStudentIds),
+      schoolYearId,
+    );
+
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+      client,
+      [schoolYearId],
+      (progress) => {
+        const progressMap = {
+          refreshing_final_results: {
+            percent: 54,
+            message: "Refreshing final attendance results.",
+          },
+          refreshing_calculations: {
+            percent: 72,
+            message: "Refreshing attendance calculations.",
+          },
+          refreshing_penalties: {
+            percent: 88,
+            message: "Refreshing fines and penalties.",
+          },
+        } as const;
+        const mapped = progressMap[progress.stage];
+        emit({
+          stage: progress.stage,
+          percent: mapped.percent,
+          message: mapped.message,
+          completed: progress.scopeIndex,
+          total: progress.scopeTotal,
+        });
+      },
+    );
+
+    emit({
+      stage: "finalizing",
+      percent: 97,
+      message: "Finalizing exemption removal.",
+      completed: allIds.length,
+      total: allIds.length,
+    });
+
+    return {
+      removedCollegeExemptions: collegeRows,
+      removedYearLevelExemptions: yearLevelRows,
+    };
+  });
+
+  emit({
+    stage: "finalizing",
+    percent: 100,
+    message: "Selected exemptions removed.",
+    completed: allIds.length,
+    total: allIds.length,
+  });
+
+  return result;
 }
 
 export async function getEventYearLevelExemptionImpact(input: {
