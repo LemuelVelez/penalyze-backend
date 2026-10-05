@@ -25,6 +25,7 @@ import {
 import {
   attendanceUpload,
   calculationResults as attendanceCalculationResults,
+  calculationPendingSummary as attendanceCalculationPendingSummary,
   calculationStatus as attendanceCalculationStatus,
   colleges as attendanceColleges,
   deleteCalculationResultRows as deleteAttendanceCalculationResults,
@@ -327,6 +328,10 @@ app.post(
   refreshAttendanceFinalResults,
 );
 app.get("/api/attendance/calculation-results", attendanceCalculationResults);
+app.get(
+  "/api/attendance/calculation-results/pending-summary",
+  attendanceCalculationPendingSummary,
+);
 app.post(
   "/api/attendance/calculation-results/status",
   attendanceCalculationStatus,

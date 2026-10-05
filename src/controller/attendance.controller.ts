@@ -28,6 +28,7 @@ import {
   deleteManualAttendanceRecordsBySchoolYear,
   getAttendanceImport,
   getCalculationStatus,
+  getCalculationPendingSummary,
   getEventCollegeExemptionImpact,
   getEventYearLevelExemptionImpact,
   listAttendanceEvents,
@@ -1042,6 +1043,24 @@ export async function refreshFinalResults(
     });
 
     res.json({ message: "Final attendance results refreshed.", data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function calculationPendingSummary(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const summary = await getCalculationPendingSummary(
+      req.query.schoolYearId
+        ? String(req.query.schoolYearId).trim()
+        : undefined,
+    );
+
+    res.json({ data: summary });
   } catch (error) {
     next(error);
   }
