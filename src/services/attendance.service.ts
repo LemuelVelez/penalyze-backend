@@ -4097,7 +4097,14 @@ async function upsertPenaltyResultForManualRecord(
   client: PoolClient,
   record: ManualAttendanceRecord,
 ) {
-  const noOfAbsences = Number(record.no_of_absences || 0);
+  const isEventAttendance =
+    Boolean(record.event_id) &&
+    record.attendance_type !== "zero_attendance" &&
+    cleanText(record.remarks).toLowerCase() !==
+      ZERO_ATTENDANCE_REMARK.toLowerCase();
+  const noOfAbsences = isEventAttendance
+    ? 0
+    : Number(record.no_of_absences || 0);
 
   if (noOfAbsences <= 0) {
     await client.query(
@@ -4184,7 +4191,10 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
           (input as Record<string, unknown>).school_year_id,
         [row.scannedAt],
       ));
-    const noOfAbsences = Math.max(0, Number(row.noOfAbsences ?? 0));
+    const noOfAbsences =
+      attendanceType === "manual" && event
+        ? 0
+        : Math.max(0, Number(row.noOfAbsences ?? 0));
 
     await upsertStudent(client, {
       ...row,
@@ -4471,10 +4481,13 @@ async function updateManualAttendanceRecord(
         existingRecord.school_year_id,
       [row.scannedAt, existingRecord.scanned_at],
     ));
-  const noOfAbsences = Math.max(
-    0,
-    Number(row.noOfAbsences ?? existingRecord.no_of_absences ?? 0),
-  );
+  const noOfAbsences =
+    attendanceType === "manual" && event
+      ? 0
+      : Math.max(
+          0,
+          Number(row.noOfAbsences ?? existingRecord.no_of_absences ?? 0),
+        );
 
   await upsertStudent(client, {
     ...row,
@@ -6935,7 +6948,13 @@ async function refreshCalculationResultsWithClient(
             THEN NULL
             ELSE mar.event_id
           END AS event_id,
-          GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
+          CASE
+            WHEN mar.event_id IS NOT NULL
+              AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+              AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($4::TEXT)
+            THEN 0
+            ELSE GREATEST(0, COALESCE(mar.no_of_absences, 0))
+          END::INT AS no_of_absences,
           COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
           mar.updated_at
         FROM manual_attendance_records mar
@@ -8508,7 +8527,13 @@ async function refreshAttendanceFinalResultsWithClient(
             THEN NULL
             ELSE mar.event_id
           END AS event_id,
-          GREATEST(0, COALESCE(mar.no_of_absences, 0))::INT AS no_of_absences,
+          CASE
+            WHEN mar.event_id IS NOT NULL
+              AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+              AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($2::TEXT)
+            THEN 0
+            ELSE GREATEST(0, COALESCE(mar.no_of_absences, 0))
+          END::INT AS no_of_absences,
           COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
           mar.updated_at
         FROM manual_attendance_records mar
