@@ -50,6 +50,7 @@ import {
   saveManualAttendanceRecord,
   mergeAttendanceEvents,
   updateAttendanceEvent,
+  updateAttendanceFinalResultProfile,
   updateAttendanceRecord,
   updateAttendanceRecords as updateAttendanceRecordsService,
   UploadedAttendanceFile,
@@ -1026,6 +1027,29 @@ export async function finalResults(
     });
 
     res.json({ data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function updateFinalResultProfile(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const id = getRouteParam(req, "id");
+
+    if (!id) {
+      res.status(400).json({ message: "Final attendance result ID is required." });
+      return;
+    }
+
+    const result = await updateAttendanceFinalResultProfile(id, req.body ?? {});
+    res.json({
+      message: "Student attendance details updated successfully.",
+      data: result,
+    });
   } catch (error) {
     next(error);
   }

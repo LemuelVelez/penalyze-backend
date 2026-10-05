@@ -148,6 +148,19 @@ export type DeletedAttendanceFinalResultsResult = {
   deletedRecords: AttendanceFinalResultRecord[];
 };
 
+export type AttendanceFinalResultProfileField =
+  | "studentId"
+  | "name"
+  | "yearLevel"
+  | "college"
+  | "program"
+  | "institution";
+
+export type AttendanceFinalResultProfileUpdateResult = {
+  finalResult: AttendanceFinalResultRecord;
+  updatedFields: AttendanceFinalResultProfileField[];
+};
+
 export type DeletedCalculationResultsResult = {
   deletedCount: number;
   deletedRecords: CalculationResultRecord[];
@@ -4383,10 +4396,23 @@ export async function updateAttendanceRecords(
     );
     const records = await listRecordsByIds(client, updatedRecordIds);
 
-    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
-      client,
-      affectedSchoolYearIds,
+    const hasUnscopedSchoolYear = affectedSchoolYearIds.some(
+      (schoolYearId) => !cleanText(schoolYearId),
     );
+    const refreshScopes: Array<string | undefined> = hasUnscopedSchoolYear
+      ? [undefined]
+      : uniqueCleanTextValues(affectedSchoolYearIds).map(
+          (schoolYearId) => schoolYearId,
+        );
+
+    // Student-profile edits should refresh attendance/fines immediately, but
+    // they must not silently mark saved calculation results as recalculated.
+    // The students-table change trigger intentionally leaves Calculate pending
+    // until the user explicitly runs and saves the calculation workflow.
+    for (const schoolYearId of refreshScopes) {
+      await refreshAttendanceFinalResultsWithClient(client, { schoolYearId });
+      await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
+    }
 
     return {
       event,
@@ -6817,12 +6843,25 @@ async function refreshCalculationResultsWithClient(
           mar.school_year_id,
           LOWER(TRIM(mar.student_id)) AS normalized_student_id
         FROM manual_attendance_records mar
+        LEFT JOIN canonical_students selected_manual_student
+          ON LOWER(TRIM(selected_manual_student.student_id)) = LOWER(TRIM(mar.student_id))
+        LEFT JOIN calculation_resolved_year_levels selected_manual_year_level
+          ON selected_manual_year_level.school_year_id IS NOT DISTINCT FROM mar.school_year_id
+         AND selected_manual_year_level.normalized_student_id = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
           AND (
             (
               $6::BOOLEAN
               AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
               AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($4::TEXT)
+              AND (
+                mar.event_id IS NULL
+                OR ${getEventStudentExemptionFilterSql(
+                  "mar.event_id",
+                  "selected_manual_year_level.year_level_key",
+                  getCanonicalCollegeKeySql("mar", "selected_manual_student"),
+                )}
+              )
             )
             OR (
               $7::BOOLEAN
@@ -6905,6 +6944,16 @@ async function refreshCalculationResultsWithClient(
           ON manual_year_level.school_year_id IS NOT DISTINCT FROM mar.school_year_id
          AND manual_year_level.normalized_student_id = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+          AND (
+            mar.attendance_type = 'zero_attendance'
+            OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT)
+            OR mar.event_id IS NULL
+            OR ${getEventStudentExemptionFilterSql(
+              "mar.event_id",
+              "manual_year_level.year_level_key",
+              getCanonicalCollegeKeySql("mar", "s"),
+            )}
+          )
       ), imported_totals AS (
         SELECT
           school_year_id,
@@ -8465,6 +8514,15 @@ async function refreshAttendanceFinalResultsWithClient(
         FROM manual_attendance_records mar
         LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+          AND (
+            mar.attendance_type = 'zero_attendance'
+            OR mar.event_id IS NULL
+            OR ${getEventStudentExemptionFilterSql(
+              "mar.event_id",
+              getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
+              getCanonicalCollegeKeySql("mar", "s"),
+            )}
+          )
       ), imported_totals AS (
         SELECT
           school_year_id,
@@ -8978,6 +9036,339 @@ export async function refreshAttendanceFinalResults(
       options.schoolYearId,
     );
     return rows;
+  });
+}
+
+const ATTENDANCE_FINAL_RESULT_PROFILE_FIELDS = new Set<AttendanceFinalResultProfileField>([
+  "studentId",
+  "name",
+  "yearLevel",
+  "college",
+  "program",
+  "institution",
+]);
+
+function parseAttendanceFinalResultProfileFields(value: unknown) {
+  const values = Array.isArray(value) ? value : String(value ?? "").split(",");
+  const requested = values.map((item) => cleanText(item)).filter(Boolean);
+  const invalidFields = requested.filter(
+    (field) =>
+      !ATTENDANCE_FINAL_RESULT_PROFILE_FIELDS.has(
+        field as AttendanceFinalResultProfileField,
+      ),
+  );
+
+  if (invalidFields.length) {
+    throw createValidationError(
+      `Unsupported student detail field${invalidFields.length === 1 ? "" : "s"}: ${invalidFields.join(", ")}.`,
+    );
+  }
+
+  return Array.from(
+    new Set(requested as AttendanceFinalResultProfileField[]),
+  );
+}
+
+export async function updateAttendanceFinalResultProfile(
+  id: string,
+  input: RawImportRow,
+): Promise<AttendanceFinalResultProfileUpdateResult> {
+  const updatedFields = parseAttendanceFinalResultProfileFields(input.fields);
+
+  if (!updatedFields.length) {
+    throw createValidationError("Choose at least one student detail to update.");
+  }
+
+  const fieldSet = new Set(updatedFields);
+
+  return withTransaction(async (client) => {
+    const finalResultQuery = await client.query<AttendanceFinalResultRecord>(
+      `
+        SELECT *
+        FROM attendance_final_results
+        WHERE id = $1
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [id],
+    );
+    const finalResult = finalResultQuery.rows[0];
+
+    if (!finalResult) {
+      throw createValidationError("Final attendance result not found.", 404);
+    }
+
+    const originalStudentId = cleanText(finalResult.student_id);
+    const targetStudentId = fieldSet.has("studentId")
+      ? cleanText(input.studentId ?? input.student_id)
+      : originalStudentId;
+
+    if (!targetStudentId) {
+      throw createValidationError("Student ID is required.");
+    }
+
+    const targetName = fieldSet.has("name")
+      ? cleanText(input.name)
+      : cleanText(finalResult.name);
+
+    if (!targetName) {
+      throw createValidationError("Name is required.");
+    }
+
+    const normalizedIdChanged =
+      targetStudentId.toLowerCase() !== originalStudentId.toLowerCase();
+
+    if (normalizedIdChanged) {
+      const conflictQuery = await client.query<{ exists: boolean }>(
+        `
+          SELECT EXISTS (
+            SELECT 1 FROM students WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+            UNION ALL
+            SELECT 1 FROM attendance_records WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+            UNION ALL
+            SELECT 1 FROM manual_attendance_records WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+            UNION ALL
+            SELECT 1 FROM attendance_requests WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+            UNION ALL
+            SELECT 1 FROM attendance_final_results WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+            UNION ALL
+            SELECT 1 FROM calculation_results WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+            UNION ALL
+            SELECT 1 FROM penalty_results WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+            UNION ALL
+            SELECT 1 FROM fines WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+          ) AS exists
+        `,
+        [targetStudentId],
+      );
+
+      if (conflictQuery.rows[0]?.exists) {
+        throw createValidationError(
+          `Student ID ${targetStudentId} already belongs to another student.`,
+          409,
+        );
+      }
+    }
+
+    const affectedSchoolYearsQuery = await client.query<{ school_year_id: string | null }>(
+      `
+        SELECT DISTINCT school_year_id
+        FROM (
+          SELECT school_year_id
+          FROM attendance_records
+          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+            AND deleted_at IS NULL
+          UNION ALL
+          SELECT school_year_id
+          FROM manual_attendance_records
+          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+          UNION ALL
+          SELECT school_year_id
+          FROM attendance_final_results
+          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        ) scoped_years
+      `,
+      [originalStudentId],
+    );
+    const affectedSchoolYearIds = affectedSchoolYearsQuery.rows.map(
+      (row) => row.school_year_id,
+    );
+
+    const existingStudentQuery = await client.query<{
+      id: string;
+      student_id: string;
+      name: string;
+      year_level: string | null;
+      college: string | null;
+      program: string | null;
+      institution: string | null;
+    }>(
+      `
+        SELECT id, student_id, name, year_level, college, program, institution
+        FROM students
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [originalStudentId],
+    );
+    const existingStudent = existingStudentQuery.rows[0] ?? null;
+
+    const profileValues = {
+      name: targetName,
+      yearLevel: fieldSet.has("yearLevel")
+        ? cleanText(input.yearLevel ?? input.year_level)
+        : cleanText(existingStudent?.year_level ?? finalResult.year_level),
+      college: fieldSet.has("college")
+        ? cleanText(input.college)
+        : cleanText(existingStudent?.college ?? finalResult.college),
+      program: fieldSet.has("program")
+        ? cleanText(input.program)
+        : cleanText(existingStudent?.program ?? finalResult.program),
+      institution: fieldSet.has("institution")
+        ? cleanText(input.institution)
+        : cleanText(existingStudent?.institution ?? finalResult.institution),
+    };
+
+    if (existingStudent) {
+      await client.query(
+        `
+          UPDATE students
+          SET
+            student_id = CASE WHEN $8::BOOLEAN THEN $2 ELSE student_id END,
+            name = CASE WHEN $9::BOOLEAN THEN $3 ELSE name END,
+            year_level = CASE WHEN $10::BOOLEAN THEN NULLIF($4, '') ELSE year_level END,
+            college = CASE WHEN $11::BOOLEAN THEN NULLIF($5, '') ELSE college END,
+            program = CASE WHEN $12::BOOLEAN THEN NULLIF($6, '') ELSE program END,
+            institution = CASE WHEN $13::BOOLEAN THEN NULLIF($7, '') ELSE institution END,
+            updated_at = NOW()
+          WHERE id = $1
+        `,
+        [
+          existingStudent.id,
+          targetStudentId,
+          profileValues.name,
+          profileValues.yearLevel,
+          profileValues.college,
+          profileValues.program,
+          profileValues.institution,
+          fieldSet.has("studentId"),
+          fieldSet.has("name"),
+          fieldSet.has("yearLevel"),
+          fieldSet.has("college"),
+          fieldSet.has("program"),
+          fieldSet.has("institution"),
+        ],
+      );
+    } else {
+      await client.query(
+        `
+          INSERT INTO students (
+            student_id,
+            name,
+            year_level,
+            college,
+            program,
+            institution
+          )
+          VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''))
+        `,
+        [
+          targetStudentId,
+          profileValues.name,
+          profileValues.yearLevel,
+          profileValues.college,
+          profileValues.program,
+          profileValues.institution,
+        ],
+      );
+    }
+
+    const sourceProfileFieldsChanged =
+      fieldSet.has("name") ||
+      fieldSet.has("yearLevel") ||
+      fieldSet.has("college") ||
+      fieldSet.has("program") ||
+      fieldSet.has("institution");
+
+    if (sourceProfileFieldsChanged) {
+      const sourceProfileParams = [
+        originalStudentId,
+        fieldSet.has("name"),
+        profileValues.name,
+        fieldSet.has("yearLevel"),
+        profileValues.yearLevel,
+        fieldSet.has("college"),
+        profileValues.college,
+        fieldSet.has("program"),
+        profileValues.program,
+        fieldSet.has("institution"),
+        profileValues.institution,
+      ];
+      const sourceProfileSetSql = `
+        name = CASE WHEN $2::BOOLEAN THEN $3 ELSE name END,
+        year_level = CASE WHEN $4::BOOLEAN THEN NULLIF($5, '') ELSE year_level END,
+        college = CASE WHEN $6::BOOLEAN THEN NULLIF($7, '') ELSE college END,
+        program = CASE WHEN $8::BOOLEAN THEN NULLIF($9, '') ELSE program END,
+        institution = CASE WHEN $10::BOOLEAN THEN NULLIF($11, '') ELSE institution END,
+        updated_at = NOW()
+      `;
+
+      // Keep the student's profile copies consistent without invoking the
+      // attendance-event mutation path for every row. Event IDs, attendance
+      // values, scan times and remarks stay untouched, so a pre-existing
+      // exempted manual row cannot block an unrelated name/college edit.
+      await client.query(
+        `
+          UPDATE attendance_records
+          SET ${sourceProfileSetSql}
+          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+            AND deleted_at IS NULL
+        `,
+        sourceProfileParams,
+      );
+      await client.query(
+        `
+          UPDATE manual_attendance_records
+          SET ${sourceProfileSetSql}
+          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        `,
+        sourceProfileParams,
+      );
+    }
+
+    if (targetStudentId !== originalStudentId) {
+      const studentIdTables = [
+        "attendance_records",
+        "manual_attendance_records",
+        "attendance_requests",
+        "attendance_final_results",
+        "calculation_results",
+        "penalty_results",
+        "fines",
+      ];
+
+      for (const table of studentIdTables) {
+        await client.query(
+          `
+            UPDATE ${table}
+            SET student_id = $1
+            WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($2))
+          `,
+          [targetStudentId, originalStudentId],
+        );
+      }
+    }
+
+    if (!affectedSchoolYearIds.length) {
+      affectedSchoolYearIds.push(finalResult.school_year_id);
+    }
+
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+      client,
+      affectedSchoolYearIds,
+    );
+
+    const refreshedResultQuery = await client.query<AttendanceFinalResultRecord>(
+      `
+        SELECT *
+        FROM attendance_final_results
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [id],
+    );
+    const refreshedResult = refreshedResultQuery.rows[0];
+
+    if (!refreshedResult) {
+      throw new Error("Updated final attendance result could not be reloaded.");
+    }
+
+    return {
+      finalResult: refreshedResult,
+      updatedFields,
+    };
   });
 }
 
