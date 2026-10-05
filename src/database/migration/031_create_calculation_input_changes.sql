@@ -228,11 +228,7 @@ SELECT
       THEN 'zero_attendance'
     ELSE 'imported'
   END,
-  CASE
-    WHEN LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER('Zero attendance registration from landing page.')
-      THEN ar.import_id
-    ELSE ar.import_id
-  END,
+  ar.import_id,
   MAX(ar.updated_at)
 FROM public.attendance_records ar
 GROUP BY
