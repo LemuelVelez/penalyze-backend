@@ -6081,10 +6081,29 @@ export async function deleteAttendanceEvent(id: string) {
   });
 }
 
+function getAttendanceDashboardRecordWhereSql(schoolYearId?: string) {
+  const schoolYearSql = schoolYearId ? "AND ar.school_year_id = $1" : "";
+
+  return `
+    ${getAttendanceRecordVisibilitySql("ar")}
+    AND (
+      COALESCE(ar.event_id, ai.event_id) IS NULL
+      OR ${getEventStudentExemptionFilterSql(
+        "COALESCE(ar.event_id, ai.event_id)",
+        getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
+        getCanonicalCollegeKeySql("ar"),
+      )}
+    )
+    ${schoolYearSql}
+  `;
+}
+
 export type AttendanceDashboardOverview = {
   attendanceRecordCount: number;
   recentAttendanceRecords: AttendanceRecord[];
   recentImports: AttendanceImportRecord[];
+  attendanceTrend: Array<{ date: string; count: number }>;
+  attendanceByCollege: Array<{ college: string; count: number }>;
 };
 
 export async function getAttendanceDashboardOverview(
@@ -6095,8 +6114,15 @@ export async function getAttendanceDashboardOverview(
     ? "AND ar.school_year_id = $1"
     : "";
   const importSchoolYearSql = schoolYearId ? "AND ai.school_year_id = $1" : "";
+  const dashboardWhereSql = getAttendanceDashboardRecordWhereSql(schoolYearId);
 
-  const [countResult, attendanceResult, importResult] = await Promise.all([
+  const [
+    countResult,
+    attendanceResult,
+    importResult,
+    trendResult,
+    collegeResult,
+  ] = await Promise.all([
     query<{ total: number }>(
       `
         SELECT COUNT(*)::INT AS total
@@ -6104,16 +6130,7 @@ export async function getAttendanceDashboardOverview(
         LEFT JOIN attendance_imports ai
           ON ai.id = ar.import_id
          AND ai.deleted_at IS NULL
-        WHERE ${getAttendanceRecordVisibilitySql("ar")}
-          AND (
-            COALESCE(ar.event_id, ai.event_id) IS NULL
-            OR ${getEventStudentExemptionFilterSql(
-              "COALESCE(ar.event_id, ai.event_id)",
-              getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
-              getCanonicalCollegeKeySql("ar"),
-            )}
-          )
-          ${attendanceSchoolYearSql}
+        WHERE ${dashboardWhereSql}
       `,
       params,
     ),
@@ -6159,12 +6176,68 @@ export async function getAttendanceDashboardOverview(
       `,
       params,
     ),
+    query<{ date: string; count: number }>(
+      `
+        WITH date_range AS (
+          SELECT generate_series(
+            timezone('Asia/Manila', NOW())::date - INTERVAL '13 days',
+            timezone('Asia/Manila', NOW())::date,
+            INTERVAL '1 day'
+          )::date AS date
+        ),
+        attendance_counts AS (
+          SELECT
+            timezone('Asia/Manila', COALESCE(ar.scanned_at, ar.created_at))::date AS date,
+            COUNT(*)::INT AS count
+          FROM attendance_records ar
+          LEFT JOIN attendance_imports ai
+            ON ai.id = ar.import_id
+           AND ai.deleted_at IS NULL
+          WHERE ${dashboardWhereSql}
+            AND timezone('Asia/Manila', COALESCE(ar.scanned_at, ar.created_at))::date
+              BETWEEN timezone('Asia/Manila', NOW())::date - INTERVAL '13 days'
+                  AND timezone('Asia/Manila', NOW())::date
+          GROUP BY 1
+        )
+        SELECT
+          TO_CHAR(date_range.date, 'YYYY-MM-DD') AS date,
+          COALESCE(attendance_counts.count, 0)::INT AS count
+        FROM date_range
+        LEFT JOIN attendance_counts ON attendance_counts.date = date_range.date
+        ORDER BY date_range.date ASC
+      `,
+      params,
+    ),
+    query<{ college: string; count: number }>(
+      `
+        SELECT
+          COALESCE(NULLIF(TRIM(ar.college), ''), 'Unassigned') AS college,
+          COUNT(*)::INT AS count
+        FROM attendance_records ar
+        LEFT JOIN attendance_imports ai
+          ON ai.id = ar.import_id
+         AND ai.deleted_at IS NULL
+        WHERE ${dashboardWhereSql}
+        GROUP BY COALESCE(NULLIF(TRIM(ar.college), ''), 'Unassigned')
+        ORDER BY count DESC, college ASC
+        LIMIT 8
+      `,
+      params,
+    ),
   ]);
 
   return {
     attendanceRecordCount: Number(countResult.rows[0]?.total ?? 0),
     recentAttendanceRecords: attendanceResult.rows,
     recentImports: importResult.rows.map(withAttendanceImportRetention),
+    attendanceTrend: trendResult.rows.map((row) => ({
+      date: row.date,
+      count: Number(row.count ?? 0),
+    })),
+    attendanceByCollege: collegeResult.rows.map((row) => ({
+      college: row.college,
+      count: Number(row.count ?? 0),
+    })),
   };
 }
 
