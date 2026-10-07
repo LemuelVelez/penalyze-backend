@@ -502,9 +502,17 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       return (await getRequestViewById(requestResult.rows[0].id, client))!;
     }
 
-    const name = cleanText(input.name);
+    let name = cleanText(input.name);
     const events = normalizeRequestEvents(input.events);
-    if (!name) throw createHttpError("Name is required.");
+    if (!name) {
+      const currentStudent = await getCurrentStudentDetails(client, studentId);
+      name = currentStudent.name ?? "";
+    }
+    if (!name) {
+      throw createHttpError(
+        "Name is required. Submit a Request Details Correction first, then try the attendance review again.",
+      );
+    }
 
     const eventIds = events.map((event) => event.eventId);
     const eventResult = await client.query<{
