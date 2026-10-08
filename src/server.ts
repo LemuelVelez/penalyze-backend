@@ -4,6 +4,7 @@ import multer from "multer";
 
 import {
   attachAuthUser,
+  changePassword,
   deleteUser,
   listUsers,
   login,
@@ -225,6 +226,7 @@ function publicStudentStatusRateLimit(req: Request, res: Response, next: NextFun
 app.post("/api/auth/register", register);
 app.post("/api/auth/login", login);
 app.get("/api/auth/me", requireAuth, me);
+app.post("/api/auth/change-password", requireAuth, changePassword);
 
 app.get("/api/users", requireAuth, requireAdmin, listUsers);
 app.patch("/api/users/:id", requireAuth, requireAdmin, updateUser);

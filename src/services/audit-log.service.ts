@@ -51,6 +51,7 @@ function getAuditContext(method: string, path: string): AuditContext {
   }> = [
     { matches: (m, p) => m === "POST" && p === "/api/auth/login", action: "Login attempt", resourceType: "authentication" },
     { matches: (m, p) => m === "POST" && p === "/api/auth/register", action: "Created user account", resourceType: "user" },
+    { matches: (m, p) => m === "POST" && p === "/api/auth/change-password", action: "Changed account password", resourceType: "user" },
     { matches: (m, p) => ["PATCH", "PUT"].includes(m) && /^\/api\/users\//.test(p), action: "Updated user account", resourceType: "user" },
     { matches: (m, p) => m === "DELETE" && /^\/api\/users\//.test(p), action: "Deleted user account", resourceType: "user" },
     { matches: (m, p) => m === "POST" && p === "/api/school-years", action: "Created school year", resourceType: "school year" },
@@ -150,7 +151,7 @@ function sanitizeValue(value: unknown, depth = 0): unknown {
 
     for (const [key, item] of entries) {
       const normalizedKey = key.toLowerCase().replace(/[-_]/g, "");
-      result[key] = SENSITIVE_KEYS.has(key.toLowerCase()) || SENSITIVE_KEYS.has(normalizedKey)
+      result[key] = normalizedKey.includes("password") || SENSITIVE_KEYS.has(key.toLowerCase()) || SENSITIVE_KEYS.has(normalizedKey)
         ? "[redacted]"
         : sanitizeValue(item, depth + 1);
     }
@@ -279,7 +280,7 @@ export function auditMutation(req: AuthenticatedRequest, res: Response, next: Ne
             : "failed",
       durationMs: Date.now() - startedAt,
       ...(Object.keys(req.query ?? {}).length ? { query: sanitizeValue(req.query) } : {}),
-      ...(req.body && Object.keys(req.body).length ? { body: sanitizeValue(req.body) } : {}),
+      ...(path !== "/api/auth/change-password" && req.body && Object.keys(req.body).length ? { body: sanitizeValue(req.body) } : {}),
       ...(files.length ? { files } : {}),
     };
 

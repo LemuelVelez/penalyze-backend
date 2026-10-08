@@ -239,6 +239,82 @@ export async function login(req: Request, res: Response, next: NextFunction) {
   }
 }
 
+export async function changePassword(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  try {
+    if (!req.user?.sub) {
+      res.status(401).json({ message: "Authentication token is required." });
+      return;
+    }
+
+    const { currentPassword, newPassword, confirmPassword } = req.body ?? {};
+    if (
+      typeof currentPassword !== "string" ||
+      typeof newPassword !== "string" ||
+      typeof confirmPassword !== "string" ||
+      !currentPassword ||
+      !newPassword ||
+      !confirmPassword
+    ) {
+      res.status(400).json({ message: "All password fields are required." });
+      return;
+    }
+
+    if (currentPassword.length > 1024) {
+      res.status(400).json({ message: "Current password is too long." });
+      return;
+    }
+
+    if (newPassword.length < 8 || newPassword.length > 128) {
+      res.status(400).json({ message: "New password must be 8 to 128 characters." });
+      return;
+    }
+
+    if (newPassword !== confirmPassword) {
+      res.status(400).json({ message: "New password and confirmation do not match." });
+      return;
+    }
+
+    if (newPassword === currentPassword) {
+      res.status(400).json({ message: "New password must be different from your current password." });
+      return;
+    }
+
+    const result = await query<UserRecord>("SELECT * FROM users WHERE id = $1 LIMIT 1", [req.user.sub]);
+    const user = result.rows[0];
+
+    if (!user) {
+      res.status(404).json({ message: "User not found." });
+      return;
+    }
+
+    const validPassword = verifyPassword(currentPassword, user.password_hash) ||
+      await verifyLegacyPostgresPassword(currentPassword, user.password_hash);
+    if (!validPassword) {
+      res.status(401).json({ message: "Current password is incorrect." });
+      return;
+    }
+
+    const updated = await query<{ id: string }>(
+      `
+        UPDATE users
+        SET password_hash = $1, updated_at = NOW()
+        WHERE id = $2 AND password_hash = $3
+        RETURNING id
+      `,
+      [hashPassword(newPassword), user.id, user.password_hash]
+    );
+
+    if (!updated.rows.length) {
+      res.status(409).json({ message: "Password was changed in another session. Please try again." });
+      return;
+    }
+
+    res.json({ message: "Password changed successfully." });
+  } catch (error) {
+    next(error);
+  }
+}
+
 export function attachAuthUser(req: AuthenticatedRequest, _res: Response, next: NextFunction) {
   try {
     const header = req.headers.authorization ?? "";
