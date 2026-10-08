@@ -16,7 +16,9 @@ export type AuthenticatedRequest = Request & {
   user?: JwtPayload;
 };
 
-const TOKEN_TTL_SECONDS = Number(process.env.JWT_TTL_SECONDS ?? 60 * 60 * 24 * 7);
+const TOKEN_TTL_SECONDS = Number(process.env.JWT_TTL_SECONDS ?? 60 * 60 * 12);
+const LEGACY_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7;
+const REMEMBER_TOKEN_TTL_SECONDS = Number(process.env.JWT_REMEMBER_TTL_SECONDS ?? 60 * 60 * 24 * 30);
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-before-production";
 const USER_ROLES: UserRole[] = ["admin", "officer"];
 
@@ -32,12 +34,12 @@ function signData(data: string) {
   return crypto.createHmac("sha256", JWT_SECRET).update(data).digest("base64url");
 }
 
-function signToken(payload: Omit<JwtPayload, "exp">) {
+function signToken(payload: Omit<JwtPayload, "exp">, ttlSeconds = LEGACY_TOKEN_TTL_SECONDS) {
   const header = base64UrlEncode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
   const body = base64UrlEncode(
     JSON.stringify({
       ...payload,
-      exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS
+      exp: Math.floor(Date.now() / 1000) + ttlSeconds
     })
   );
   const signature = signData(`${header}.${body}`);
@@ -225,13 +227,23 @@ export async function login(req: Request, res: Response, next: NextFunction) {
       );
     }
 
-    const token = signToken({ sub: user.id, email: user.email, name: user.name, role: user.role });
+    const remember = req.body?.remember;
+    if (remember !== undefined && typeof remember !== "boolean") {
+      res.status(400).json({ message: "Remember must be a boolean." });
+      return;
+    }
+    const ttl = remember === true
+      ? REMEMBER_TOKEN_TTL_SECONDS
+      : remember === false ? TOKEN_TTL_SECONDS : LEGACY_TOKEN_TTL_SECONDS;
+    const expiresAt = new Date((Math.floor(Date.now() / 1000) + ttl) * 1000).toISOString();
+    const token = signToken({ sub: user.id, email: user.email, name: user.name, role: user.role }, ttl);
 
     res.json({
       message: "Login successful.",
       data: {
         user: publicUser(user),
-        token
+        token,
+        expiresAt
       }
     });
   } catch (error) {
