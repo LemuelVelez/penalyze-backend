@@ -1086,7 +1086,6 @@ export async function refreshFinalResults(
   try {
     const records = await refreshAttendanceFinalResults({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
-    college: req.body?.college,
       importId: req.body?.importId ?? req.body?.import_id,
     });
 
@@ -1122,7 +1121,6 @@ export async function calculationStatus(
   try {
     const status = await getCalculationStatus({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
-    college: req.body?.college,
       importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
       sourceTypes: parseCalculationSourceTypes(
         req.body?.sourceTypes ?? req.body?.source_types,
@@ -1171,7 +1169,6 @@ export async function previewCalculationResultRows(
   try {
     const records = await previewCalculationResults({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
-    college: req.body?.college,
       importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
       sourceTypes: parseCalculationSourceTypes(
         req.body?.sourceTypes ?? req.body?.source_types,
@@ -1192,7 +1189,6 @@ export async function refreshCalculationResultRows(
   try {
     const records = await refreshCalculationResults({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
-    college: req.body?.college,
       importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
       sourceTypes: parseCalculationSourceTypes(
         req.body?.sourceTypes ?? req.body?.source_types,
