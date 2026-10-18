@@ -125,6 +125,8 @@ export type AttendanceImportRecord = {
   deleted_by: string | null;
   delete_reason: string | null;
   event_name_snapshot: string | null;
+  college_key: string | null;
+  college_label: string | null;
   needs_reattachment: boolean;
   deleted_by_name?: string | null;
   deleted_by_email?: string | null;

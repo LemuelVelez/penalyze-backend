@@ -74,6 +74,7 @@ type RawImportRow = Record<string, unknown>;
 type CalculationSourceType = "imported" | "manual" | "zero_attendance";
 
 type SaveRowsInput = {
+  college?: string;
   schoolYearId?: string;
   uploadedBy?: string;
   eventId?: string;
@@ -3073,10 +3074,77 @@ function getBatchAttendanceCandidate(
   };
 }
 
+// The upload college is an import-level scope, never an event identity.
+const ATTENDANCE_UPLOAD_COLLEGES = [
+  "College of Business Administration",
+  "College of Teacher Education",
+  "College of Computing Studies",
+  "College of Agriculture and Forestry",
+  "College of Liberal Arts, Mathematics and Sciences",
+  "School of Engineering",
+  "School of Criminal Justice Education",
+] as const;
+
+export function isValidAttendanceUploadCollege(value: unknown): boolean {
+  const key = normalizeCollegeKey(value);
+  return Boolean(key && ATTENDANCE_UPLOAD_COLLEGES.some(
+    (college) => normalizeCollegeKey(college) === key,
+  ));
+}
+
+function requireAttendanceUploadCollege(value: unknown): { key: string; label: string } {
+  const key = normalizeCollegeKey(value);
+  const label = ATTENDANCE_UPLOAD_COLLEGES.find(
+    (college) => normalizeCollegeKey(college) === key,
+  );
+  if (!key || !label) {
+    throw createValidationError("Select a college before uploading.", 400);
+  }
+  return { key, label };
+}
+
+function scopeAttendancePreviewToCollege(
+  preview: AttendancePreviewResult,
+  selectedCollege: string | undefined,
+): AttendancePreviewResult {
+  if (!selectedCollege) return preview;
+  const { key, label } = requireAttendanceUploadCollege(selectedCollege);
+  const rows = preview.rows.map((row) => {
+    const incomingCollege = cleanText(row.college);
+    const mismatched = Boolean(incomingCollege && normalizeCollegeKey(incomingCollege) !== key);
+    const mismatchError = mismatched
+      ? `Row ${row.rowNumber}, student ${row.studentId || "unknown"} (${row.name || "unnamed"}): file college "${incomingCollege}" does not match selected college "${label}".`
+      : "";
+    return {
+      ...row,
+      college: incomingCollege || label,
+      errors: mismatchError ? [...row.errors, mismatchError] : row.errors,
+    };
+  });
+  const rowsValid = rows.filter((row) => row.errors.length === 0).length;
+  return { ...preview, rows, rowsValid, rowsInvalid: rows.length - rowsValid };
+}
+
+function assertNoAttendanceCollegeMismatches(preview: AttendancePreviewResult) {
+  const mismatchErrors = preview.rows.flatMap((row) =>
+    row.errors.filter((error) => error.includes("does not match selected college")),
+  );
+  if (mismatchErrors.length) {
+    throw createValidationError(
+      `College mismatch in ${preview.fileName}: ${mismatchErrors.join(" ")}`,
+      400,
+    );
+  }
+}
+
 export async function previewAttendanceFiles(
   files: UploadedAttendanceFile[],
+  college?: string | (string | undefined)[],
 ): Promise<AttendancePreviewResult[]> {
-  const previews = await Promise.all(files.map(previewAttendanceFileBase));
+  const selectedColleges = Array.isArray(college) ? college : files.map(() => college);
+  const previews = (await Promise.all(files.map(previewAttendanceFileBase))).map(
+    (preview, index) => scopeAttendancePreviewToCollege(preview, selectedColleges[index]),
+  );
   const schoolYearIds = await Promise.all(
     previews.map(findSchoolYearIdForAttendancePreview),
   );
@@ -3129,11 +3197,13 @@ export async function previewAttendanceFile(
 }
 
 function prepareAttendanceRowsForSave(input: SaveRowsInput) {
-  const preview = buildPreview(
+  const selected = requireAttendanceUploadCollege(input.college);
+  const preview = scopeAttendancePreviewToCollege(buildPreview(
     input.fileName ?? "manual-import",
     input.fileType ?? "json",
     input.rows,
-  );
+  ), selected.label);
+  assertNoAttendanceCollegeMismatches(preview);
   const validRows = preview.rows.filter((row) => row.errors.length === 0);
 
   if (!validRows.length) {
@@ -3183,8 +3253,10 @@ async function saveAttendanceRowsWithClient(
       }
     : prepareAttendanceRowsForSave(originalInput);
   let input = prepared.input;
-  const preview = prepared.preview;
-  const validRows = prepared.validRows;
+  const selectedCollege = requireAttendanceUploadCollege(input.college);
+  const preview = scopeAttendancePreviewToCollege(prepared.preview, selectedCollege.label);
+  assertNoAttendanceCollegeMismatches(preview);
+  const validRows = preview.rows.filter((row) => !row.errors.length);
 
   if (!validRows.length) {
     throw createValidationError(
@@ -3253,6 +3325,8 @@ async function saveAttendanceRowsWithClient(
               event_id = COALESCE(event_id, $2),
               event_name_snapshot = COALESCE(NULLIF(event_name_snapshot, ''), NULLIF($7, '')),
               uploaded_by = COALESCE(uploaded_by, $8::uuid),
+              college_key = $9,
+              college_label = $10,
               rows_total = rows_total + $3,
               rows_valid = rows_valid + $4,
               rows_invalid = rows_invalid + $5,
@@ -3270,6 +3344,8 @@ async function saveAttendanceRowsWithClient(
             resolvedSchoolYearId,
             defaultEvent?.name ?? input.eventName ?? null,
             cleanText(input.uploadedBy) || null,
+            selectedCollege.key,
+            selectedCollege.label,
           ],
         )
       ).rows[0]
@@ -3286,9 +3362,11 @@ async function saveAttendanceRowsWithClient(
               rows_total,
               rows_valid,
               rows_invalid,
-              status
+              status,
+              college_key,
+              college_label
             )
-            VALUES ($1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, 'saved')
+            VALUES ($1, $2, $3, $4::uuid, $5, $6, $7, $8, $9, 'saved', $10, $11)
             RETURNING *
           `,
           [
@@ -3301,6 +3379,8 @@ async function saveAttendanceRowsWithClient(
             preview.rowsTotal,
             preview.rowsValid,
             preview.rowsInvalid,
+            selectedCollege.key,
+            selectedCollege.label,
           ],
         )
       ).rows[0];
@@ -3366,7 +3446,7 @@ async function saveAttendanceRowsWithClient(
     const recordCollege = await getEffectiveAttendanceCollege(
       client,
       row.studentId,
-      row.college,
+      selectedCollege.label,
     );
     if (!input.allowExemptedRows) {
       await assertEventCollegeNotExempt(
@@ -3604,7 +3684,6 @@ export async function saveAttendanceFiles(
     throw createValidationError("Please upload at least one attendance file.");
   }
 
-  const previews = await previewAttendanceFiles(files);
   const options = files.map((file, index) => {
     const matching = fileOptions.find(
       (option) =>
@@ -3613,6 +3692,9 @@ export async function saveAttendanceFiles(
     );
     return matching ?? {};
   });
+  const selectedColleges = options.map((option) => requireAttendanceUploadCollege(option.college).label);
+  const previews = await previewAttendanceFiles(files, selectedColleges);
+  previews.forEach((preview) => assertNoAttendanceCollegeMismatches(preview));
 
   previews.forEach((preview, index) => {
     if (hasUnresolvedAttendanceMergeCandidate(preview, index, options[index])) {
@@ -4169,6 +4251,9 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
     studentId: cleanText(validatedRow.studentId),
   };
   const attendanceType = getManualAttendanceType(input);
+  if ((attendanceType === "manual" || attendanceType === "zero_attendance") && !cleanText(row.college)) {
+    throw createValidationError("Select a college before saving manual attendance.", 400);
+  }
 
   return withTransaction(async (client) => {
     const recordCollege = await getEffectiveAttendanceCollege(
@@ -9941,15 +10026,7 @@ export type EventExemptionImpact = {
 };
 
 export async function listAttendanceColleges() {
-  const known = [
-    "College of Business Administration",
-    "College of Teacher Education",
-    "College of Computing Studies",
-    "College of Agriculture and Forestry",
-    "College of Liberal Arts, Mathematics and Sciences",
-    "School of Engineering",
-    "School of Criminal Justice Education",
-  ];
+  const known = [...ATTENDANCE_UPLOAD_COLLEGES];
   const result = await query<{ college: string }>(`
     SELECT DISTINCT TRIM(college) AS college
     FROM students

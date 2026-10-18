@@ -42,6 +42,7 @@ import {
   listAttendanceRecords,
   listManualAttendanceRecords,
   previewAttendanceFiles,
+  isValidAttendanceUploadCollege,
   previewCalculationResults,
   refreshAttendanceFinalResults,
   refreshCalculationResults,
@@ -220,6 +221,7 @@ function parseOptionalIndex(value: unknown) {
 function getEventPayload(req: Request) {
   return {
     schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+    college: req.body?.college,
     eventId: req.body?.eventId,
     eventName: req.body?.eventName,
     eventStartAt: req.body?.eventStartAt,
@@ -272,6 +274,7 @@ function getEventPayloadForFile(
   return {
     ...commonPayload,
     schoolYearId: filePayload.schoolYearId ?? commonPayload.schoolYearId,
+    college: filePayload.college ?? commonPayload.college,
     eventId: filePayload.eventId ?? commonPayload.eventId,
     eventName: filePayload.eventName ?? commonPayload.eventName,
     eventStartAt: filePayload.eventStartAt ?? commonPayload.eventStartAt,
@@ -776,7 +779,7 @@ export async function previewImport(
       return;
     }
 
-    const previews = await previewAttendanceFiles(files);
+    const previews = await previewAttendanceFiles(files, getEventPayload(req).college);
     res.json({ message: "Files read successfully.", data: previews });
   } catch (error) {
     next(error);
@@ -798,6 +801,10 @@ export async function saveImport(
         fileName: file.originalname,
         uploadedBy: getAuthenticatedUserId(req),
       }));
+      if (fileOptions.some((option) => !isValidAttendanceUploadCollege(option.college))) {
+        res.status(400).json({ message: "Select a college before uploading." });
+        return;
+      }
       const result = await saveAttendanceFiles(files, fileOptions);
 
       res.status(201).json({
@@ -817,6 +824,10 @@ export async function saveImport(
       return;
     }
 
+    if (!isValidAttendanceUploadCollege(eventPayload.college)) {
+      res.status(400).json({ message: "Select a college before uploading." });
+      return;
+    }
     const result = await saveAttendanceRows({
       ...eventPayload,
       uploadedBy: getAuthenticatedUserId(req),
@@ -858,6 +869,14 @@ export async function saveImportWithProgress(
         message:
           "Please upload a file or provide rows from the preview response.",
       });
+      return;
+    }
+
+    const selectedColleges = files.length
+      ? files.map((file, index) => getEventPayloadForFile(req, file, index).college)
+      : [getEventPayload(req).college];
+    if (selectedColleges.some((college) => !isValidAttendanceUploadCollege(college))) {
+      res.status(400).json({ message: "Select a college before uploading." });
       return;
     }
 
@@ -907,6 +926,10 @@ export async function saveImportWithProgress(
       writeProgressStreamMessage(res, { type: "progress", progress });
     };
 
+    if (!isValidAttendanceUploadCollege(eventPayload.college)) {
+      res.status(400).json({ message: "Select a college before uploading." });
+      return;
+    }
     const result = await saveAttendanceRows({
       ...eventPayload,
       uploadedBy: getAuthenticatedUserId(req),
@@ -1063,6 +1086,7 @@ export async function refreshFinalResults(
   try {
     const records = await refreshAttendanceFinalResults({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+    college: req.body?.college,
       importId: req.body?.importId ?? req.body?.import_id,
     });
 
@@ -1098,6 +1122,7 @@ export async function calculationStatus(
   try {
     const status = await getCalculationStatus({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+    college: req.body?.college,
       importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
       sourceTypes: parseCalculationSourceTypes(
         req.body?.sourceTypes ?? req.body?.source_types,
@@ -1146,6 +1171,7 @@ export async function previewCalculationResultRows(
   try {
     const records = await previewCalculationResults({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+    college: req.body?.college,
       importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
       sourceTypes: parseCalculationSourceTypes(
         req.body?.sourceTypes ?? req.body?.source_types,
@@ -1166,6 +1192,7 @@ export async function refreshCalculationResultRows(
   try {
     const records = await refreshCalculationResults({
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+    college: req.body?.college,
       importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
       sourceTypes: parseCalculationSourceTypes(
         req.body?.sourceTypes ?? req.body?.source_types,
