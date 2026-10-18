@@ -75,6 +75,7 @@ type CalculationSourceType = "imported" | "manual" | "zero_attendance";
 
 type SaveRowsInput = {
   college?: string;
+  rowCollegeOverrides?: Record<string, string>;
   schoolYearId?: string;
   uploadedBy?: string;
   eventId?: string;
@@ -3103,35 +3104,58 @@ function requireAttendanceUploadCollege(value: unknown): { key: string; label: s
   return { key, label };
 }
 
+// A selected college is the fallback for blank file cells, not a restriction on
+// other recognised colleges in the same attendance file. Overrides are keyed by
+// the original spreadsheet row number and are verified on the server.
 function scopeAttendancePreviewToCollege(
   preview: AttendancePreviewResult,
   selectedCollege: string | undefined,
+  overrides: Record<string, string> = {},
 ): AttendancePreviewResult {
   if (!selectedCollege) return preview;
-  const { key, label } = requireAttendanceUploadCollege(selectedCollege);
+  const fallback = requireAttendanceUploadCollege(selectedCollege);
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) {
+    throw createValidationError("Invalid row college assignments.", 400);
+  }
+  const knownRowNumbers = new Set(preview.rows.map((row) => String(row.rowNumber)));
+  const normalizedOverrides = new Map<string, string>();
+  for (const [rowNumber, college] of Object.entries(overrides)) {
+    if (!knownRowNumbers.has(rowNumber)) {
+      throw createValidationError(`Row ${rowNumber} was not found in ${preview.fileName}.`, 400);
+    }
+    const valid = requireAttendanceUploadCollege(college);
+    normalizedOverrides.set(rowNumber, valid.label);
+  }
   const rows = preview.rows.map((row) => {
     const incomingCollege = cleanText(row.college);
-    const mismatched = Boolean(incomingCollege && normalizeCollegeKey(incomingCollege) !== key);
-    const mismatchError = mismatched
-      ? `Row ${row.rowNumber}, student ${row.studentId || "unknown"} (${row.name || "unnamed"}): file college "${incomingCollege}" does not match selected college "${label}".`
+    const assignedCollege = normalizedOverrides.get(String(row.rowNumber));
+    const candidateCollege = assignedCollege || incomingCollege || fallback.label;
+    const canonicalCollege = ATTENDANCE_UPLOAD_COLLEGES.find(
+      (college) => normalizeCollegeKey(college) === normalizeCollegeKey(candidateCollege),
+    );
+    const collegeError = !canonicalCollege
+      ? `Row ${row.rowNumber}, student ${row.studentId || "unknown"} (${row.name || "unnamed"}): unrecognised college "${candidateCollege}". Assign a college from the list before uploading.`
       : "";
     return {
       ...row,
-      college: incomingCollege || label,
-      errors: mismatchError ? [...row.errors, mismatchError] : row.errors,
+      college: canonicalCollege || candidateCollege,
+      errors: [
+        ...row.errors.filter((error) => !error.includes(": unrecognised college ")),
+        ...(collegeError ? [collegeError] : []),
+      ],
     };
   });
   const rowsValid = rows.filter((row) => row.errors.length === 0).length;
   return { ...preview, rows, rowsValid, rowsInvalid: rows.length - rowsValid };
 }
 
-function assertNoAttendanceCollegeMismatches(preview: AttendancePreviewResult) {
-  const mismatchErrors = preview.rows.flatMap((row) =>
-    row.errors.filter((error) => error.includes("does not match selected college")),
+function assertNoInvalidAttendanceColleges(preview: AttendancePreviewResult) {
+  const errors = preview.rows.flatMap((row) =>
+    row.errors.filter((error) => error.includes(": unrecognised college ")),
   );
-  if (mismatchErrors.length) {
+  if (errors.length) {
     throw createValidationError(
-      `College mismatch in ${preview.fileName}: ${mismatchErrors.join(" ")}`,
+      `Invalid college in ${preview.fileName}: ${errors.join(" ")}`,
       400,
     );
   }
@@ -3140,10 +3164,13 @@ function assertNoAttendanceCollegeMismatches(preview: AttendancePreviewResult) {
 export async function previewAttendanceFiles(
   files: UploadedAttendanceFile[],
   college?: string | (string | undefined)[],
+  rowCollegeOverrides?: Record<string, string>[],
 ): Promise<AttendancePreviewResult[]> {
   const selectedColleges = Array.isArray(college) ? college : files.map(() => college);
   const previews = (await Promise.all(files.map(previewAttendanceFileBase))).map(
-    (preview, index) => scopeAttendancePreviewToCollege(preview, selectedColleges[index]),
+    (preview, index) => scopeAttendancePreviewToCollege(
+      preview, selectedColleges[index], rowCollegeOverrides?.[index] ?? {},
+    ),
   );
   const schoolYearIds = await Promise.all(
     previews.map(findSchoolYearIdForAttendancePreview),
@@ -3202,8 +3229,8 @@ function prepareAttendanceRowsForSave(input: SaveRowsInput) {
     input.fileName ?? "manual-import",
     input.fileType ?? "json",
     input.rows,
-  ), selected.label);
-  assertNoAttendanceCollegeMismatches(preview);
+  ), selected.label, input.rowCollegeOverrides);
+  assertNoInvalidAttendanceColleges(preview);
   const validRows = preview.rows.filter((row) => row.errors.length === 0);
 
   if (!validRows.length) {
@@ -3254,8 +3281,10 @@ async function saveAttendanceRowsWithClient(
     : prepareAttendanceRowsForSave(originalInput);
   let input = prepared.input;
   const selectedCollege = requireAttendanceUploadCollege(input.college);
-  const preview = scopeAttendancePreviewToCollege(prepared.preview, selectedCollege.label);
-  assertNoAttendanceCollegeMismatches(preview);
+  const preview = scopeAttendancePreviewToCollege(
+    prepared.preview, selectedCollege.label, input.rowCollegeOverrides,
+  );
+  assertNoInvalidAttendanceColleges(preview);
   const validRows = preview.rows.filter((row) => !row.errors.length);
 
   if (!validRows.length) {
@@ -3446,7 +3475,7 @@ async function saveAttendanceRowsWithClient(
     const recordCollege = await getEffectiveAttendanceCollege(
       client,
       row.studentId,
-      selectedCollege.label,
+      row.college,
     );
     if (!input.allowExemptedRows) {
       await assertEventCollegeNotExempt(
@@ -3693,8 +3722,12 @@ export async function saveAttendanceFiles(
     return matching ?? {};
   });
   const selectedColleges = options.map((option) => requireAttendanceUploadCollege(option.college).label);
-  const previews = await previewAttendanceFiles(files, selectedColleges);
-  previews.forEach((preview) => assertNoAttendanceCollegeMismatches(preview));
+  const previews = await previewAttendanceFiles(
+    files,
+    selectedColleges,
+    options.map((option) => option.rowCollegeOverrides ?? {}),
+  );
+  previews.forEach(assertNoInvalidAttendanceColleges);
 
   previews.forEach((preview, index) => {
     if (hasUnresolvedAttendanceMergeCandidate(preview, index, options[index])) {

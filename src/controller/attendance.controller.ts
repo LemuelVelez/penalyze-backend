@@ -222,6 +222,7 @@ function getEventPayload(req: Request) {
   return {
     schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
     college: req.body?.college,
+    rowCollegeOverrides: req.body?.rowCollegeOverrides,
     eventId: req.body?.eventId,
     eventName: req.body?.eventName,
     eventStartAt: req.body?.eventStartAt,
@@ -275,6 +276,7 @@ function getEventPayloadForFile(
     ...commonPayload,
     schoolYearId: filePayload.schoolYearId ?? commonPayload.schoolYearId,
     college: filePayload.college ?? commonPayload.college,
+    rowCollegeOverrides: filePayload.rowCollegeOverrides ?? commonPayload.rowCollegeOverrides,
     eventId: filePayload.eventId ?? commonPayload.eventId,
     eventName: filePayload.eventName ?? commonPayload.eventName,
     eventStartAt: filePayload.eventStartAt ?? commonPayload.eventStartAt,
