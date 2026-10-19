@@ -6936,7 +6936,7 @@ export function attachExpectedEventConsistencyWarnings<T extends ConsistencyResu
     consistency_warning: row.college_key
       ? warnings.get(expectedEventGroupKey(
           row.school_year_id,
-          table === "calculation_results" ? row.calculation_scope_key : null,
+          table === "calculation_results" ? (row.calculation_scope_key ?? null) : null,
           row.college_key,
           normalizeYearLevelKey(row.year_level),
         )) ?? null
