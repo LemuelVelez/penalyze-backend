@@ -1181,8 +1181,8 @@ export async function repairCalculationConsistencyRows(
     });
     res.json({
       message: result.repaired
-        ? "Saved expected-event totals rebuilt from the current event roster."
-        : "Saved results already have consistent expected-event totals.",
+        ? "Inconsistent attendance totals were automatically corrected for all affected groups."
+        : "All expected-event totals are already consistent.",
       data: result,
     });
   } catch (error) {

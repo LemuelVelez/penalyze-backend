@@ -11,6 +11,8 @@ import {
   getStudentEventOverrideExclusionSql,
   setStudentEventAttendance,
   repairCalculationConsistency,
+  getExpectedEventGroupRepairCtesSql,
+  selectExpectedEventGroupRepairTargets,
   getYearLevelKeySql,
   normalizeYearLevelKey,
   previewAttendanceFileBase,
@@ -260,4 +262,38 @@ test("consistency repair requires an explicit school year before writing results
     }),
     /Choose one school year to repair/,
   );
+});
+
+
+test("automatic expected-event repair chooses the most common total for every affected group", () => {
+  const rows = [
+    { school_year_id: "school-1", calculation_scope_key: "school_year", college_key: "criminal-justice", year_level: "2nd Year", expected_events: 7 },
+    { school_year_id: "school-1", calculation_scope_key: "school_year", college_key: "criminal-justice", year_level: "2nd Year", expected_events: 8 },
+    { school_year_id: "school-1", calculation_scope_key: "school_year", college_key: "criminal-justice", year_level: "Second Year", expected_events: 8 },
+    { school_year_id: "school-1", calculation_scope_key: "school_year", college_key: "criminal-justice", year_level: "3rd Year", expected_events: 4 },
+    { school_year_id: "school-1", calculation_scope_key: "school_year", college_key: "criminal-justice", year_level: "3rd Year", expected_events: 5 },
+  ];
+  const violations = [
+    { school_year_id: "school-1", calculation_scope_key: "school_year", college_key: "criminal-justice", college: "School of Criminal Justice Education", year_level_key: "2", expected_event_values: [7, 8], student_count: 3 },
+    { school_year_id: "school-1", calculation_scope_key: "school_year", college_key: "criminal-justice", college: "School of Criminal Justice Education", year_level_key: "3", expected_event_values: [4, 5], student_count: 2 },
+  ];
+  const targets = selectExpectedEventGroupRepairTargets(rows, violations);
+  assert.deepEqual(targets.map((target) => [target.yearLevelKey, target.expectedEvents, target.studentCount]), [
+    ["2", 8, 3],
+    ["3", 4, 2], // lower total wins a tie instead of increasing fines
+  ]);
+  assert.deepEqual(targets[0]?.observedValues, [7, 8]);
+});
+
+test("automatic repairs apply in both refreshes only to unchanged conflicting source groups", () => {
+  for (const isCalculation of [true, false]) {
+    const sql = getExpectedEventGroupRepairCtesSql(isCalculation);
+    assert.match(sql, /attendance_expected_event_group_repairs/);
+    assert.match(sql, /groups\.observed_values = repair\.observed_expected_values/);
+    assert.match(sql, /cardinality\(groups\.observed_values\) > 1/);
+    assert.match(sql, /raw\.year_level/);
+    assert.match(sql, /GREATEST\(aligned\.expected_events - aligned\.attended_events, 0\)/);
+    assert.match(sql, /raw_total_absences/);
+    assert.match(sql, /THEN 'roster' ELSE 'imported_fallback'/);
+  }
 });
