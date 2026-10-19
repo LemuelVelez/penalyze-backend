@@ -2289,6 +2289,22 @@ const ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL =
   getAttendanceRecordEventRosterCollegeSql("ar");
 const MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL =
   getCanonicalCollegeKeySql("mar");
+// Remove only this participant's presence; leave the original event roster intact.
+export function getStudentEventOverrideExclusionSql(
+  schoolYearSql: string,
+  studentIdSql: string,
+  eventIdSql: string,
+) {
+  return `NOT EXISTS (
+    SELECT 1
+    FROM attendance_student_event_overrides excluded_override
+    WHERE excluded_override.school_year_id IS NOT DISTINCT FROM ${schoolYearSql}
+      AND excluded_override.student_key = LOWER(TRIM(${studentIdSql}))
+      AND excluded_override.event_id = ${eventIdSql}
+      AND excluded_override.attended = FALSE
+  )`;
+}
+
 const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
   event_participation AS (
     SELECT DISTINCT
@@ -2304,6 +2320,9 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
       AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
       AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
+      AND ${getStudentEventOverrideExclusionSql(
+        "ar.school_year_id", "ar.student_id", "COALESCE(ar.event_id, ai.event_id)",
+      )}
       AND ${getEventStudentExemptionFilterSql(
         "COALESCE(ar.event_id, ai.event_id)",
         getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
@@ -2323,11 +2342,23 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
       AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
       AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
+      AND ${getStudentEventOverrideExclusionSql(
+        "mar.school_year_id", "mar.student_id", "mar.event_id",
+      )}
       AND ${getEventStudentExemptionFilterSql(
         "mar.event_id",
         getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
         getCanonicalCollegeKeySql("mar", "participation_manual_student"),
       )}
+
+    UNION
+
+    SELECT DISTINCT
+      correction.school_year_id,
+      correction.event_id,
+      correction.student_key AS normalized_student_id
+    FROM attendance_student_event_overrides correction
+    WHERE correction.attended = TRUE
   )
 `
 export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
@@ -5877,6 +5908,24 @@ export async function mergeAttendanceEvents(input: {
       `,
       [impact.targetEvent.id, sourceIds, targetName],
     );
+    // Preserve the latest participant correction when duplicate events are merged.
+    // Source event FKs cascade on deletion; move corrections beforehand.
+    await client.query(
+      `INSERT INTO attendance_student_event_overrides AS existing
+         (school_year_id, student_key, event_id, attended, updated_by, created_at, updated_at)
+       SELECT DISTINCT ON (school_year_id, student_key)
+         school_year_id, student_key, $1::uuid, attended, updated_by, created_at, updated_at
+       FROM attendance_student_event_overrides
+       WHERE event_id = ANY($2::uuid[]) OR event_id = $1::uuid
+       ORDER BY school_year_id, student_key, updated_at DESC, id DESC
+       ON CONFLICT (school_year_id, student_key, event_id)
+       DO UPDATE SET
+         attended = EXCLUDED.attended,
+         updated_by = EXCLUDED.updated_by,
+         updated_at = EXCLUDED.updated_at
+       WHERE existing.updated_at < EXCLUDED.updated_at`,
+      [impact.targetEvent.id, sourceIds],
+    );
     await client.query(`DELETE FROM attendance_events WHERE id = ANY($1::uuid[])`, [sourceIds]);
     await resequenceAttendanceEvents(client, impact.targetEvent.school_year_id);
 
@@ -7056,7 +7105,7 @@ function getYearLevelResolutionCtesSql() {
 
 // Both refreshes use the exact same roster and participation CTEs, including
 // canonical college and year-level exemptions.
-function getDenominatorEventScopeCtesSql() {
+export function getDenominatorEventScopeCtesSql() {
   return `event_participation AS MATERIALIZED (
         SELECT DISTINCT
           ar.school_year_id,
@@ -7075,6 +7124,9 @@ function getDenominatorEventScopeCtesSql() {
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
           AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
           AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
+          AND ${getStudentEventOverrideExclusionSql(
+            "ar.school_year_id", "ar.student_id", "COALESCE(ar.event_id, ai.event_id)",
+          )}
           AND ${getEventStudentExemptionFilterSql(
             "COALESCE(ar.event_id, ai.event_id)",
             "participation_year_level.year_level_key",
@@ -7098,11 +7150,24 @@ function getDenominatorEventScopeCtesSql() {
           AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
           AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
           AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
+          AND ${getStudentEventOverrideExclusionSql(
+            "mar.school_year_id", "mar.student_id", "mar.event_id",
+          )}
           AND ${getEventStudentExemptionFilterSql(
             "mar.event_id",
             "participation_manual_year_level.year_level_key",
             getCanonicalCollegeKeySql("mar", "participation_manual_student"),
           )}
+
+        UNION
+
+        SELECT DISTINCT
+          correction.school_year_id,
+          correction.event_id,
+          correction.student_key AS normalized_student_id
+        FROM attendance_student_event_overrides correction
+        WHERE correction.attended = TRUE
+          AND ($1::uuid IS NULL OR correction.school_year_id = $1::uuid)
       ), event_roster_scope AS MATERIALIZED (
         SELECT DISTINCT
           ar.school_year_id,
@@ -8720,6 +8785,7 @@ type AttendanceFinalResultsFilter = {
   college?: string;
   includeMissedEvents?: boolean;
   includeEventDetails?: boolean;
+  consolidatedOnly?: boolean;
   limit?: number;
   offset?: number;
 };
@@ -9614,6 +9680,13 @@ export async function updateAttendanceFinalResultProfile(
           [targetStudentId, originalStudentId],
         );
       }
+      // Corrections are keyed by normalized student ID rather than raw row IDs.
+      await client.query(
+        `UPDATE attendance_student_event_overrides
+         SET student_key = LOWER(TRIM($1::text)), updated_at = NOW()
+         WHERE student_key = LOWER(TRIM($2::text))`,
+        [targetStudentId, originalStudentId],
+      );
     }
 
     if (!affectedSchoolYearIds.length) {
@@ -9647,6 +9720,90 @@ export async function updateAttendanceFinalResultProfile(
   });
 }
 
+export async function setStudentEventAttendance(
+  finalResultId: string,
+  eventId: string,
+  attended: boolean,
+  updatedBy?: string,
+) {
+  if (!finalResultId || !eventId || typeof attended !== "boolean") {
+    throw createValidationError("Select a student, event, and attendance status.", 400);
+  }
+
+  return withTransaction(async (client) => {
+    await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
+
+    const studentResult = await client.query<{
+      school_year_id: string;
+      student_id: string;
+      college_key: string | null;
+    }>(
+      `SELECT afr.school_year_id, afr.student_id, afr.college_key
+       FROM attendance_final_results afr
+       WHERE afr.id = $1::uuid
+         AND afr.import_id IS NULL
+         AND afr.school_year_id IS NOT NULL
+         AND ${getAttendanceFinalResultVisibilitySql("afr")}
+       FOR UPDATE OF afr`,
+      [finalResultId],
+    );
+    const student = studentResult.rows[0];
+    if (!student || !student.college_key) {
+      throw createValidationError("Student's school year or college is not resolved.", 404);
+    }
+
+    const eligible = await client.query<{ id: string; name: string }>(
+      `WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}
+       SELECT event.id, event.name
+       FROM attendance_events event
+       JOIN event_roster_scope roster
+         ON roster.event_id = event.id
+        AND roster.school_year_id IS NOT DISTINCT FROM $2::uuid
+        AND roster.college_key = $3::text
+       WHERE event.id = $1::uuid
+         AND event.school_year_id IS NOT DISTINCT FROM $2::uuid
+         AND ${getEventYearLevelExemptionFilterSql(
+           "event.id",
+           getResolvedStudentYearLevelKeySql("$4::text", "$2::uuid"),
+           "$3::text",
+         )}
+       LIMIT 1`,
+      [eventId, student.school_year_id, student.college_key, student.student_id],
+    );
+    if (!eligible.rows.length) {
+      throw createValidationError("This event is not expected for the student's college and year level.", 409);
+    }
+
+    const change = await client.query<{ id: string }>(
+      `INSERT INTO attendance_student_event_overrides AS existing
+         (school_year_id, student_key, event_id, attended, updated_by)
+       VALUES ($1::uuid, LOWER(TRIM($2::text)), $3::uuid, $4::boolean, $5::uuid)
+       ON CONFLICT (school_year_id, student_key, event_id)
+       DO UPDATE SET
+         attended = EXCLUDED.attended,
+         updated_by = EXCLUDED.updated_by,
+         updated_at = NOW()
+       WHERE existing.attended IS DISTINCT FROM EXCLUDED.attended
+       RETURNING id`,
+      [student.school_year_id, student.student_id, eventId, attended, updatedBy ?? null],
+    );
+
+    if (change.rowCount) {
+      await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+        client,
+        [student.school_year_id],
+      );
+    }
+    return {
+      studentId: student.student_id,
+      eventId,
+      eventName: eligible.rows[0].name,
+      attended,
+      updated: Boolean(change.rowCount),
+    };
+  });
+}
+
 export async function listAttendanceFinalResults(
   options: AttendanceFinalResultsFilter = {},
 ) {
@@ -9661,6 +9818,9 @@ export async function listAttendanceFinalResults(
   if (options.importId) {
     params.push(options.importId);
     clauses.push(`afr.import_id = $${params.length}`);
+  }
+  if (options.consolidatedOnly) {
+    clauses.push("afr.import_id IS NULL");
   }
 
   if (options.studentId) {
@@ -9708,6 +9868,10 @@ export async function listAttendanceFinalResults(
         ) AS missed_events
         FROM event_roster_scope roster
         JOIN attendance_events expected_event ON expected_event.id = roster.event_id
+        LEFT JOIN attendance_student_event_overrides correction
+          ON correction.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+         AND correction.student_key = LOWER(TRIM(afr.student_id))
+         AND correction.event_id = roster.event_id
         WHERE roster.school_year_id IS NOT DISTINCT FROM afr.school_year_id
           AND roster.college_key = afr.college_key
           AND ${getEventYearLevelExemptionFilterSql(
@@ -9715,25 +9879,32 @@ export async function listAttendanceFinalResults(
             getResolvedStudentYearLevelKeySql("afr.student_id", "afr.school_year_id"),
             "afr.college_key",
           )}
-          AND NOT EXISTS (
-            SELECT 1
-            FROM attendance_records attended_record
-            LEFT JOIN attendance_imports attended_import
-              ON attended_import.id = attended_record.import_id
-             AND attended_import.deleted_at IS NULL
-            WHERE ${getAttendanceRecordVisibilitySql("attended_record")}
-              AND attended_record.school_year_id IS NOT DISTINCT FROM afr.school_year_id
-              AND LOWER(TRIM(attended_record.student_id)) = LOWER(TRIM(afr.student_id))
-              AND COALESCE(attended_record.event_id, attended_import.event_id) = roster.event_id
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM manual_attendance_records attended_manual
-            WHERE attended_manual.school_year_id IS NOT DISTINCT FROM afr.school_year_id
-              AND LOWER(TRIM(attended_manual.student_id)) = LOWER(TRIM(afr.student_id))
-              AND attended_manual.event_id = roster.event_id
-              AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
-              AND LOWER(TRIM(COALESCE(attended_manual.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+          AND (
+            -- A saved adjustment always wins over the original uploaded/manual row.
+            (correction.id IS NOT NULL AND correction.attended = FALSE)
+            OR (
+              correction.id IS NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM attendance_records attended_record
+                LEFT JOIN attendance_imports attended_import
+                  ON attended_import.id = attended_record.import_id
+                 AND attended_import.deleted_at IS NULL
+                WHERE ${getAttendanceRecordVisibilitySql("attended_record")}
+                  AND attended_record.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+                  AND LOWER(TRIM(attended_record.student_id)) = LOWER(TRIM(afr.student_id))
+                  AND COALESCE(attended_record.event_id, attended_import.event_id) = roster.event_id
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM manual_attendance_records attended_manual
+                WHERE attended_manual.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+                  AND LOWER(TRIM(attended_manual.student_id)) = LOWER(TRIM(afr.student_id))
+                  AND attended_manual.event_id = roster.event_id
+                  AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
+                  AND LOWER(TRIM(COALESCE(attended_manual.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+              )
+            )
           )
       ) missed ON TRUE`
     : "";
@@ -9750,11 +9921,11 @@ export async function listAttendanceFinalResults(
             'event_order', expected_event.event_order,
             'event_start_at', expected_event.event_start_at,
             'event_end_at', expected_event.event_end_at,
-            'attended', attended.record_id IS NOT NULL,
-            'source', attended.source,
-            'record_id', attended.record_id,
-            'scanned_at', attended.scanned_at,
-            'remarks', attended.remarks
+            'attended', COALESCE(correction.attended, attended.record_id IS NOT NULL),
+            'source', CASE WHEN correction.attended IS TRUE THEN 'Manual' WHEN correction.attended IS FALSE THEN NULL ELSE attended.source END,
+            'record_id', CASE WHEN correction.attended IS TRUE THEN correction.id WHEN correction.attended IS FALSE THEN NULL ELSE attended.record_id END,
+            'scanned_at', CASE WHEN correction.attended IS TRUE THEN correction.updated_at WHEN correction.attended IS FALSE THEN NULL ELSE attended.scanned_at END,
+            'remarks', CASE WHEN correction.attended IS TRUE THEN 'Added by attendance adjustment' WHEN correction.attended IS FALSE THEN NULL ELSE attended.remarks END
           )
           ORDER BY expected_event.event_order ASC NULLS LAST,
                    COALESCE(expected_event.event_start_at, expected_event.event_end_at) ASC NULLS LAST,
@@ -9803,6 +9974,10 @@ export async function listAttendanceFinalResults(
             getResolvedStudentYearLevelKeySql("afr.student_id", "afr.school_year_id"),
             "afr.college_key",
           )}
+        LEFT JOIN attendance_student_event_overrides correction
+          ON correction.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+         AND correction.student_key = LOWER(TRIM(afr.student_id))
+         AND correction.event_id = roster.event_id
         LEFT JOIN LATERAL (
           SELECT source_record.source,
                  source_record.record_id,

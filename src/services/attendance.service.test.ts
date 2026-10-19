@@ -7,6 +7,9 @@ import * as XLSX from "xlsx";
 import {
   attachExpectedEventConsistencyWarnings,
   getExpectedEventConsistencyQuery,
+  getDenominatorEventScopeCtesSql,
+  getStudentEventOverrideExclusionSql,
+  setStudentEventAttendance,
   getYearLevelKeySql,
   normalizeYearLevelKey,
   previewAttendanceFileBase,
@@ -216,4 +219,32 @@ test("TypeScript and SQL year-level normalizers accept exactly the same aliases"
     assert.equal(normalizeYearLevelKey(input), sqlAliases.get(normalized) ?? null, input);
   }
   assert.match(sql, /ELSE NULL/);
+});
+
+
+test("participant corrections change attendance, not the college's expected-event roster", () => {
+  const sql = getDenominatorEventScopeCtesSql();
+  const participationSql = sql.split('), event_roster_scope AS MATERIALIZED (')[0];
+  const rosterSql = sql.split('), event_roster_scope AS MATERIALIZED (')[1];
+
+  assert.match(participationSql, /attendance_student_event_overrides correction/);
+  assert.match(participationSql, /correction\.attended = TRUE/);
+  assert.match(participationSql, /excluded_override\.attended = FALSE/);
+  assert.match(participationSql, /excluded_override\.student_key = LOWER\(TRIM\(ar\.student_id\)\)/);
+  assert.doesNotMatch(rosterSql, /attendance_student_event_overrides/);
+});
+
+test("absence overrides are keyed to one normalized student, event, and school year", () => {
+  const sql = getStudentEventOverrideExclusionSql(
+    "ar.school_year_id", "ar.student_id", "COALESCE(ar.event_id, ai.event_id)",
+  );
+  assert.match(sql, /excluded_override\.school_year_id IS NOT DISTINCT FROM ar\.school_year_id/);
+  assert.match(sql, /excluded_override\.student_key = LOWER\(TRIM\(ar\.student_id\)\)/);
+  assert.match(sql, /excluded_override\.event_id = COALESCE\(ar\.event_id, ai\.event_id\)/);
+  assert.match(sql, /excluded_override\.attended = FALSE/);
+});
+
+test("attendance adjustments reject incomplete input before touching the database", async () => {
+  await assert.rejects(setStudentEventAttendance("", "", true), /Select a student, event/);
+  await assert.rejects(setStudentEventAttendance("id", "event", undefined as unknown as boolean), /Select a student, event/);
 });

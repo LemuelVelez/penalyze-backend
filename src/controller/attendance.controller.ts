@@ -49,6 +49,7 @@ import {
   saveAttendanceFiles,
   saveAttendanceRows,
   saveManualAttendanceRecord,
+  setStudentEventAttendance,
   mergeAttendanceEvents,
   updateAttendanceEvent,
   updateAttendanceFinalResultProfile,
@@ -1047,11 +1048,40 @@ export async function finalResults(
         String(req.query.includeEventDetails ?? "")
           .trim()
           .toLowerCase() === "true",
+      consolidatedOnly:
+        String(req.query.consolidatedOnly ?? "")
+          .trim()
+          .toLowerCase() === "true",
       limit,
       offset,
     });
 
     res.json({ data: records });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function updateStudentEventAttendance(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const id = getRouteParam(req, "id");
+    const eventId = getRouteParam(req, "eventId");
+    if (!id || !eventId || typeof req.body?.attended !== "boolean") {
+      res.status(400).json({ message: "Student, event, and a boolean attended status are required." });
+      return;
+    }
+
+    const result = await setStudentEventAttendance(
+      id,
+      eventId,
+      req.body.attended,
+      getAuthenticatedUserId(req),
+    );
+    res.json({ message: "Student event attendance updated successfully.", data: result });
   } catch (error) {
     next(error);
   }
