@@ -10,6 +10,7 @@ import {
   getDenominatorEventScopeCtesSql,
   getStudentEventOverrideExclusionSql,
   setStudentEventAttendance,
+  repairCalculationConsistency,
   getYearLevelKeySql,
   normalizeYearLevelKey,
   previewAttendanceFileBase,
@@ -247,4 +248,16 @@ test("absence overrides are keyed to one normalized student, event, and school y
 test("attendance adjustments reject incomplete input before touching the database", async () => {
   await assert.rejects(setStudentEventAttendance("", "", true), /Select a student, event/);
   await assert.rejects(setStudentEventAttendance("id", "event", undefined as unknown as boolean), /Select a student, event/);
+});
+
+
+test("consistency repair requires an explicit school year before writing results", async () => {
+  await assert.rejects(
+    repairCalculationConsistency({
+      schoolYearId: undefined,
+      importIds: [],
+      sourceTypes: ["manual"],
+    }),
+    /Choose one school year to repair/,
+  );
 });

@@ -62,6 +62,7 @@ import {
   previewCalculationResultRows as previewAttendanceCalculationResults,
   purgeImport as purgeAttendanceImport,
   refreshCalculationResultRows as refreshAttendanceCalculationResults,
+  repairCalculationConsistencyRows as repairAttendanceCalculationConsistency,
   refreshFinalResults as refreshAttendanceFinalResults,
   saveEvent as saveAttendanceEvent,
   saveEventExemptions as saveAttendanceEventExemptions,
@@ -361,6 +362,11 @@ app.post(
 app.post(
   "/api/attendance/calculation-results/refresh",
   refreshAttendanceCalculationResults,
+);
+app.post(
+  "/api/attendance/calculation-results/repair-consistency",
+  requireAuth,
+  repairAttendanceCalculationConsistency,
 );
 app.get("/api/attendance/manual-records", attendanceManualRecords);
 app.delete("/api/attendance/manual-records", deleteAttendanceManualRecords);

@@ -8613,6 +8613,64 @@ export async function refreshCalculationResults(
   });
 }
 
+/**
+ * Rebuild a selected saved calculation scope from current attendance and event
+ * exemptions. A broken denominator is a source-data problem, never a reason to
+ * overwrite all students with an arbitrarily selected expected-event total.
+ * If the rebuilt groups still disagree the transaction is rolled back.
+ */
+export async function repairCalculationConsistency(
+  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes">,
+) {
+  const schoolYearId = cleanText(options.schoolYearId);
+  if (!schoolYearId) {
+    throw createValidationError("Choose one school year to repair its saved calculation results.");
+  }
+  const importIds = normalizeImportIds(options.importIds ?? []);
+  const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
+  const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
+
+  return withTransaction(async (client) => {
+    // Serialize with the same lock as other attendance/fines mutations.
+    await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
+    const originalViolations = await assertExpectedEventConsistencyWithClient(
+      client, "calculation_results", schoolYearId, calculationScopeKey,
+    );
+    if (!originalViolations.length) {
+      return { repaired: false, remainingViolations: [] as ExpectedEventViolation[] };
+    }
+
+    await refreshCalculationResultsWithClient(client, {
+      schoolYearId,
+      importIds,
+      sourceTypes,
+      logConsistencyViolation: false,
+    });
+    const remainingViolations = await assertExpectedEventConsistencyWithClient(
+      client, "calculation_results", schoolYearId, calculationScopeKey,
+    );
+    if (remainingViolations.length) {
+      // Never commit a partial "repair" or silently change fines to match
+      // a guessed 7/8 denominator. Editing the offending source records or
+      // event exemptions is required instead.
+      throw createValidationError(
+        `The current event roster still produces conflicting expected-event totals for ${remainingViolations
+          .map(formatExpectedEventWarning).join("; ")}. Review students' year levels, colleges and event exemptions before recalculating. No changes were saved.`,
+        409,
+      );
+    }
+
+    await refreshAttendanceFinalResultsWithClient(client, { schoolYearId });
+    await refreshPenaltyResultsForSchoolYearWithClient(
+      client, schoolYearId, calculationScopeKey,
+    );
+    await acknowledgeCalculationInputChangesWithClient(client, {
+      schoolYearId, importIds, sourceTypes,
+    });
+    return { repaired: true, remainingViolations };
+  });
+}
+
 export async function listCalculationResults(
   options: CalculationResultsFilter = {},
 ) {

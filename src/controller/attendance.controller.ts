@@ -46,6 +46,7 @@ import {
   previewCalculationResults,
   refreshAttendanceFinalResults,
   refreshCalculationResults,
+  repairCalculationConsistency,
   saveAttendanceFiles,
   saveAttendanceRows,
   saveManualAttendanceRecord,
@@ -1160,6 +1161,30 @@ export async function calculationStatus(
     });
 
     res.json({ data: status });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function repairCalculationConsistencyRows(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const result = await repairCalculationConsistency({
+      schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
+      importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
+      sourceTypes: parseCalculationSourceTypes(
+        req.body?.sourceTypes ?? req.body?.source_types,
+      ),
+    });
+    res.json({
+      message: result.repaired
+        ? "Saved expected-event totals rebuilt from the current event roster."
+        : "Saved results already have consistent expected-event totals.",
+      data: result,
+    });
   } catch (error) {
     next(error);
   }
