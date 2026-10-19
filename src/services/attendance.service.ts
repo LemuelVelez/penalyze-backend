@@ -10118,29 +10118,47 @@ export type StudentEventAttendanceProgress = {
   message: string;
 };
 
-export async function setStudentEventAttendance(
+export type StudentEventAttendanceChange = {
+  eventId: string;
+  attended: boolean;
+};
+
+export async function setStudentEventAttendances(
   finalResultId: string,
-  eventId: string,
-  attended: boolean,
+  changes: StudentEventAttendanceChange[],
   updatedBy?: string,
   onProgress?: (progress: StudentEventAttendanceProgress) => void,
 ) {
-  if (!finalResultId || !eventId || typeof attended !== "boolean") {
-    throw createValidationError("Select a student, event, and attendance status.", 400);
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (
+    !uuidPattern.test(finalResultId) ||
+    !Array.isArray(changes) ||
+    !changes.length ||
+    changes.length > 10000 ||
+    changes.some((change) =>
+      !change || !uuidPattern.test(change.eventId) || typeof change.attended !== "boolean"
+    ) ||
+    new Set(changes.map((change) => change.eventId.toLowerCase())).size !== changes.length
+  ) {
+    throw createValidationError("Select 1 to 10,000 distinct events with an attended or missed status.", 400);
   }
 
+  const eventIds = changes.map((change) => change.eventId);
+  const attendedStatuses = changes.map((change) => change.attended);
+  const total = changes.length;
+  const label = `${total} event${total === 1 ? "" : "s"}`;
   const emitProgress = (
     stage: StudentEventAttendanceProgress["stage"],
     percent: number,
     message: string,
   ) => onProgress?.({ stage, percent, message });
 
-  emitProgress("validating", 4, "Request validated. Preparing to update this student's event attendance.");
+  emitProgress("validating", 4, `Validated ${label}. Preparing one attendance update transaction.`);
 
   const result = await withTransaction(async (client) => {
-    emitProgress("waiting_for_lock", 10, "Waiting for the attendance database lock. Another update may still be finishing.");
+    emitProgress("waiting_for_lock", 10, `Waiting for the attendance database lock to update ${label}.`);
     await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
-    emitProgress("checking_student", 20, "Lock acquired. Checking the student's final attendance record and school year.");
+    emitProgress("checking_student", 20, "Lock acquired. Checking the student's final record and school year.");
 
     const studentResult = await client.query<{
       school_year_id: string;
@@ -10161,8 +10179,7 @@ export async function setStudentEventAttendance(
       throw createValidationError("Student's school year or college is not resolved.", 404);
     }
 
-    emitProgress("checking_event", 30, "Student located. Verifying the event belongs to the student's expected roster.");
-
+    emitProgress("checking_event", 30, `Checking the college and year-level eligibility of all ${label}.`);
     const eligible = await client.query<{ id: string; name: string }>(
       `WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}
        SELECT event.id, event.name
@@ -10171,37 +10188,44 @@ export async function setStudentEventAttendance(
          ON roster.event_id = event.id
         AND roster.school_year_id IS NOT DISTINCT FROM $2::uuid
         AND roster.college_key = $3::text
-       WHERE event.id = $1::uuid
+       WHERE event.id = ANY($1::uuid[])
          AND event.school_year_id IS NOT DISTINCT FROM $2::uuid
          AND ${getEventYearLevelExemptionFilterSql(
            "event.id",
            getResolvedStudentYearLevelKeySql("$4::text", "$2::uuid"),
            "$3::text",
          )}
-       LIMIT 1`,
-      [eventId, student.school_year_id, student.college_key, student.student_id],
+       GROUP BY event.id, event.name`,
+      [eventIds, student.school_year_id, student.college_key, student.student_id],
     );
-    if (!eligible.rows.length) {
-      throw createValidationError("This event is not expected for the student's college and year level.", 409);
+    const eventNames = new Map(eligible.rows.map((event) => [event.id.toLowerCase(), event.name]));
+    const ineligible = changes.find((change) => !eventNames.has(change.eventId.toLowerCase()));
+    if (ineligible) {
+      throw createValidationError(
+        `An event (${ineligible.eventId}) is not expected for this student's college and year level. No changes were saved.`,
+        409,
+      );
     }
 
-    emitProgress("saving_override", 42, "Event eligibility confirmed. Saving the attended/missed correction without changing the original upload.");
-
-    const change = await client.query<{ id: string }>(
+    emitProgress("saving_override", 42, `All ${label} checked. Saving corrections together without modifying uploads.`);
+    const saved = await client.query<{ event_id: string }>(
       `INSERT INTO attendance_student_event_overrides AS existing
          (school_year_id, student_key, event_id, attended, updated_by)
-       VALUES ($1::uuid, LOWER(TRIM($2::text)), $3::uuid, $4::boolean, $5::uuid)
+       SELECT $1::uuid, LOWER(TRIM($2::text)), updates.event_id, updates.attended, $5::uuid
+       FROM UNNEST($3::uuid[], $4::boolean[]) AS updates(event_id, attended)
+       WHERE TRUE
        ON CONFLICT (school_year_id, student_key, event_id)
        DO UPDATE SET
          attended = EXCLUDED.attended,
          updated_by = EXCLUDED.updated_by,
          updated_at = NOW()
        WHERE existing.attended IS DISTINCT FROM EXCLUDED.attended
-       RETURNING id`,
-      [student.school_year_id, student.student_id, eventId, attended, updatedBy ?? null],
+       RETURNING event_id`,
+      [student.school_year_id, student.student_id, eventIds, attendedStatuses, updatedBy ?? null],
     );
+    const updatedEventIds = new Set(saved.rows.map((row) => row.event_id.toLowerCase()));
 
-    if (change.rowCount) {
+    if (updatedEventIds.size) {
       await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
         client,
         [student.school_year_id],
@@ -10209,15 +10233,15 @@ export async function setStudentEventAttendance(
           const detail = {
             refreshing_final_results: {
               percent: 52,
-              message: "Correction saved. Recalculating final attendance and absence totals for the school year.",
+              message: `${updatedEventIds.size} correction(s) saved. Recalculating final attendance and absence totals once for the school year.`,
             },
             refreshing_calculations: {
               percent: 65,
-              message: "Final attendance refreshed. Recalculating Calculate results for the school year.",
+              message: "Attendance totals refreshed. Recalculating Calculate results once for the school year.",
             },
             refreshing_penalties: {
               percent: 77,
-              message: "Calculate results refreshed. Recalculating penalties and fines for the school year.",
+              message: "Calculate results refreshed. Recalculating penalties and fines once for the school year.",
             },
           }[stage];
           emitProgress(stage, detail.percent, detail.message);
@@ -10227,21 +10251,41 @@ export async function setStudentEventAttendance(
     emitProgress(
       "committing",
       85,
-      change.rowCount
-        ? "Recalculations finished. Committing the attendance change to the database."
-        : "Attendance was already set to this value. Finishing without recalculation.",
+      updatedEventIds.size
+        ? `Recalculations complete. Committing ${updatedEventIds.size} changed event(s).`
+        : "All selected events already had the requested attendance statuses. No recalculation needed.",
     );
     return {
       studentId: student.student_id,
-      eventId,
-      eventName: eligible.rows[0].name,
-      attended,
-      updated: Boolean(change.rowCount),
+      totalCount: total,
+      updatedCount: updatedEventIds.size,
+      changes: changes.map((change) => ({
+        eventId: change.eventId,
+        eventName: eventNames.get(change.eventId.toLowerCase()) ?? "Event",
+        attended: change.attended,
+        updated: updatedEventIds.has(change.eventId.toLowerCase()),
+      })),
     };
   });
 
-  emitProgress("completed", 88, "Database transaction committed. The updated student and attendance page can now be reloaded.");
+  emitProgress("completed", 88, `${label} processed and database transaction committed. Reloading attendance details.`);
   return result;
+}
+
+export async function setStudentEventAttendance(
+  finalResultId: string,
+  eventId: string,
+  attended: boolean,
+  updatedBy?: string,
+  onProgress?: (progress: StudentEventAttendanceProgress) => void,
+) {
+  const result = await setStudentEventAttendances(
+    finalResultId,
+    [{ eventId, attended }],
+    updatedBy,
+    onProgress,
+  );
+  return { studentId: result.studentId, ...result.changes[0] };
 }
 
 export async function listAttendanceFinalResults(

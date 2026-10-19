@@ -77,6 +77,7 @@ import {
   updateFinalResultProfile as updateAttendanceFinalResultProfile,
   updateStudentEventAttendance,
   updateStudentEventAttendanceWithProgress,
+  updateStudentEventAttendancesWithProgress,
   updateRecord as updateAttendanceRecord,
   updateRecordsBulk as updateAttendanceRecordsBulk,
 } from "./controller/attendance.controller";
@@ -327,6 +328,12 @@ app.patch("/api/attendance/events/:eventId", updateAttendanceEvent);
 app.delete("/api/attendance/events/:eventId", deleteAttendanceEvent);
 app.get("/api/attendance/dashboard-overview", requireAuth, attendanceDashboardOverview);
 app.get("/api/attendance/final-results", attendanceFinalResults);
+app.patch(
+  "/api/attendance/final-results/:id/events/batch/progress",
+  requireAuth,
+  requireAdmin,
+  updateStudentEventAttendancesWithProgress,
+);
 app.patch(
   "/api/attendance/final-results/:id/events/:eventId",
   requireAuth,

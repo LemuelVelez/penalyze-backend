@@ -51,6 +51,7 @@ import {
   saveAttendanceRows,
   saveManualAttendanceRecord,
   setStudentEventAttendance,
+  setStudentEventAttendances,
   mergeAttendanceEvents,
   updateAttendanceEvent,
   updateAttendanceFinalResultProfile,
@@ -1121,6 +1122,46 @@ export async function updateStudentEventAttendanceWithProgress(
       writeProgressStreamMessage(res, {
         type: "error",
         message: getErrorMessage(error, "Unable to update event attendance."),
+      });
+      res.end();
+      return;
+    }
+    next(error);
+  }
+}
+
+
+export async function updateStudentEventAttendancesWithProgress(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const id = getRouteParam(req, "id");
+    if (!id || !Array.isArray(req.body?.changes)) {
+      res.status(400).json({ message: "Student and event changes are required." });
+      return;
+    }
+
+    prepareProgressStream(res);
+    const result = await setStudentEventAttendances(
+      id,
+      req.body.changes,
+      getAuthenticatedUserId(req),
+      (progress) => writeProgressStreamMessage(res, { type: "progress", progress }),
+    );
+    writeProgressStreamMessage(res, {
+      type: "success",
+      message: "Selected student event attendance updated successfully.",
+      data: result,
+    });
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      res.locals.auditOutcome = "failed";
+      writeProgressStreamMessage(res, {
+        type: "error",
+        message: getErrorMessage(error, "Unable to update selected events."),
       });
       res.end();
       return;
