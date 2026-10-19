@@ -7239,8 +7239,8 @@ export function getExpectedEventGroupRepairCtesSql(isCalculation: boolean) {
     ), aligned AS (
       SELECT raw.*,
         COALESCE(
-          CASE WHEN cardinality(groups.observed_values) > 1
-            AND groups.observed_values = repair.observed_expected_values
+          CASE WHEN cardinality(repair.observed_expected_values) > 1
+            AND groups.observed_values <@ repair.observed_expected_values
             THEN repair.expected_events END,
           raw.raw_expected_events
         )::INT AS expected_events
@@ -8697,6 +8697,128 @@ export async function refreshCalculationResults(
 }
 
 /**
+ * A refresh can leave previously saved rows outside its selected source set.
+ * Correct these *visible saved* rows as well, using the exact school-year,
+ * calculation scope, college and normalized year level from the warning.
+ * Do not touch the underlying imported/manual attendance records.
+ *
+ * This reconciliation is deliberately restricted to the explicit admin repair
+ * action; ordinary refreshes still use the guarded source-signature override.
+ * The caller rechecks the full visible scope before committing the transaction.
+ */
+export function getSavedCalculationGroupRepairQuery() {
+  return `
+    WITH affected AS (
+      SELECT cr.id, cr.college_key, cr.attended_events, cr.manual_absences,
+        CASE WHEN $4::INT > 0
+          THEN GREATEST($4::INT - cr.attended_events, 0)
+          ELSE cr.imported_absences END::INT AS imported_absences
+      FROM calculation_results cr
+      WHERE cr.school_year_id = $1::UUID
+        AND cr.calculation_scope_key = $2::TEXT
+        AND cr.college_key = $3::TEXT
+        AND ${getYearLevelKeySql('cr.year_level')} IS NOT DISTINCT FROM NULLIF($5::TEXT, '')
+        AND cr.expected_events IS DISTINCT FROM $4::INT
+        AND NOT EXISTS (
+          SELECT 1 FROM attendance_imports hidden_import
+          WHERE hidden_import.id = ANY(cr.import_ids)
+            AND hidden_import.deleted_at IS NOT NULL
+        )
+    ), adjusted AS (
+      SELECT affected.*,
+        (affected.imported_absences + affected.manual_absences)::INT AS total_absences
+      FROM affected
+    ), matched AS (
+      SELECT adjusted.*, penalty.id AS penalty_id, penalty.prescribed_penalty
+      FROM adjusted
+      LEFT JOIN LATERAL (
+        SELECT p.id, p.prescribed_penalty
+        FROM penalties p
+        WHERE p.no_of_absences <= adjusted.total_absences
+        ORDER BY p.no_of_absences DESC, p.id DESC
+        LIMIT 1
+      ) penalty ON adjusted.total_absences > 0 AND adjusted.college_key IS NOT NULL
+    )
+    UPDATE calculation_results AS cr
+    SET expected_events = $4::INT,
+        imported_absences = matched.imported_absences,
+        total_absences = matched.total_absences,
+        absence_calculation_source = CASE WHEN $4::INT > 0
+          THEN 'roster' ELSE 'imported_fallback' END,
+        attendance_status = CASE
+          WHEN matched.college_key IS NULL THEN 'unresolved_college'
+          WHEN $4::INT > 0 AND cr.attended_events >= $4::INT
+            AND matched.total_absences <= 0 THEN 'perfect_attendance'
+          ELSE 'with_absences' END,
+        penalty_id = matched.penalty_id,
+        prescribed_penalty = CASE
+          WHEN matched.college_key IS NULL OR matched.total_absences <= 0 THEN NULL
+          ELSE COALESCE(matched.prescribed_penalty, 'No prescribed penalty configured.') END,
+        calculated_at = NOW(),
+        updated_at = NOW()
+    FROM matched
+    WHERE cr.id = matched.id
+    RETURNING cr.id
+  `;
+}
+
+/** Apply the same approved total to consolidated final rows when their
+ * independently rebuilt roster still has a conflict. The final-results table
+ * has no manual_absences column, so preserve its existing manual component
+ * (or recover it from manual records when it was using imported fallback).
+ */
+export function getSavedFinalGroupRepairQuery() {
+  return `
+    WITH affected AS (
+      SELECT afr.id, afr.college_key, afr.attended_events, afr.total_absences,
+        CASE WHEN afr.absence_calculation_source = 'roster'
+          THEN GREATEST(afr.total_absences -
+            GREATEST(afr.expected_events - afr.attended_events, 0), 0)
+          ELSE manual.manual_absences END::INT AS manual_absences
+      FROM attendance_final_results afr
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(CASE
+          WHEN mar.event_id IS NOT NULL
+            AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+            AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($5::TEXT)
+          THEN 0
+          ELSE GREATEST(mar.no_of_absences, 0)
+        END), 0)::INT AS manual_absences
+        FROM manual_attendance_records mar
+        WHERE mar.school_year_id = afr.school_year_id
+          AND LOWER(TRIM(mar.student_id)) = LOWER(TRIM(afr.student_id))
+      ) manual ON TRUE
+      WHERE afr.school_year_id = $1::UUID
+        AND afr.import_id IS NULL
+        AND ${getAttendanceFinalResultVisibilitySql('afr')}
+        AND afr.college_key = $2::TEXT
+        AND ${getYearLevelKeySql('afr.year_level')} IS NOT DISTINCT FROM NULLIF($4::TEXT, '')
+        AND afr.expected_events IS DISTINCT FROM $3::INT
+    ), adjusted AS (
+      SELECT affected.*,
+        CASE WHEN $3::INT > 0
+          THEN GREATEST($3::INT - affected.attended_events, 0) + affected.manual_absences
+          ELSE affected.total_absences END::INT AS corrected_absences
+      FROM affected
+    )
+    UPDATE attendance_final_results afr
+    SET expected_events = $3::INT,
+        total_absences = adjusted.corrected_absences,
+        absence_calculation_source = CASE WHEN $3::INT > 0
+          THEN 'roster' ELSE 'imported_fallback' END,
+        attendance_status = CASE
+          WHEN adjusted.college_key IS NULL THEN 'unresolved_college'
+          WHEN $3::INT > 0 AND afr.attended_events >= $3::INT
+            AND adjusted.corrected_absences <= 0 THEN 'perfect_attendance'
+          ELSE 'with_absences' END,
+        updated_at = NOW()
+    FROM adjusted
+    WHERE afr.id = adjusted.id
+    RETURNING afr.id
+  `;
+}
+
+/**
  * One-click repair for every inconsistent displayed group in this school year
  * and calculation scope. Overrides are persisted with the observed conflicting
  * totals, so future source changes invalidate the correction automatically.
@@ -8747,9 +8869,61 @@ export async function repairCalculationConsistency(
         schoolYearId, importIds, sourceTypes, logConsistencyViolation: false,
       });
     }
-    const remainingViolations = await assertExpectedEventConsistencyWithClient(
+    // The CTE override works for a complete raw roster group. Rows kept from
+    // an older/import-limited calculation can have a different visible set of
+    // totals, so an exact source signature alone cannot repair them. Apply a
+    // scoped, auditable saved-result correction to any remaining conflicts.
+    let remainingViolations = await assertExpectedEventConsistencyWithClient(
       client, "calculation_results", schoolYearId, calculationScopeKey,
     );
+    let directlyRepairedRows = 0;
+    if (remainingViolations.length) {
+      const currentRows = await client.query<CalculationResultRecord>(
+        `SELECT cr.* FROM calculation_results cr
+         WHERE cr.school_year_id = $1::UUID AND cr.calculation_scope_key = $2::TEXT
+           AND NOT EXISTS (
+             SELECT 1 FROM attendance_imports hidden_import
+             WHERE hidden_import.id = ANY(cr.import_ids)
+               AND hidden_import.deleted_at IS NOT NULL
+           )`,
+        [schoolYearId, calculationScopeKey],
+      );
+      const fallbackTargets = selectExpectedEventGroupRepairTargets(
+        currentRows.rows, remainingViolations,
+      );
+      const initiallyChosen = new Map(targets.map((target) => [
+        expectedEventGroupKey(target.schoolYearId, calculationScopeKey, target.collegeKey, target.yearLevelKey || null),
+        target.expectedEvents,
+      ]));
+      for (const target of fallbackTargets) {
+        const key = expectedEventGroupKey(
+          target.schoolYearId, calculationScopeKey, target.collegeKey, target.yearLevelKey || null,
+        );
+        const desiredTotal = initiallyChosen.get(key) ?? target.expectedEvents;
+        if (!targets.some((existing) => existing.collegeKey === target.collegeKey && existing.yearLevelKey === target.yearLevelKey)) {
+          targets.push({ ...target, expectedEvents: desiredTotal });
+          await client.query(
+            `INSERT INTO attendance_expected_event_group_repairs (
+               school_year_id, college_key, year_level_key, expected_events, observed_expected_values
+             ) VALUES ($1::UUID, $2::TEXT, $3::TEXT, $4::INT, $5::INT[])
+             ON CONFLICT (school_year_id, college_key, year_level_key)
+             DO UPDATE SET expected_events = EXCLUDED.expected_events,
+               observed_expected_values = EXCLUDED.observed_expected_values,
+               updated_at = NOW()`,
+            [schoolYearId, target.collegeKey, target.yearLevelKey,
+              desiredTotal, target.observedValues],
+          );
+        }
+        const correction = await client.query<{ id: string }>(
+          getSavedCalculationGroupRepairQuery(),
+          [schoolYearId, calculationScopeKey, target.collegeKey, desiredTotal, target.yearLevelKey],
+        );
+        directlyRepairedRows += correction.rows.length;
+      }
+      remainingViolations = await assertExpectedEventConsistencyWithClient(
+        client, "calculation_results", schoolYearId, calculationScopeKey,
+      );
+    }
     if (remainingViolations.length) {
       throw createValidationError(
         `Unable to resolve ${remainingViolations.map(formatExpectedEventWarning).join("; ")}. No records were changed.`,
@@ -8757,7 +8931,44 @@ export async function repairCalculationConsistency(
       );
     }
 
-    await refreshAttendanceFinalResultsWithClient(client, { schoolYearId });
+    await refreshAttendanceFinalResultsWithClient(client, { schoolYearId, logConsistencyViolation: false });
+    // Consolidated final results are independently recalculated. If they
+    // still conflict for a repaired group, correct the corresponding visible
+    // consolidated records before updating fines (never per-import rows).
+    const finalViolations = await assertExpectedEventConsistencyWithClient(
+      client, "attendance_final_results", schoolYearId,
+    );
+    let directlyRepairedFinalRows = 0;
+    let attemptedFinalRepairs = 0;
+    for (const violation of finalViolations) {
+      const chosen = targets.find((target) =>
+        target.collegeKey === violation.college_key &&
+        target.yearLevelKey === (violation.year_level_key ?? "")
+      );
+      if (!chosen) continue;
+      attemptedFinalRepairs += 1;
+      const result = await client.query<{ id: string }>(
+        getSavedFinalGroupRepairQuery(),
+        [schoolYearId, chosen.collegeKey, chosen.expectedEvents,
+          chosen.yearLevelKey, ZERO_ATTENDANCE_REMARK],
+      );
+      directlyRepairedFinalRows += result.rows.length;
+    }
+    if (attemptedFinalRepairs) {
+      const finalRemaining = await assertExpectedEventConsistencyWithClient(
+        client, "attendance_final_results", schoolYearId,
+      );
+      const unrepairedGroups = finalRemaining.filter((violation) => targets.some((target) =>
+        target.collegeKey === violation.college_key &&
+        target.yearLevelKey === (violation.year_level_key ?? "")
+      ));
+      if (unrepairedGroups.length) {
+        throw createValidationError(
+          `Unable to resolve consolidated totals: ${unrepairedGroups.map(formatExpectedEventWarning).join("; ")}. No records were changed.`,
+          409,
+        );
+      }
+    }
     await refreshPenaltyResultsForSchoolYearWithClient(
       client, schoolYearId, calculationScopeKey,
     );
@@ -8769,12 +8980,14 @@ export async function repairCalculationConsistency(
         `INSERT INTO audit_logs (action, resource_type, method, route, status_code, details)
          VALUES ('attendance_expected_events_auto_repaired', 'calculation_results',
            'SYSTEM', '/api/attendance/calculation-results/repair-consistency', 200, $1::jsonb)`,
-        [JSON.stringify({ schoolYearId, calculationScopeKey, targets })],
+        [JSON.stringify({ schoolYearId, calculationScopeKey, targets, directlyRepairedRows, directlyRepairedFinalRows })],
       );
     }
     return {
       repaired: targets.length > 0 || previousViolations.length > 0,
       repairedGroups: targets,
+      directlyRepairedRows,
+      directlyRepairedFinalRows,
       remainingViolations,
     };
   });
@@ -8959,7 +9172,7 @@ type AttendanceFinalResultsFilter = {
 
 async function refreshAttendanceFinalResultsWithClient(
   client: PoolClient,
-  options: Pick<AttendanceFinalResultsFilter, "schoolYearId" | "importId"> = {},
+  options: Pick<AttendanceFinalResultsFilter, "schoolYearId" | "importId"> & { logConsistencyViolation?: boolean } = {},
 ) {
   const schoolYearId = cleanText(options.schoolYearId) || null;
 
@@ -9377,7 +9590,7 @@ async function refreshAttendanceFinalResultsWithClient(
     "attendance_final_results",
     schoolYearId,
     undefined,
-    true,
+    options.logConsistencyViolation !== false,
   );
   return attachExpectedEventConsistencyWarnings(currentResult.rows, violations, "attendance_final_results");
 }

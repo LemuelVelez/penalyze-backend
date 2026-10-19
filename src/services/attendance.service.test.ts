@@ -12,6 +12,8 @@ import {
   setStudentEventAttendance,
   repairCalculationConsistency,
   getExpectedEventGroupRepairCtesSql,
+  getSavedCalculationGroupRepairQuery,
+  getSavedFinalGroupRepairQuery,
   selectExpectedEventGroupRepairTargets,
   getYearLevelKeySql,
   normalizeYearLevelKey,
@@ -285,15 +287,46 @@ test("automatic expected-event repair chooses the most common total for every af
   assert.deepEqual(targets[0]?.observedValues, [7, 8]);
 });
 
-test("automatic repairs apply in both refreshes only to unchanged conflicting source groups", () => {
+test("automatic repairs also cover partial stale-roster groups without accepting novel totals", () => {
   for (const isCalculation of [true, false]) {
     const sql = getExpectedEventGroupRepairCtesSql(isCalculation);
     assert.match(sql, /attendance_expected_event_group_repairs/);
-    assert.match(sql, /groups\.observed_values = repair\.observed_expected_values/);
-    assert.match(sql, /cardinality\(groups\.observed_values\) > 1/);
+    assert.match(sql, /groups\.observed_values <@ repair\.observed_expected_values/);
+    assert.match(sql, /cardinality\(repair\.observed_expected_values\) > 1/);
     assert.match(sql, /raw\.year_level/);
     assert.match(sql, /GREATEST\(aligned\.expected_events - aligned\.attended_events, 0\)/);
     assert.match(sql, /raw_total_absences/);
     assert.match(sql, /THEN 'roster' ELSE 'imported_fallback'/);
   }
+});
+
+
+test("explicit saved-record repair stays inside the visible group and recalculates absences and fines", () => {
+  const sql = getSavedCalculationGroupRepairQuery();
+  assert.match(sql, /cr\.school_year_id = \$1::UUID/);
+  assert.match(sql, /cr\.calculation_scope_key = \$2::TEXT/);
+  assert.match(sql, /cr\.college_key = \$3::TEXT/);
+  assert.match(sql, /IS NOT DISTINCT FROM NULLIF\(\$5::TEXT, ''\)/);
+  assert.match(sql, /hidden_import\.deleted_at IS NOT NULL/);
+  assert.match(sql, /GREATEST\(\$4::INT - cr\.attended_events, 0\)/);
+  assert.match(sql, /affected\.imported_absences \+ affected\.manual_absences/);
+  assert.match(sql, /LEFT JOIN LATERAL/);
+  assert.match(sql, /penalty_id = matched\.penalty_id/);
+  assert.match(sql, /calculated_at = NOW\(\)/);
+  assert.match(sql, /RETURNING cr\.id/);
+});
+
+
+test("fallback final-result repair respects consolidated visibility and manual penalties", () => {
+  const sql = getSavedFinalGroupRepairQuery();
+  assert.match(sql, /afr\.school_year_id = \$1::UUID/);
+  assert.match(sql, /afr\.import_id IS NULL/);
+  assert.match(sql, /getSavedFinalGroupRepairQuery|visible_import|afr\.id IS NOT NULL/);
+  assert.match(sql, /afr\.college_key = \$2::TEXT/);
+  assert.match(sql, /IS NOT DISTINCT FROM NULLIF\(\$4::TEXT, ''\)/);
+  assert.match(sql, /afr\.expected_events IS DISTINCT FROM \$3::INT/);
+  assert.match(sql, /affected\.manual_absences/);
+  assert.match(sql, /GREATEST\(\$3::INT - affected\.attended_events, 0\)/);
+  assert.match(sql, /UPDATE attendance_final_results afr/);
+  assert.match(sql, /RETURNING afr\.id/);
 });
