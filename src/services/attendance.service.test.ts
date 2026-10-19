@@ -5,6 +5,9 @@ import test from "node:test";
 import * as XLSX from "xlsx";
 
 import {
+  attachExpectedEventConsistencyWarnings,
+  getExpectedEventConsistencyQuery,
+  getYearLevelKeySql,
   normalizeYearLevelKey,
   previewAttendanceFileBase,
   type UploadedAttendanceFile,
@@ -134,4 +137,83 @@ test("normalizes supported year level variants", () => {
   assert.equal(normalizeYearLevelKey("Graduate"), null);
   assert.equal(normalizeYearLevelKey(""), null);
   assert.equal(normalizeYearLevelKey(null), null);
+});
+
+test("consistency SQL never compares calculation scopes or hidden imports", () => {
+  const { sql: allScopesSql, params: allScopesParams } = getExpectedEventConsistencyQuery(
+    "calculation_results",
+    "00000000-0000-4000-8000-000000000001",
+  );
+  assert.deepEqual(allScopesParams, ["00000000-0000-4000-8000-000000000001"]);
+  assert.match(allScopesSql, /GROUP BY school_year_id, calculation_scope_key, college_key, year_level_key/);
+  assert.match(allScopesSql, /hidden_import\.id = ANY\(cr\.import_ids\)/);
+  assert.match(allScopesSql, /hidden_import\.deleted_at IS NOT NULL/);
+  assert.match(allScopesSql, /HAVING COUNT\(DISTINCT expected_events\) > 1/);
+
+  const { sql: scopedSql, params } = getExpectedEventConsistencyQuery(
+    "calculation_results",
+    "00000000-0000-4000-8000-000000000001",
+    "sources:imported|imports:all",
+  );
+  assert.match(scopedSql, /cr\.calculation_scope_key = \$2::TEXT/);
+  assert.deepEqual(params, [
+    "00000000-0000-4000-8000-000000000001",
+    "sources:imported|imports:all",
+  ]);
+});
+
+test("final-results consistency excludes per-import and invisible rows", () => {
+  const { sql } = getExpectedEventConsistencyQuery("attendance_final_results", null);
+  assert.match(sql, /afr\.import_id IS NULL/);
+  assert.match(sql, /visible_import/);
+  assert.match(sql, /afr\.school_year_id/);
+  assert.match(sql, /HAVING COUNT\(DISTINCT expected_events\) > 1/);
+});
+
+test("only rows in the genuinely mismatched college/year/scope receive detailed warnings", () => {
+  const school_year_id = "00000000-0000-4000-8000-000000000001";
+  const base = { school_year_id, college_key: "college of engineering", college: "College of Engineering", year_level: "1st Year" };
+  const rows = [
+    { ...base, student_id: "A", calculation_scope_key: "school_year", expected_events: 3 },
+    { ...base, student_id: "B", calculation_scope_key: "school_year", expected_events: 5 },
+    { ...base, student_id: "C", calculation_scope_key: "sources:manual|imports:all", expected_events: 7 },
+    { ...base, student_id: "D", year_level: "2nd Year", calculation_scope_key: "school_year", expected_events: 3 },
+  ];
+  const mismatched = attachExpectedEventConsistencyWarnings(rows, [
+    {
+      school_year_id,
+      calculation_scope_key: "school_year",
+      college_key: "college of engineering",
+      college: "College of Engineering",
+      year_level_key: "1",
+      expected_event_values: [3, 5],
+      student_count: 2,
+    },
+  ], "calculation_results");
+  assert.match(mismatched[0].consistency_warning ?? "", /College of Engineering.*1st Year.*3 vs 5 expected events/);
+  assert.equal(mismatched[0].consistency_warning, mismatched[1].consistency_warning);
+  assert.equal(mismatched[2].consistency_warning, null, "another scope is not the same denominator group");
+  assert.equal(mismatched[3].consistency_warning, null, "another year is not the same group");
+});
+
+test("TypeScript and SQL year-level normalizers accept exactly the same aliases", () => {
+  const sql = getYearLevelKeySql("year_level");
+  const cases = [...sql.matchAll(/WHEN\s+.*?\s+IN\s*\(([^)]+)\)\s+THEN\s+'([1-5])'/g)];
+  assert.equal(cases.length, 5);
+  const sqlAliases = new Map<string, string>();
+  for (const [, literals, year] of cases) {
+    for (const [, alias] of literals.matchAll(/'([^']+)'/g)) {
+      sqlAliases.set(alias, year);
+    }
+  }
+  assert.equal(sqlAliases.size, 35);
+  for (const [alias, year] of sqlAliases) {
+    assert.equal(normalizeYearLevelKey(alias), year, `alias: ${alias}`);
+    assert.equal(normalizeYearLevelKey(`  ${alias.toUpperCase()}  `), year);
+  }
+  for (const input of ["6", "graduate", "", "sixth year", "iiiI", "3rd-year!!", "  2nd\u00a0yr  "]) {
+    const normalized = String(input).trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+    assert.equal(normalizeYearLevelKey(input), sqlAliases.get(normalized) ?? null, input);
+  }
+  assert.match(sql, /ELSE NULL/);
 });

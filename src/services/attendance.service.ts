@@ -6764,116 +6764,236 @@ type AttendanceConsistencyTable =
   | "attendance_final_results"
   | "calculation_results";
 
-async function assertExpectedEventConsistencyWithClient(
-  client: PoolClient,
+type ExpectedEventViolation = {
+  school_year_id: string | null;
+  calculation_scope_key: string | null;
+  college_key: string;
+  college: string | null;
+  year_level_key: string | null;
+  expected_event_values: number[];
+  student_count: number;
+};
+
+type ConsistencyResultRow = Pick<
+  CalculationResultRecord,
+  "school_year_id" | "college_key" | "year_level"
+> & { calculation_scope_key?: string | null; college?: string | null };
+
+// This is also used for listing saved calculations. Never compare different
+// calculation scopes or invisible rows, even when the caller selects all scopes.
+export function getExpectedEventConsistencyQuery(
   table: AttendanceConsistencyTable,
   schoolYearId: string | null,
   calculationScopeKey?: string,
 ) {
-  const scopeClause =
-    table === "calculation_results" && calculationScopeKey
-      ? "AND calculation_scope_key = $2::TEXT"
-      : "";
-  const params =
-    table === "calculation_results" && calculationScopeKey
-      ? [schoolYearId, calculationScopeKey]
-      : [schoolYearId];
+  const isCalculation = table === "calculation_results";
+  const alias = isCalculation ? "cr" : "afr";
+  const params: unknown[] = [schoolYearId];
+  const filters = [`($1::uuid IS NULL OR ${alias}.school_year_id = $1::uuid)`];
 
-  const violations = await client.query<{
-    school_year_id: string | null;
-    college_key: string;
-    year_level_key: string | null;
-    expected_event_values: number[];
-    student_count: number;
-  }>(
-    `
+  if (isCalculation) {
+    filters.push(`NOT EXISTS (
+      SELECT 1 FROM attendance_imports hidden_import
+      WHERE hidden_import.id = ANY(cr.import_ids)
+        AND hidden_import.deleted_at IS NOT NULL
+    )`);
+    if (calculationScopeKey) {
+      params.push(calculationScopeKey);
+      filters.push(`cr.calculation_scope_key = $${params.length}::TEXT`);
+    }
+  } else {
+    filters.push("afr.import_id IS NULL");
+    filters.push(getAttendanceFinalResultVisibilitySql("afr"));
+  }
+
+  const scopeSql = isCalculation
+    ? "cr.calculation_scope_key"
+    : "NULL::TEXT";
+  return {
+    sql: `
+      WITH visible_rows AS (
+        SELECT
+          ${alias}.school_year_id,
+          ${scopeSql} AS calculation_scope_key,
+          ${alias}.college_key,
+          ${alias}.college,
+          ${getYearLevelKeySql(`${alias}.year_level`)} AS year_level_key,
+          ${alias}.expected_events
+        FROM ${table} ${alias}
+        WHERE ${filters.join(" AND ")}
+      )
       SELECT
         school_year_id,
+        calculation_scope_key,
         college_key,
-        ${getYearLevelKeySql("year_level")} AS year_level_key,
+        MAX(NULLIF(TRIM(college), '')) AS college,
+        year_level_key,
         ARRAY_AGG(DISTINCT expected_events ORDER BY expected_events) AS expected_event_values,
         COUNT(*)::INT AS student_count
-      FROM ${table}
-      WHERE ($1::uuid IS NULL OR school_year_id = $1::uuid)
-        AND college_key IS NOT NULL
-        ${scopeClause}
-      GROUP BY school_year_id, college_key, ${getYearLevelKeySql("year_level")}
+      FROM visible_rows
+      WHERE college_key IS NOT NULL
+      GROUP BY school_year_id, calculation_scope_key, college_key, year_level_key
       HAVING COUNT(DISTINCT expected_events) > 1
+      ORDER BY school_year_id, calculation_scope_key, college_key, year_level_key
     `,
     params,
-  );
+  };
+}
 
-  if (!violations.rows.length) return new Set<string>();
+function expectedEventGroupKey(
+  schoolYearId: string | null,
+  calculationScopeKey: string | null,
+  collegeKey: string,
+  yearLevelKey: string | null,
+) {
+  return JSON.stringify([
+    schoolYearId,
+    calculationScopeKey,
+    collegeKey,
+    yearLevelKey,
+  ]);
+}
+
+function formatExpectedEventWarning(violation: ExpectedEventViolation) {
+  const year = violation.year_level_key;
+  const yearLabel = year
+    ? `${year}${({ "1": "st", "2": "nd", "3": "rd" } as Record<string, string>)[year] ?? "th"} Year`
+    : "Unresolved year level";
+  const scopeLabel = violation.calculation_scope_key && violation.calculation_scope_key !== "school_year"
+    ? ` (scope: ${violation.calculation_scope_key})`
+    : "";
+  return `${violation.college || violation.college_key} — ${yearLabel}${scopeLabel}: ` +
+    `${violation.expected_event_values.join(" vs ")} expected events`;
+}
+
+export function attachExpectedEventConsistencyWarnings<T extends ConsistencyResultRow>(
+  rows: T[],
+  violations: ExpectedEventViolation[],
+  table: AttendanceConsistencyTable,
+): Array<T & { consistency_warning: string | null }> {
+  const warnings = new Map(
+    violations.map((violation) => [
+      expectedEventGroupKey(
+        violation.school_year_id,
+        violation.calculation_scope_key,
+        violation.college_key,
+        violation.year_level_key,
+      ),
+      formatExpectedEventWarning(violation),
+    ]),
+  );
+  return rows.map((row) => ({
+    ...row,
+    consistency_warning: row.college_key
+      ? warnings.get(expectedEventGroupKey(
+          row.school_year_id,
+          table === "calculation_results" ? row.calculation_scope_key : null,
+          row.college_key,
+          normalizeYearLevelKey(row.year_level),
+        )) ?? null
+      : null,
+  }));
+}
+
+async function assertExpectedEventConsistencyWithClient(
+  client: PoolClient | null,
+  table: AttendanceConsistencyTable,
+  schoolYearId: string | null,
+  calculationScopeKey?: string,
+  logViolation = false,
+): Promise<ExpectedEventViolation[]> {
+  const { sql, params } = getExpectedEventConsistencyQuery(
+    table,
+    schoolYearId,
+    calculationScopeKey,
+  );
+  const result = client
+    ? await client.query<ExpectedEventViolation>(sql, params)
+    : await query<ExpectedEventViolation>(sql, params);
+  const violations = result.rows;
+
+  // A preview is always rolled back; its warning must be self-contained.
+  // Listing results must not write audit entries either.
+  if (!logViolation || !client || !violations.length) return violations;
+
+  const previous = await client.query<{ violations: ExpectedEventViolation[] | null }>(
+    `
+      SELECT details->'violations' AS violations
+      FROM audit_logs
+      WHERE action = 'attendance_expected_events_consistency_violation'
+        AND resource_type = $1::TEXT
+        AND (details->>'schoolYearId') IS NOT DISTINCT FROM $2::TEXT
+        AND (details->>'calculationScopeKey') IS NOT DISTINCT FROM $3::TEXT
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `,
+    [table, schoolYearId, calculationScopeKey ?? null],
+  );
+  // The query orders groups and totals deterministically. A stable mismatch
+  // only needs one audit entry until its values / affected students change.
+  const signature = (items: ExpectedEventViolation[] | null | undefined) =>
+    JSON.stringify(items?.map((item) => [
+      item.school_year_id,
+      item.calculation_scope_key,
+      item.college_key,
+      item.year_level_key,
+      item.expected_event_values,
+      item.student_count,
+    ]));
+  if (signature(previous.rows[0]?.violations) === signature(violations)) {
+    return violations;
+  }
 
   await client.query(
     `
       INSERT INTO audit_logs (
-        action,
-        resource_type,
-        method,
-        route,
-        status_code,
-        details
-      )
-      VALUES (
+        action, resource_type, method, route, status_code, details
+      ) VALUES (
         'attendance_expected_events_consistency_violation',
-        $1::TEXT,
-        'SYSTEM',
-        '/internal/attendance/refresh',
-        409,
-        $2::jsonb
+        $1::TEXT, 'SYSTEM', '/internal/attendance/refresh', 409, $2::jsonb
       )
     `,
-    [
-      table,
-      JSON.stringify({
-        schoolYearId,
-        calculationScopeKey: calculationScopeKey ?? null,
-        violations: violations.rows,
-      }),
-    ],
+    [table, JSON.stringify({
+      schoolYearId,
+      calculationScopeKey: calculationScopeKey ?? null,
+      violations,
+    })],
   );
 
-  return new Set(
-    violations.rows.map(
-      (row) => `${row.school_year_id ?? "null"}::${row.college_key}::${row.year_level_key ?? "unresolved"}`,
-    ),
-  );
+  return violations;
 }
 
-async function refreshCalculationResultsWithClient(
-  client: PoolClient,
-  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
-) {
-  const schoolYearId = cleanText(options.schoolYearId) || null;
-  const importIds = normalizeImportIds(options.importIds ?? []);
-  const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
-  const sourceFlags = getCalculationSourceFlags(sourceTypes);
-  const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
+// Both result refreshes resolve the student's denominator group from the
+// same canonical college and latest valid year level, not from display text.
+function getStudentEventScopeCteSql(keysCte: "selected_student_keys" | "student_keys") {
+  return `student_event_scope AS (
+    SELECT
+      keys.school_year_id,
+      keys.normalized_student_id,
+      CASE
+        WHEN ${getCanonicalCollegeKeySql("s", "s")} IS NOT NULL
+          THEN ${getCanonicalCollegeKeySql("s", "s")}
+        WHEN COALESCE(colleges.college_key_count, 0) = 1
+          THEN colleges.college_key
+        ELSE NULL
+      END AS college_key,
+      resolved_year_level.year_level_key
+    FROM ${keysCte} keys
+    LEFT JOIN canonical_students s
+      ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
+    LEFT JOIN calculation_resolved_year_levels resolved_year_level
+      ON resolved_year_level.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+     AND resolved_year_level.normalized_student_id = keys.normalized_student_id
+    LEFT JOIN student_college_totals colleges
+      ON colleges.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+     AND colleges.normalized_student_id = keys.normalized_student_id
+  )`;
+}
 
-  await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
-
-  await client.query(
-    `
-      WITH canonical_students AS (
-        SELECT DISTINCT ON (LOWER(TRIM(student_id)))
-          id,
-          student_id,
-          name,
-          year_level,
-          college,
-          program,
-          institution,
-          created_at,
-          updated_at
-        FROM students
-        WHERE NULLIF(TRIM(student_id), '') IS NOT NULL
-        ORDER BY
-          LOWER(TRIM(student_id)),
-          updated_at DESC,
-          created_at DESC,
-          id DESC
-      ), calculation_year_level_candidates AS MATERIALIZED (
+// Shared materialized resolution keeps both result refreshes consistent and
+// avoids per-student correlated year-level lookups when building denominators.
+function getYearLevelResolutionCtesSql() {
+  return `calculation_year_level_candidates AS MATERIALIZED (
         SELECT
           ar.school_year_id,
           LOWER(TRIM(ar.student_id)) AS normalized_student_id,
@@ -6931,7 +7051,13 @@ async function refreshCalculationResultsWithClient(
          AND latest.normalized_student_id = keys.normalized_student_id
         LEFT JOIN canonical_students student
           ON LOWER(TRIM(student.student_id)) = keys.normalized_student_id
-      ), event_participation AS MATERIALIZED (
+      )`;
+}
+
+// Both refreshes use the exact same roster and participation CTEs, including
+// canonical college and year-level exemptions.
+function getDenominatorEventScopeCtesSql() {
+  return `event_participation AS MATERIALIZED (
         SELECT DISTINCT
           ar.school_year_id,
           COALESCE(ar.event_id, ai.event_id) AS event_id,
@@ -7023,7 +7149,42 @@ async function refreshCalculationResultsWithClient(
             "roster_manual_year_level.year_level_key",
             getCanonicalCollegeKeySql("mar", "roster_manual_student"),
           )}
-      ), selected_imported_records AS (
+      )`;
+}
+
+async function refreshCalculationResultsWithClient(
+  client: PoolClient,
+  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> & { logConsistencyViolation?: boolean } = {},
+) {
+  const schoolYearId = cleanText(options.schoolYearId) || null;
+  const importIds = normalizeImportIds(options.importIds ?? []);
+  const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
+  const sourceFlags = getCalculationSourceFlags(sourceTypes);
+  const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
+
+  await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
+
+  await client.query(
+    `
+      WITH canonical_students AS (
+        SELECT DISTINCT ON (LOWER(TRIM(student_id)))
+          id,
+          student_id,
+          name,
+          year_level,
+          college,
+          program,
+          institution,
+          created_at,
+          updated_at
+        FROM students
+        WHERE NULLIF(TRIM(student_id), '') IS NOT NULL
+        ORDER BY
+          LOWER(TRIM(student_id)),
+          updated_at DESC,
+          created_at DESC,
+          id DESC
+      ), ${getYearLevelResolutionCtesSql()}, ${getDenominatorEventScopeCtesSql()}, selected_imported_records AS (
         SELECT
           ar.school_year_id,
           ar.import_id,
@@ -7210,28 +7371,7 @@ async function refreshCalculationResultsWithClient(
           MAX(college_key) AS college_key
         FROM student_college_candidates
         GROUP BY school_year_id, normalized_student_id
-      ), student_event_scope AS (
-        SELECT
-          keys.school_year_id,
-          keys.normalized_student_id,
-          CASE
-            WHEN ${getCanonicalCollegeKeySql("s", "s")} IS NOT NULL
-              THEN ${getCanonicalCollegeKeySql("s", "s")}
-            WHEN COALESCE(colleges.college_key_count, 0) = 1
-              THEN colleges.college_key
-            ELSE NULL
-          END AS college_key,
-          resolved_year_level.year_level_key
-        FROM selected_student_keys keys
-        LEFT JOIN canonical_students s
-          ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
-        LEFT JOIN calculation_resolved_year_levels resolved_year_level
-          ON resolved_year_level.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-         AND resolved_year_level.normalized_student_id = keys.normalized_student_id
-        LEFT JOIN student_college_totals colleges
-          ON colleges.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-         AND colleges.normalized_student_id = keys.normalized_student_id
-      ), expected_event_totals AS (
+      ), ${getStudentEventScopeCteSql("selected_student_keys")}, expected_event_totals AS (
         SELECT
           student.school_year_id,
           student.normalized_student_id,
@@ -7601,34 +7741,24 @@ async function refreshCalculationResultsWithClient(
       FROM calculation_results cr
       WHERE ($1::uuid IS NULL OR cr.school_year_id = $1::uuid)
         AND cr.calculation_scope_key = $2::TEXT
+        AND NOT EXISTS (
+          SELECT 1 FROM attendance_imports hidden_import
+          WHERE hidden_import.id = ANY(cr.import_ids)
+            AND hidden_import.deleted_at IS NOT NULL
+        )
       ORDER BY LOWER(TRIM(cr.student_id)), cr.created_at
     `,
     [schoolYearId, calculationScopeKey],
   );
 
-  const consistencyWarnings = await assertExpectedEventConsistencyWithClient(
+  const violations = await assertExpectedEventConsistencyWithClient(
     client,
     "calculation_results",
     schoolYearId,
     calculationScopeKey,
+    options.logConsistencyViolation !== false,
   );
-
-  if (!consistencyWarnings.size) return currentResult.rows;
-
-  return currentResult.rows.map((row) => {
-    const yearLevelKey = normalizeYearLevelKey(row.year_level);
-
-    return {
-      ...row,
-      consistency_warning:
-        row.college_key &&
-        consistencyWarnings.has(
-          `${row.school_year_id ?? "null"}::${row.college_key}::${yearLevelKey ?? "unresolved"}`,
-        )
-          ? "Expected-event denominator mismatch detected for this college and year level."
-          : null,
-    };
-  });
+  return attachExpectedEventConsistencyWarnings(currentResult.rows, violations, "calculation_results");
 }
 
 function getCalculationScopeIncludesSourceSql(
@@ -8345,6 +8475,7 @@ export async function previewCalculationResults(
       schoolYearId: options.schoolYearId,
       importIds,
       sourceTypes,
+      logConsistencyViolation: false,
     });
 
     await client.query("ROLLBACK");
@@ -8491,53 +8622,15 @@ export async function listCalculationResults(
     params,
   );
 
-  const warningParams: unknown[] = [options.schoolYearId ?? null];
-  const warningClauses = ["($1::uuid IS NULL OR school_year_id = $1::uuid)"];
-  if (importIds.length || options.sourceTypes?.length) {
-    warningParams.push(getCalculationScopeKey(importIds, sourceTypes));
-    warningClauses.push(`calculation_scope_key = $${warningParams.length}::TEXT`);
-  }
-  const consistencyResult = await query<{
-    school_year_id: string | null;
-    college_key: string;
-    year_level_key: string | null;
-  }>(
-    `
-      SELECT
-        school_year_id,
-        college_key,
-        ${getYearLevelKeySql("year_level")} AS year_level_key
-      FROM calculation_results
-      WHERE ${warningClauses.join(" AND ")}
-        AND college_key IS NOT NULL
-      GROUP BY school_year_id, college_key, ${getYearLevelKeySql("year_level")}
-      HAVING COUNT(DISTINCT expected_events) > 1
-    `,
-    warningParams,
+  const violations = await assertExpectedEventConsistencyWithClient(
+    null,
+    "calculation_results",
+    options.schoolYearId ?? null,
+    importIds.length || options.sourceTypes?.length
+      ? getCalculationScopeKey(importIds, sourceTypes)
+      : undefined,
   );
-  const inconsistentKeys = new Set(
-    consistencyResult.rows.map(
-      (row) =>
-        `${row.school_year_id ?? "null"}::${row.college_key}::${row.year_level_key ?? "unresolved"}`,
-    ),
-  );
-
-  if (!inconsistentKeys.size) return result.rows;
-
-  return result.rows.map((row) => {
-    const yearLevelKey = normalizeYearLevelKey(row.year_level);
-
-    return {
-      ...row,
-      consistency_warning:
-        row.college_key &&
-        inconsistentKeys.has(
-          `${row.school_year_id ?? "null"}::${row.college_key}::${yearLevelKey ?? "unresolved"}`,
-        )
-          ? "Expected-event denominator mismatch detected for this college and year level."
-          : null,
-    };
-  });
+  return attachExpectedEventConsistencyWarnings(result.rows, violations, "calculation_results");
 }
 
 export async function deleteCalculationResultsByIds(
@@ -8641,9 +8734,7 @@ async function refreshAttendanceFinalResultsWithClient(
 
   await client.query(
     `
-      WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
-      ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
-      canonical_students AS (
+      WITH canonical_students AS (
         SELECT DISTINCT ON (LOWER(TRIM(student_id)))
           id,
           student_id,
@@ -8662,6 +8753,8 @@ async function refreshAttendanceFinalResultsWithClient(
           created_at DESC,
           id DESC
       ),
+      ${getYearLevelResolutionCtesSql()},
+      ${getDenominatorEventScopeCtesSql()},
       all_imported_records AS (
         SELECT
           ar.school_year_id,
@@ -8789,28 +8882,7 @@ async function refreshAttendanceFinalResultsWithClient(
           MAX(college_key) AS college_key
         FROM student_college_candidates
         GROUP BY school_year_id, normalized_student_id
-      ), student_event_scope AS (
-        SELECT
-          keys.school_year_id,
-          keys.normalized_student_id,
-          CASE
-            WHEN ${getCanonicalCollegeKeySql("s", "s")} IS NOT NULL
-              THEN ${getCanonicalCollegeKeySql("s", "s")}
-            WHEN COALESCE(colleges.college_key_count, 0) = 1
-              THEN colleges.college_key
-            ELSE NULL
-          END AS college_key,
-          ${getResolvedStudentYearLevelKeySql(
-            "keys.normalized_student_id",
-            "keys.school_year_id",
-          )} AS year_level_key
-        FROM student_keys keys
-        LEFT JOIN canonical_students s
-          ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
-        LEFT JOIN student_college_totals colleges
-          ON colleges.school_year_id IS NOT DISTINCT FROM keys.school_year_id
-         AND colleges.normalized_student_id = keys.normalized_student_id
-      ), expected_event_totals AS (
+      ), ${getStudentEventScopeCteSql("student_keys")}, expected_event_totals AS (
         SELECT
           student.school_year_id,
           student.normalized_student_id,
@@ -9059,33 +9131,20 @@ async function refreshAttendanceFinalResultsWithClient(
       FROM attendance_final_results afr
       WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
         AND afr.import_id IS NULL
+        AND ${getAttendanceFinalResultVisibilitySql("afr")}
       ORDER BY LOWER(TRIM(afr.student_id)), afr.created_at
     `,
     [schoolYearId],
   );
 
-  const consistencyWarnings = await assertExpectedEventConsistencyWithClient(
+  const violations = await assertExpectedEventConsistencyWithClient(
     client,
     "attendance_final_results",
     schoolYearId,
+    undefined,
+    true,
   );
-
-  if (!consistencyWarnings.size) return currentResult.rows;
-
-  return currentResult.rows.map((row) => {
-    const yearLevelKey = normalizeYearLevelKey(row.year_level);
-
-    return {
-      ...row,
-      consistency_warning:
-        row.college_key &&
-        consistencyWarnings.has(
-          `${row.school_year_id ?? "null"}::${row.college_key}::${yearLevelKey ?? "unresolved"}`,
-        )
-          ? "Expected-event denominator mismatch detected for this college and year level."
-          : null,
-    };
-  });
+  return attachExpectedEventConsistencyWarnings(currentResult.rows, violations, "attendance_final_results");
 }
 export async function refreshPenaltyResultsForSchoolYearWithClient(
   client: PoolClient,
