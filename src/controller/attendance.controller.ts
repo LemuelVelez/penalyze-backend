@@ -1088,6 +1088,47 @@ export async function updateStudentEventAttendance(
   }
 }
 
+export async function updateStudentEventAttendanceWithProgress(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const id = getRouteParam(req, "id");
+    const eventId = getRouteParam(req, "eventId");
+    if (!id || !eventId || typeof req.body?.attended !== "boolean") {
+      res.status(400).json({ message: "Student, event, and a boolean attended status are required." });
+      return;
+    }
+
+    prepareProgressStream(res);
+    const result = await setStudentEventAttendance(
+      id,
+      eventId,
+      req.body.attended,
+      getAuthenticatedUserId(req),
+      (progress) => writeProgressStreamMessage(res, { type: "progress", progress }),
+    );
+    writeProgressStreamMessage(res, {
+      type: "success",
+      message: "Student event attendance updated successfully.",
+      data: result,
+    });
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      res.locals.auditOutcome = "failed";
+      writeProgressStreamMessage(res, {
+        type: "error",
+        message: getErrorMessage(error, "Unable to update event attendance."),
+      });
+      res.end();
+      return;
+    }
+    next(error);
+  }
+}
+
 export async function updateFinalResultProfile(
   req: Request,
   res: Response,

@@ -76,6 +76,7 @@ import {
   updateEvent as updateAttendanceEvent,
   updateFinalResultProfile as updateAttendanceFinalResultProfile,
   updateStudentEventAttendance,
+  updateStudentEventAttendanceWithProgress,
   updateRecord as updateAttendanceRecord,
   updateRecordsBulk as updateAttendanceRecordsBulk,
 } from "./controller/attendance.controller";
@@ -331,6 +332,12 @@ app.patch(
   requireAuth,
   requireAdmin,
   updateStudentEventAttendance,
+);
+app.patch(
+  "/api/attendance/final-results/:id/events/:eventId/progress",
+  requireAuth,
+  requireAdmin,
+  updateStudentEventAttendanceWithProgress,
 );
 app.patch(
   "/api/attendance/final-results/:id/profile",

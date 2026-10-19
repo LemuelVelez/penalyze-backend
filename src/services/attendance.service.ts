@@ -10102,18 +10102,45 @@ export async function updateAttendanceFinalResultProfile(
   });
 }
 
+export type StudentEventAttendanceProgress = {
+  stage:
+    | "validating"
+    | "waiting_for_lock"
+    | "checking_student"
+    | "checking_event"
+    | "saving_override"
+    | "refreshing_final_results"
+    | "refreshing_calculations"
+    | "refreshing_penalties"
+    | "committing"
+    | "completed";
+  percent: number;
+  message: string;
+};
+
 export async function setStudentEventAttendance(
   finalResultId: string,
   eventId: string,
   attended: boolean,
   updatedBy?: string,
+  onProgress?: (progress: StudentEventAttendanceProgress) => void,
 ) {
   if (!finalResultId || !eventId || typeof attended !== "boolean") {
     throw createValidationError("Select a student, event, and attendance status.", 400);
   }
 
-  return withTransaction(async (client) => {
+  const emitProgress = (
+    stage: StudentEventAttendanceProgress["stage"],
+    percent: number,
+    message: string,
+  ) => onProgress?.({ stage, percent, message });
+
+  emitProgress("validating", 4, "Request validated. Preparing to update this student's event attendance.");
+
+  const result = await withTransaction(async (client) => {
+    emitProgress("waiting_for_lock", 10, "Waiting for the attendance database lock. Another update may still be finishing.");
     await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
+    emitProgress("checking_student", 20, "Lock acquired. Checking the student's final attendance record and school year.");
 
     const studentResult = await client.query<{
       school_year_id: string;
@@ -10133,6 +10160,8 @@ export async function setStudentEventAttendance(
     if (!student || !student.college_key) {
       throw createValidationError("Student's school year or college is not resolved.", 404);
     }
+
+    emitProgress("checking_event", 30, "Student located. Verifying the event belongs to the student's expected roster.");
 
     const eligible = await client.query<{ id: string; name: string }>(
       `WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}
@@ -10156,6 +10185,8 @@ export async function setStudentEventAttendance(
       throw createValidationError("This event is not expected for the student's college and year level.", 409);
     }
 
+    emitProgress("saving_override", 42, "Event eligibility confirmed. Saving the attended/missed correction without changing the original upload.");
+
     const change = await client.query<{ id: string }>(
       `INSERT INTO attendance_student_event_overrides AS existing
          (school_year_id, student_key, event_id, attended, updated_by)
@@ -10174,8 +10205,32 @@ export async function setStudentEventAttendance(
       await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
         client,
         [student.school_year_id],
+        ({ stage }) => {
+          const detail = {
+            refreshing_final_results: {
+              percent: 52,
+              message: "Correction saved. Recalculating final attendance and absence totals for the school year.",
+            },
+            refreshing_calculations: {
+              percent: 65,
+              message: "Final attendance refreshed. Recalculating Calculate results for the school year.",
+            },
+            refreshing_penalties: {
+              percent: 77,
+              message: "Calculate results refreshed. Recalculating penalties and fines for the school year.",
+            },
+          }[stage];
+          emitProgress(stage, detail.percent, detail.message);
+        },
       );
     }
+    emitProgress(
+      "committing",
+      85,
+      change.rowCount
+        ? "Recalculations finished. Committing the attendance change to the database."
+        : "Attendance was already set to this value. Finishing without recalculation.",
+    );
     return {
       studentId: student.student_id,
       eventId,
@@ -10184,6 +10239,9 @@ export async function setStudentEventAttendance(
       updated: Boolean(change.rowCount),
     };
   });
+
+  emitProgress("completed", 88, "Database transaction committed. The updated student and attendance page can now be reloaded.");
+  return result;
 }
 
 export async function listAttendanceFinalResults(
