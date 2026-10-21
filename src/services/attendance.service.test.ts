@@ -17,6 +17,7 @@ import {
   selectExpectedEventGroupRepairTargets,
   getYearLevelKeySql,
   normalizeYearLevelKey,
+  normalizeOptionalTimestamp,
   previewAttendanceFileBase,
   type UploadedAttendanceFile,
 } from "./attendance.service";
@@ -109,6 +110,53 @@ test("engineering FRC CSV previews ñ names correctly", async () => {
   assert.ok(names.has("Curt Jehiel A. Nuñal"));
   assert.ok(names.has("Sharah Marie Geñoso"));
   assert.ok(names.has("Richen Villanueva Soriño"));
+});
+
+test("interprets timezone-free scanned dates as Philippine local time", () => {
+  assert.equal(
+    normalizeOptionalTimestamp("2026-10-20 14:39:00", "Scanned at").value,
+    "2026-10-20T06:39:00.000Z",
+  );
+  assert.equal(
+    normalizeOptionalTimestamp("10/20/2026 2:39 PM", "Scanned at").value,
+    "2026-10-20T06:39:00.000Z",
+  );
+});
+
+test("keeps explicitly zoned scan timestamps unchanged", () => {
+  assert.equal(
+    normalizeOptionalTimestamp("2026-10-20T06:39:00Z", "Scanned at").value,
+    "2026-10-20T06:39:00.000Z",
+  );
+  assert.equal(
+    normalizeOptionalTimestamp("2026-10-20T14:39:00+08:00", "Scanned at").value,
+    "2026-10-20T06:39:00.000Z",
+  );
+});
+
+test("interprets Excel serial scan timestamps as Philippine local time", () => {
+  const serial =
+    (Date.UTC(2026, 9, 20, 14, 39) - Date.UTC(1899, 11, 30)) / 86_400_000;
+
+  assert.equal(
+    normalizeOptionalTimestamp(String(serial), "Scanned at").value,
+    "2026-10-20T06:39:00.000Z",
+  );
+});
+
+test("rejects future scan dates instead of saving them as attendance", async () => {
+  const futureEpoch = Date.now() + 60 * 60 * 1000;
+  const csv = [
+    "Student ID,Name,Scanned At",
+    `TC-001,Maria,${futureEpoch}`,
+    "TC-002,Juan,2026-10-20T14:39:00+08:00",
+  ].join("\n");
+  const preview = await previewAttendanceFileBase(
+    uploadedFile("attendance.csv", Buffer.from(csv, "utf8")),
+  );
+
+  assert.equal(preview.rowsInvalid, 1);
+  assert.match(preview.rows[0]?.errors.join(" ") ?? "", /cannot be in the future/i);
 });
 
 test("xlsx parsing keeps the existing buffer path", async () => {

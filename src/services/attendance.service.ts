@@ -561,6 +561,8 @@ function isNumericDateCandidate(value: string) {
   return /^\d+(?:\.\d+)?$/.test(value.trim());
 }
 
+const PHILIPPINE_UTC_OFFSET_MS = 8 * 60 * 60 * 1000;
+
 function parseExcelSerialDate(value: string) {
   const serial = Number(value);
   if (!Number.isFinite(serial) || serial <= 0 || serial > 100000) return null;
@@ -570,7 +572,8 @@ function parseExcelSerialDate(value: string) {
   const milliseconds = Math.round(
     (wholeDays - 25569) * 86400000 + timeFraction * 86400000,
   );
-  const date = new Date(milliseconds);
+  // Excel serial dates are local wall-clock values, not UTC timestamps.
+  const date = new Date(milliseconds - PHILIPPINE_UTC_OFFSET_MS);
 
   return Number.isNaN(date.getTime()) ? null : date;
 }
@@ -1211,7 +1214,8 @@ function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
 
     transformedRows.push({
       ...parsedPayload,
-      "Scanned At": scannedAt.value ?? "",
+      // Preserve invalid/future input so preview can report a row error.
+      "Scanned At": scannedAt.value ?? scannedAtInput ?? "",
     });
   });
 
@@ -1348,7 +1352,32 @@ function createValidationError(message: string, statusCode = 400) {
   return error;
 }
 
-function normalizeOptionalTimestamp(value: unknown, label = "Date and time") {
+function parseAttendanceDateTime(text: string) {
+  // ISO timestamps with Z/offsets and Unix epochs already represent an instant.
+  // CSV, spreadsheet and datetime-local values without a timezone are Manila time.
+  const isoLocal = text.match(
+    /^(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?))?$/,
+  );
+  if (isoLocal) {
+    return new Date(`${isoLocal[1]}T${isoLocal[2] ?? "00:00"}+08:00`);
+  }
+
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return parsed;
+  if (/(?:Z|[+-]\d{2}:?\d{2}|\bUTC|\bGMT)$/i.test(text)) return parsed;
+
+  // Preserve the wall-clock fields for common CSV dates such as
+  // "10/21/2026 2:30 PM", regardless of the server's configured timezone.
+  return new Date(
+    Date.UTC(
+      parsed.getFullYear(), parsed.getMonth(), parsed.getDate(),
+      parsed.getHours(), parsed.getMinutes(), parsed.getSeconds(),
+      parsed.getMilliseconds(),
+    ) - PHILIPPINE_UTC_OFFSET_MS,
+  );
+}
+
+export function normalizeOptionalTimestamp(value: unknown, label = "Date and time") {
   const text = cleanText(value);
   if (!text) return { value: null as string | null, error: "" };
 
@@ -1359,12 +1388,19 @@ function normalizeOptionalTimestamp(value: unknown, label = "Date and time") {
   const serialDate = !unixDate && isNumericDateCandidate(text)
     ? parseExcelSerialDate(text)
     : null;
-  const date = unixDate ?? serialDate ?? new Date(text);
+  const date = unixDate ?? serialDate ?? parseAttendanceDateTime(text);
 
   if (Number.isNaN(date.getTime())) {
     return {
       value: null as string | null,
       error: `${label} must be a valid date and time.`,
+    };
+  }
+
+  if (label === "Scanned at" && date.getTime() > Date.now() + 5 * 60 * 1000) {
+    return {
+      value: null as string | null,
+      error: "Scanned at cannot be in the future. Check the date, time and timezone.",
     };
   }
 
@@ -7410,7 +7446,12 @@ async function refreshCalculationResultsWithClient(
             ELSE COALESCE(ar.event_id, ai.event_id)
           END AS event_id,
           GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
-          COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
+          CASE
+            WHEN ar.scanned_at > NOW()
+              OR ar.scanned_at > GREATEST(ar.created_at, ar.updated_at) + INTERVAL '5 minutes'
+            THEN LEAST(ar.created_at, NOW())
+            ELSE COALESCE(ar.scanned_at, ar.created_at)
+          END AS scanned_at,
           ar.updated_at
         FROM attendance_records ar
         LEFT JOIN attendance_imports ai
@@ -7454,7 +7495,12 @@ async function refreshCalculationResultsWithClient(
             THEN 0
             ELSE GREATEST(0, COALESCE(mar.no_of_absences, 0))
           END::INT AS no_of_absences,
-          COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
+          CASE
+            WHEN mar.scanned_at > NOW()
+              OR mar.scanned_at > GREATEST(mar.created_at, mar.updated_at) + INTERVAL '5 minutes'
+            THEN LEAST(mar.created_at, NOW())
+            ELSE COALESCE(mar.scanned_at, mar.created_at)
+          END AS scanned_at,
           mar.updated_at
         FROM manual_attendance_records mar
         LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
@@ -9223,7 +9269,12 @@ async function refreshAttendanceFinalResultsWithClient(
             ELSE COALESCE(ar.event_id, ai.event_id)
           END AS event_id,
           GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
-          COALESCE(ar.scanned_at, ar.created_at) AS scanned_at,
+          CASE
+            WHEN ar.scanned_at > NOW()
+              OR ar.scanned_at > GREATEST(ar.created_at, ar.updated_at) + INTERVAL '5 minutes'
+            THEN LEAST(ar.created_at, NOW())
+            ELSE COALESCE(ar.scanned_at, ar.created_at)
+          END AS scanned_at,
           ar.updated_at
         FROM attendance_records ar
         LEFT JOIN attendance_imports ai
@@ -9264,7 +9315,12 @@ async function refreshAttendanceFinalResultsWithClient(
             THEN 0
             ELSE GREATEST(0, COALESCE(mar.no_of_absences, 0))
           END::INT AS no_of_absences,
-          COALESCE(mar.scanned_at, mar.created_at) AS scanned_at,
+          CASE
+            WHEN mar.scanned_at > NOW()
+              OR mar.scanned_at > GREATEST(mar.created_at, mar.updated_at) + INTERVAL '5 minutes'
+            THEN LEAST(mar.created_at, NOW())
+            ELSE COALESCE(mar.scanned_at, mar.created_at)
+          END AS scanned_at,
           mar.updated_at
         FROM manual_attendance_records mar
         LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
@@ -10507,6 +10563,14 @@ export async function listAttendanceFinalResults(
       ${rosterCteSql}
       SELECT
         afr.*,
+        CASE
+          WHEN afr.latest_scanned_at > NOW()
+            OR afr.latest_scanned_at > GREATEST(
+              afr.created_at, COALESCE(afr.source_updated_at, afr.created_at)
+            ) + INTERVAL '5 minutes'
+          THEN LEAST(afr.created_at, NOW())
+          ELSE afr.latest_scanned_at
+        END AS latest_scanned_at,
         ai.event_id,
         ae.name AS event_name,
         ae.event_order,
