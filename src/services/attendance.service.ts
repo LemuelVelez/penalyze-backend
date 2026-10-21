@@ -1214,7 +1214,7 @@ function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
 
     transformedRows.push({
       ...parsedPayload,
-      // Preserve invalid/future input so preview can report a row error.
+      // Use the normalized scan time, including any future-date correction.
       "Scanned At": scannedAt.value ?? scannedAtInput ?? "",
     });
   });
@@ -1397,14 +1397,13 @@ export function normalizeOptionalTimestamp(value: unknown, label = "Date and tim
     };
   }
 
-  if (label === "Scanned at" && date.getTime() > Date.now() + 5 * 60 * 1000) {
-    return {
-      value: null as string | null,
-      error: "Scanned at cannot be in the future. Check the date, time and timezone.",
-    };
-  }
+  // Future scan times should not invalidate attendance. Save them at the
+  // current time instead, while leaving historical timestamps unchanged.
+  const timestamp = label === "Scanned at" && date.getTime() > Date.now()
+    ? new Date()
+    : date;
 
-  return { value: date.toISOString(), error: "" };
+  return { value: timestamp.toISOString(), error: "" };
 }
 
 function normalizeOptionalPositiveInteger(value: unknown, label = "Order") {
@@ -7446,12 +7445,7 @@ async function refreshCalculationResultsWithClient(
             ELSE COALESCE(ar.event_id, ai.event_id)
           END AS event_id,
           GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
-          CASE
-            WHEN ar.scanned_at > NOW()
-              OR ar.scanned_at > GREATEST(ar.created_at, ar.updated_at) + INTERVAL '5 minutes'
-            THEN LEAST(ar.created_at, NOW())
-            ELSE COALESCE(ar.scanned_at, ar.created_at)
-          END AS scanned_at,
+          LEAST(COALESCE(ar.scanned_at, ar.created_at), NOW()) AS scanned_at,
           ar.updated_at
         FROM attendance_records ar
         LEFT JOIN attendance_imports ai
@@ -7495,12 +7489,7 @@ async function refreshCalculationResultsWithClient(
             THEN 0
             ELSE GREATEST(0, COALESCE(mar.no_of_absences, 0))
           END::INT AS no_of_absences,
-          CASE
-            WHEN mar.scanned_at > NOW()
-              OR mar.scanned_at > GREATEST(mar.created_at, mar.updated_at) + INTERVAL '5 minutes'
-            THEN LEAST(mar.created_at, NOW())
-            ELSE COALESCE(mar.scanned_at, mar.created_at)
-          END AS scanned_at,
+          LEAST(COALESCE(mar.scanned_at, mar.created_at), NOW()) AS scanned_at,
           mar.updated_at
         FROM manual_attendance_records mar
         LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
@@ -9269,12 +9258,7 @@ async function refreshAttendanceFinalResultsWithClient(
             ELSE COALESCE(ar.event_id, ai.event_id)
           END AS event_id,
           GREATEST(0, COALESCE(ar.no_of_absences, 0))::INT AS no_of_absences,
-          CASE
-            WHEN ar.scanned_at > NOW()
-              OR ar.scanned_at > GREATEST(ar.created_at, ar.updated_at) + INTERVAL '5 minutes'
-            THEN LEAST(ar.created_at, NOW())
-            ELSE COALESCE(ar.scanned_at, ar.created_at)
-          END AS scanned_at,
+          LEAST(COALESCE(ar.scanned_at, ar.created_at), NOW()) AS scanned_at,
           ar.updated_at
         FROM attendance_records ar
         LEFT JOIN attendance_imports ai
@@ -9315,12 +9299,7 @@ async function refreshAttendanceFinalResultsWithClient(
             THEN 0
             ELSE GREATEST(0, COALESCE(mar.no_of_absences, 0))
           END::INT AS no_of_absences,
-          CASE
-            WHEN mar.scanned_at > NOW()
-              OR mar.scanned_at > GREATEST(mar.created_at, mar.updated_at) + INTERVAL '5 minutes'
-            THEN LEAST(mar.created_at, NOW())
-            ELSE COALESCE(mar.scanned_at, mar.created_at)
-          END AS scanned_at,
+          LEAST(COALESCE(mar.scanned_at, mar.created_at), NOW()) AS scanned_at,
           mar.updated_at
         FROM manual_attendance_records mar
         LEFT JOIN canonical_students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(mar.student_id))
@@ -10564,11 +10543,7 @@ export async function listAttendanceFinalResults(
       SELECT
         afr.*,
         CASE
-          WHEN afr.latest_scanned_at > NOW()
-            OR afr.latest_scanned_at > GREATEST(
-              afr.created_at, COALESCE(afr.source_updated_at, afr.created_at)
-            ) + INTERVAL '5 minutes'
-          THEN LEAST(afr.created_at, NOW())
+          WHEN afr.latest_scanned_at > NOW() THEN NOW()
           ELSE afr.latest_scanned_at
         END AS latest_scanned_at,
         ai.event_id,

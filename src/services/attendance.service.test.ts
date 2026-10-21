@@ -144,19 +144,46 @@ test("interprets Excel serial scan timestamps as Philippine local time", () => {
   );
 });
 
-test("rejects future scan dates instead of saving them as attendance", async () => {
-  const futureEpoch = Date.now() + 60 * 60 * 1000;
+test("replaces future scan timestamps with the current time without rejecting attendance", async () => {
+  const before = Date.now();
+  const futureEpoch = before + 24 * 60 * 60 * 1000;
+  const futureIso = new Date(futureEpoch).toISOString();
   const csv = [
     "Student ID,Name,Scanned At",
     `TC-001,Maria,${futureEpoch}`,
-    "TC-002,Juan,2026-10-20T14:39:00+08:00",
+    `TC-002,Juan,${futureIso}`,
   ].join("\n");
   const preview = await previewAttendanceFileBase(
     uploadedFile("attendance.csv", Buffer.from(csv, "utf8")),
   );
+  const after = Date.now();
 
-  assert.equal(preview.rowsInvalid, 1);
-  assert.match(preview.rows[0]?.errors.join(" ") ?? "", /cannot be in the future/i);
+  assert.equal(preview.rowsValid, 2);
+  assert.equal(preview.rowsInvalid, 0);
+  for (const row of preview.rows) {
+    assert.deepEqual(row.errors, []);
+    const timestamp = Date.parse(row.scannedAt ?? "");
+    assert.ok(timestamp >= before && timestamp <= after);
+  }
+});
+
+test("clamps future Excel and Philippine local scan timestamps without errors", () => {
+  const before = Date.now();
+  const future = new Date(before + 86_400_000);
+  const manila = new Date(future.getTime() + 8 * 60 * 60 * 1000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const localText = `${manila.getUTCFullYear()}-${pad(manila.getUTCMonth() + 1)}-${pad(manila.getUTCDate())} ${pad(manila.getUTCHours())}:${pad(manila.getUTCMinutes())}:00`;
+  const serial = (manila.getTime() - Date.UTC(1899, 11, 30)) / 86_400_000;
+  const local = normalizeOptionalTimestamp(localText, "Scanned at");
+  const excel = normalizeOptionalTimestamp(String(serial), "Scanned at");
+  const after = Date.now();
+
+  assert.equal(local.error, "");
+  assert.equal(excel.error, "");
+  for (const normalized of [local, excel]) {
+    const timestamp = Date.parse(normalized.value ?? "");
+    assert.ok(timestamp >= before && timestamp <= after);
+  }
 });
 
 test("xlsx parsing keeps the existing buffer path", async () => {
