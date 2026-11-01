@@ -10774,6 +10774,110 @@ export async function deleteManualAttendanceRecordsBySchoolYear(
 }
 
 
+/** Remove newly exempted events from pending reviews without changing non-exempt requests. */
+export async function applyExemptionsToPendingAttendanceRequests(
+  client: PoolClient,
+  scope: { schoolYearId: string; requestIds?: string[]; studentId?: string; skipLocked?: boolean },
+): Promise<{
+  requestsUpdated: number;
+  eventsRemoved: number;
+  requestsClosed: number;
+  removedByRequest: Map<string, string[]>;
+}> {
+  const removedByRequest = new Map<string, string[]>();
+  let requestsClosed = 0;
+  let eventsRemoved = 0;
+
+  if (scope.requestIds && !scope.requestIds.length) {
+    return { requestsUpdated: 0, eventsRemoved, requestsClosed, removedByRequest };
+  }
+
+  const pending = await client.query<{
+    id: string;
+    college: string | null;
+    year_level: string | null;
+    student_college: string | null;
+    student_year_level: string | null;
+  }>(`
+    SELECT ar.id, ar.college, ar.year_level,
+      (SELECT NULLIF(TRIM(s.college), '')
+       FROM students s
+       WHERE LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+         AND NULLIF(TRIM(s.college), '') IS NOT NULL
+       ORDER BY s.updated_at DESC NULLS LAST LIMIT 1) AS student_college,
+      (SELECT NULLIF(TRIM(s.year_level), '')
+       FROM students s
+       WHERE LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+         AND NULLIF(TRIM(s.year_level), '') IS NOT NULL
+       ORDER BY s.updated_at DESC NULLS LAST LIMIT 1) AS student_year_level
+    FROM attendance_requests ar
+    WHERE ar.school_year_id = $1
+      AND ar.status = 'pending'
+      AND ar.request_type = 'event_review'
+      AND ($2::uuid[] IS NULL OR ar.id = ANY($2::uuid[]))
+      AND ($3::text IS NULL OR LOWER(TRIM(ar.student_id)) = LOWER(TRIM($3::text)))
+    ORDER BY ar.id
+    FOR UPDATE OF ar ${scope.skipLocked ? 'SKIP LOCKED' : ''}
+  `, [scope.schoolYearId, scope.requestIds ?? null, scope.studentId ?? null]);
+
+  for (const request of pending.rows) {
+    const college = cleanText(request.college) || cleanText(request.student_college);
+    const yearLevel = cleanText(request.year_level) || cleanText(request.student_year_level);
+    const collegeKey = normalizeCollegeKey(college);
+    const yearLevelKey = normalizeYearLevelKey(yearLevel);
+
+    const deleted = await client.query<{ event_name: string }>(`
+      DELETE FROM attendance_request_events are
+      USING attendance_events e
+      WHERE are.request_id = $1
+        AND are.event_id = e.id
+        AND (
+          NOT (${getEventCollegeExemptionFilterSql('e.id', '$2::text')})
+          OR NOT (${getEventYearLevelExemptionFilterSql('e.id', '$3::text', '$2::text')})
+        )
+      RETURNING are.event_name
+    `, [request.id, collegeKey, yearLevelKey]);
+
+    if (!deleted.rows.length) continue;
+    const names = deleted.rows.map((row) => row.event_name);
+    removedByRequest.set(request.id, names);
+    eventsRemoved += names.length;
+
+    const remaining = await client.query<{ exists: boolean }>(`
+      SELECT EXISTS (
+        SELECT 1 FROM attendance_request_events WHERE request_id = $1
+      ) AS exists
+    `, [request.id]);
+
+    if (!remaining.rows[0]?.exists) {
+      requestsClosed += 1;
+      await client.query(`
+        UPDATE attendance_requests
+        SET status = 'rejected', reviewed_by = NULL, reviewed_at = NOW(),
+            review_note = $2, updated_at = NOW()
+        WHERE id = $1
+      `, [
+        request.id,
+        `Automatically closed: all requested events (${names.join(', ')}) are exempted for ${college || 'unknown college'} / ${yearLevel || 'unknown year level'}. No attendance needs to be credited.`,
+      ]);
+    } else {
+      await client.query(`
+        UPDATE attendance_requests
+        SET review_note = CONCAT_WS(E'\n', NULLIF(review_note, ''), $2),
+            updated_at = NOW()
+        WHERE id = $1
+      `, [request.id, `Exempted event(s) removed automatically: ${names.join(', ')}.`]);
+    }
+  }
+
+  return {
+    requestsUpdated: removedByRequest.size,
+    eventsRemoved,
+    requestsClosed,
+    removedByRequest,
+  };
+}
+
 export type EventCollegeExemption = {
   id: string;
   school_year_id: string | null;
@@ -11140,10 +11244,14 @@ export async function createEventCollegeExemptions(input: {
       }
     }
 
+    const applied = await applyExemptionsToPendingAttendanceRequests(client, {
+      schoolYearId,
+      skipLocked: true,
+    });
     emit({
       stage: "collecting_students",
       percent: 32,
-      message: "Finding students affected by the new exemptions.",
+      message: `Applied exemptions to ${applied.requestsUpdated} pending attendance request(s).`,
       completed: completedExemptions,
       total: totalExemptions,
     });
@@ -11823,10 +11931,14 @@ export async function createEventYearLevelExemptions(input: {
       }
     }
 
+    const applied = await applyExemptionsToPendingAttendanceRequests(client, {
+      schoolYearId,
+      skipLocked: true,
+    });
     emit({
       stage: "collecting_students",
       percent: 32,
-      message: "Finding students affected by the new exemptions.",
+      message: `Applied exemptions to ${applied.requestsUpdated} pending attendance request(s).`,
       completed: completedExemptions,
       total: totalExemptions,
     });

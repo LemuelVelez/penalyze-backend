@@ -67,6 +67,9 @@ export async function requests(
 }
 
 function getReviewSuccessMessage(result: Awaited<ReturnType<typeof reviewAttendanceRequest>>) {
+  if ("autoClosedByExemption" in result && result.autoClosedByExemption) {
+    return "Attendance request closed automatically: all events are exempted.";
+  }
   return result.request?.request_type === "details_correction"
     ? result.request.status === "approved"
       ? "Details correction request approved."

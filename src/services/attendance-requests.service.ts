@@ -9,6 +9,7 @@ import type {
 } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
 import {
+  applyExemptionsToPendingAttendanceRequests,
   getEventCollegeExemptionFilterSql,
   getEventYearLevelExemptionFilterSql,
   normalizeCollegeKey,
@@ -503,7 +504,7 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
     }
 
     let name = cleanText(input.name);
-    const events = normalizeRequestEvents(input.events);
+    let events = normalizeRequestEvents(input.events);
     if (!name) {
       const currentStudent = await getCurrentStudentDetails(client, studentId);
       name = currentStudent.name ?? "";
@@ -514,7 +515,7 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       );
     }
 
-    const eventIds = events.map((event) => event.eventId);
+    let eventIds = events.map((event) => event.eventId);
     const eventResult = await client.query<{
       id: string;
       name: string;
@@ -549,61 +550,30 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       requestCollege = currentStudent.college ?? "";
     }
 
-    const requestCollegeKey = normalizeCollegeKey(requestCollege);
-    if (requestCollegeKey) {
-      const exemptedEventResult = await client.query<{ id: string; name: string }>(
-        `
-          SELECT e.id, e.name
-          FROM attendance_event_college_exemptions exemption
-          JOIN attendance_events e ON e.id = exemption.event_id
-          WHERE exemption.event_id = ANY($1::uuid[])
-            AND exemption.college_key = $2
-          ORDER BY e.event_order, e.event_start_at, e.created_at
-        `,
-        [eventIds, requestCollegeKey],
-      );
-
-      if (exemptedEventResult.rows.length) {
-        const eventNames = exemptedEventResult.rows
-          .map((event) => event.name)
-          .join(", ");
-        throw createHttpError(
-          `${requestCollege || "This college"} is exempted from the following event${
-            exemptedEventResult.rows.length === 1 ? "" : "s"
-          }: ${eventNames}. Remove ${
-            exemptedEventResult.rows.length === 1 ? "it" : "them"
-          } from the attendance request.`,
-        );
-      }
-    }
-
     let requestYearLevel = cleanText(input.yearLevel);
     if (!requestYearLevel) {
       const currentStudent = await getCurrentStudentDetails(client, studentId);
       requestYearLevel = currentStudent.year_level ?? "";
     }
+    const requestCollegeKey = normalizeCollegeKey(requestCollege);
     const requestYearLevelKey = normalizeYearLevelKey(requestYearLevel);
-    if (requestYearLevelKey) {
-      const exemptedYearLevelEvents = await client.query<{ id: string; name: string }>(
-        `
-          SELECT e.id, e.name
-          FROM attendance_events e
-          WHERE e.id = ANY($1::uuid[])
-            AND NOT (${getEventYearLevelExemptionFilterSql("e.id", "$2::text", "$3::text")})
-          ORDER BY e.event_order, e.event_start_at, e.created_at
-        `,
-        [eventIds, requestYearLevelKey, requestCollegeKey],
+
+    const exemptedEvents = await client.query<{ id: string }>(`
+      SELECT e.id
+      FROM attendance_events e
+      WHERE e.id = ANY($1::uuid[])
+        AND (
+          NOT (${getEventCollegeExemptionFilterSql('e.id', '$2::text')})
+          OR NOT (${getEventYearLevelExemptionFilterSql('e.id', '$3::text', '$2::text')})
+        )
+    `, [eventIds, requestCollegeKey, requestYearLevelKey]);
+    const exemptedIds = new Set(exemptedEvents.rows.map((event) => event.id));
+    events = events.filter((event) => !exemptedIds.has(event.eventId));
+    eventIds = events.map((event) => event.eventId);
+    if (!eventIds.length) {
+      throw createHttpError(
+        "All selected events are exempted for your college/year level, so no attendance request is needed.",
       );
-      if (exemptedYearLevelEvents.rows.length) {
-        const eventNames = exemptedYearLevelEvents.rows.map((event) => event.name).join(", ");
-        throw createHttpError(
-          `${requestYearLevel || "This year level"} is exempted from the following event${
-            exemptedYearLevelEvents.rows.length === 1 ? "" : "s"
-          }: ${eventNames}. Remove ${
-            exemptedYearLevelEvents.rows.length === 1 ? "it" : "them"
-          } from the attendance request.`,
-        );
-      }
     }
 
     const duplicateResult = await client.query<{ event_id: string | null }>(
@@ -1167,70 +1137,23 @@ async function resolveRequestEventsForApproval(
     });
   }
 
-  let requestCollege = cleanText(request.college);
-  if (!requestCollege) {
-    const currentStudent = await getCurrentStudentDetails(client, request.student_id);
-    requestCollege = currentStudent.college ?? "";
-  }
+  const applied = await applyExemptionsToPendingAttendanceRequests(client, {
+    schoolYearId: request.school_year_id,
+    requestIds: [request.id],
+  });
+  const remaining = await client.query<AttendanceRequestEventWithSchoolYear>(`
+    SELECT are.*, ae.school_year_id
+    FROM attendance_request_events are
+    LEFT JOIN attendance_events ae ON ae.id = are.event_id
+    WHERE are.request_id = $1
+    ORDER BY are.created_at, are.event_name
+  `, [request.id]);
 
-  const requestCollegeKey = normalizeCollegeKey(requestCollege);
-  const resolvedEventIds = resolvedEvents
-    .map((event) => event.event_id)
-    .filter((eventId): eventId is string => Boolean(eventId));
-
-  if (requestCollegeKey && resolvedEventIds.length) {
-    const exemptedEventResult = await client.query<{ id: string; name: string }>(
-      `
-        SELECT e.id, e.name
-        FROM attendance_events e
-        WHERE e.id = ANY($1::uuid[])
-          AND NOT (${getEventCollegeExemptionFilterSql("e.id", "$2::text")})
-        ORDER BY e.event_order, e.event_start_at, e.created_at
-      `,
-      [resolvedEventIds, requestCollegeKey],
-    );
-
-    if (exemptedEventResult.rows.length) {
-      const eventNames = exemptedEventResult.rows
-        .map((event) => event.name)
-        .join(", ");
-      throw createHttpError(
-        `${requestCollege || "This college"} is exempted from the following event${
-          exemptedEventResult.rows.length === 1 ? "" : "s"
-        }: ${eventNames}. Remove ${
-          exemptedEventResult.rows.length === 1 ? "it" : "them"
-        } from the attendance request before approving it.`,
-        409,
-      );
-    }
-  }
-
-  const requestYearLevelKey = normalizeYearLevelKey(request.year_level);
-  if (requestYearLevelKey && resolvedEventIds.length) {
-    const exemptedYearLevelEvents = await client.query<{ id: string; name: string }>(
-      `
-        SELECT e.id, e.name
-        FROM attendance_events e
-        WHERE e.id = ANY($1::uuid[])
-          AND NOT (${getEventYearLevelExemptionFilterSql("e.id", "$2::text", "$3::text")})
-        ORDER BY e.event_order, e.event_start_at, e.created_at
-      `,
-      [resolvedEventIds, requestYearLevelKey, requestCollegeKey],
-    );
-    if (exemptedYearLevelEvents.rows.length) {
-      const eventNames = exemptedYearLevelEvents.rows.map((event) => event.name).join(", ");
-      throw createHttpError(
-        `${request.year_level || "This year level"} is exempted from the following event${
-          exemptedYearLevelEvents.rows.length === 1 ? "" : "s"
-        }: ${eventNames}. Remove ${
-          exemptedYearLevelEvents.rows.length === 1 ? "it" : "them"
-        } from the attendance request before approving it.`,
-        409,
-      );
-    }
-  }
-
-  return resolvedEvents;
+  return {
+    events: remaining.rows,
+    removedEventNames: applied.removedByRequest.get(request.id) ?? [],
+    autoClosed: applied.requestsClosed > 0,
+  };
 }
 
 async function applyApprovedDetailsCorrection(
@@ -1350,6 +1273,16 @@ async function applyApprovedDetailsCorrection(
     );
     updatedRowCount += result.rowCount ?? 0;
   }
+
+  // Existing pending reviews must use the newly approved student scope.
+  await client.query(`
+    UPDATE attendance_requests
+    SET college = COALESCE(NULLIF($2::text, ''), college),
+        year_level = COALESCE(NULLIF($3::text, ''), year_level),
+        updated_at = NOW()
+    WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+      AND status = 'pending' AND request_type = 'event_review'
+  `, [studentId, requestedCollege, requestedYearLevel]);
 
   const scopeTotal = schoolYearIds.length;
   const scopeSpan = scopeTotal ? 72 / scopeTotal : 0;
@@ -1488,6 +1421,7 @@ export async function reviewAttendanceRequest(
 
     let createdAttendanceCount = 0;
     let updatedRowCount = 0;
+    let removedExemptedEventCount = 0;
     if (status === "approved") {
       if (request.request_type === "details_correction") {
         updatedRowCount = await applyApprovedDetailsCorrection(
@@ -1495,18 +1429,32 @@ export async function reviewAttendanceRequest(
           request,
           emit,
         );
+        await applyExemptionsToPendingAttendanceRequests(client, {
+          schoolYearId: request.school_year_id,
+          studentId: request.student_id,
+        });
       } else {
         emit({
           stage: "resolving_events",
           percent: 12,
           message: "Resolving requested events and checking exemptions.",
         });
-        const resolvedEvents = await resolveRequestEventsForApproval(client, request);
+        const resolved = await resolveRequestEventsForApproval(client, request);
+        removedExemptedEventCount = resolved.removedEventNames.length;
+        if (resolved.autoClosed) {
+          return {
+            createdAttendanceCount: 0,
+            updatedRowCount: 0,
+            requestType: request.request_type,
+            removedExemptedEventCount,
+            autoClosedByExemption: true,
+          };
+        }
 
         createdAttendanceCount = await addApprovedManualAttendance(
           client,
           request,
-          resolvedEvents,
+          resolved.events,
           (event, index, total) => {
             const eventPercent = total
               ? 17 + (index / total) * 17
@@ -1585,7 +1533,7 @@ export async function reviewAttendanceRequest(
         SET
           status = $2,
           reviewed_by = $3,
-          review_note = $4,
+          review_note = CONCAT_WS(E'\n', NULLIF(review_note, ''), $4),
           reviewed_at = NOW(),
           updated_at = NOW()
         WHERE id = $1
@@ -1593,7 +1541,13 @@ export async function reviewAttendanceRequest(
       [request.id, status, reviewerId, reviewNote],
     );
 
-    return { createdAttendanceCount, updatedRowCount, requestType: request.request_type };
+    return {
+      createdAttendanceCount,
+      updatedRowCount,
+      requestType: request.request_type,
+      removedExemptedEventCount,
+      autoClosedByExemption: false,
+    };
   });
 
   emit({
@@ -1612,7 +1566,12 @@ export async function reviewAttendanceRequest(
 
   return result.requestType === "details_correction"
     ? { request, updatedRowCount: result.updatedRowCount }
-    : { request, createdAttendanceCount: result.createdAttendanceCount };
+    : {
+        request,
+        createdAttendanceCount: result.createdAttendanceCount,
+        removedExemptedEventCount: result.removedExemptedEventCount,
+        autoClosedByExemption: result.autoClosedByExemption,
+      };
 }
 
 export async function removeAttendanceRequestEvent(
