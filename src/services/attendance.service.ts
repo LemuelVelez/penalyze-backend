@@ -10863,7 +10863,7 @@ export async function applyExemptionsToPendingAttendanceRequests(
     } else {
       await client.query(`
         UPDATE attendance_requests
-        SET review_note = CONCAT_WS(E'\n', NULLIF(review_note, ''), $2),
+        SET review_note = CONCAT_WS(E'\n', NULLIF(review_note, ''), $2::text),
             updated_at = NOW()
         WHERE id = $1
       `, [request.id, `Exempted event(s) removed automatically: ${names.join(', ')}.`]);

@@ -1533,7 +1533,7 @@ export async function reviewAttendanceRequest(
         SET
           status = $2,
           reviewed_by = $3,
-          review_note = CONCAT_WS(E'\n', NULLIF(review_note, ''), $4),
+          review_note = CONCAT_WS(E'\n', NULLIF(review_note, ''), NULLIF($4::text, '')),
           reviewed_at = NOW(),
           updated_at = NOW()
         WHERE id = $1
