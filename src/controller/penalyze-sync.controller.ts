@@ -2,8 +2,9 @@ import { NextFunction, Response } from "express";
 import type { AuthenticatedRequest } from "./auth.controller";
 
 // The integration key is held exclusively by this backend, never the browser.
-const REPOSITORY_BASE = (process.env.ATTENDANCE_REPOSITORY_URL ?? "").trim().replace(/\/+$/, "");
-const INTEGRATION_KEY = (process.env.PENALYZE_INTEGRATION_KEY ?? "").trim();
+const REPOSITORY_BASE = (process.env.ATTENDANCE_REPOSITORY_URL || process.env.AttendanceRepository_URL || "")
+  .trim().replace(/\/+$/, "").replace(/\/api$/i, "").replace(/\/+$/, "");
+const INTEGRATION_KEY = (process.env.PENALYZE_INTEGRATION_KEY || process.env.Penalyze_Integration_Key || "").trim();
 const MAX_BATCH = 200;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 

@@ -518,6 +518,13 @@ app.use((error: any, _req: Request, res: Response, _next: NextFunction) => {
   });
 });
 
+if (
+  !(process.env.ATTENDANCE_REPOSITORY_URL?.trim() || process.env.AttendanceRepository_URL?.trim()) ||
+  !(process.env.PENALYZE_INTEGRATION_KEY?.trim() || process.env.Penalyze_Integration_Key?.trim())
+) {
+  console.warn("AttendanceRepository sync is not configured: set ATTENDANCE_REPOSITORY_URL and PENALYZE_INTEGRATION_KEY on penalyze-backend.");
+}
+
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
