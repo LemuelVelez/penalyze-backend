@@ -366,6 +366,8 @@ export type AttendanceImportInput = {
 };
 
 export type ParsedAttendanceRow = AttendanceImportInput & {
+  // Derived by the server from reviewed row assignments; never trusted from the source workbook.
+  eventForceCreate?: boolean;
   rowNumber: number;
   errors: string[];
   raw: Record<string, unknown>;

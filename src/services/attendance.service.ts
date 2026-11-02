@@ -73,7 +73,17 @@ export type UploadedAttendanceFile = {
 type RawImportRow = Record<string, unknown>;
 type CalculationSourceType = "imported" | "manual" | "zero_attendance";
 
+type AttendanceRowEventAssignment = {
+  eventId?: string;
+  eventName?: string;
+  eventStartAt?: string;
+  eventEndAt?: string;
+  forceCreateEvent?: boolean;
+};
+
 type SaveRowsInput = {
+  rowEventOverrides?: Record<string, AttendanceRowEventAssignment>;
+  rowEventsReviewed?: boolean;
   college?: string;
   rowCollegeOverrides?: Record<string, string>;
   schoolYearId?: string;
@@ -1265,11 +1275,12 @@ function getAttendanceRowMergeKey(
   row: ParsedAttendanceRow,
   input: SaveRowsInput,
 ) {
-  const eventKey =
-    cleanText(row.eventName) ||
-    cleanText(input.eventId) ||
-    cleanText(input.eventName) ||
-    "no-event";
+  const eventKey = [
+    cleanText(row.eventId) || cleanText(row.eventName) ||
+      cleanText(input.eventId) || cleanText(input.eventName) || "no-event",
+    input.rowEventsReviewed ? cleanText(row.eventStartAt) : "",
+    input.rowEventsReviewed ? cleanText(row.eventEndAt) : "",
+  ].join("::");
   const collegeKey = cleanText(row.college) || "no-college";
 
   return `${normalizeHeader(eventKey)}:${normalizeHeader(collegeKey)}:${cleanText(row.studentId).toLowerCase()}`;
@@ -3215,6 +3226,62 @@ function scopeAttendancePreviewToCollege(
   return { ...preview, rows, rowsValid, rowsInvalid: rows.length - rowsValid };
 }
 
+// Multi-event workbooks must be reviewed row by row. Never infer that the
+// first detected event applies to every row of an all-events export.
+function applyReviewedRowEvents(
+  preview: AttendancePreviewResult,
+  option: SaveRowsInput,
+): AttendancePreviewResult {
+  const rowEventIdentities = new Set(preview.rows
+    .filter((row) => !row.errors.length)
+    .map((row) => JSON.stringify([
+      normalizeAttendanceEventIdentityName(row.eventName),
+      cleanText(row.eventStartAt), cleanText(row.eventEndAt),
+    ])));
+  const isMultipleEventFile = rowEventIdentities.size > 1;
+  if (!isMultipleEventFile && !option.rowEventsReviewed) return preview;
+  if (!option.rowEventsReviewed) {
+    throw createValidationError(
+      `"${preview.fileName}" contains ${rowEventIdentities.size} different row events. Review every row event and confirm the assignments before saving.`, 409,
+    );
+  }
+  const overrides = option.rowEventOverrides;
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) {
+    throw createValidationError(`Review row events in "${preview.fileName}" before saving.`, 400);
+  }
+  const validNumbers = new Set(preview.rows.map((row) => String(row.rowNumber)));
+  for (const key of Object.keys(overrides)) {
+    if (!validNumbers.has(key)) throw createValidationError(`Unknown event assignment for row ${key}.`, 400);
+  }
+  const rows = preview.rows.map((row) => {
+    const assignment = overrides[String(row.rowNumber)];
+    if (!assignment || typeof assignment !== "object" || Array.isArray(assignment)) {
+      throw createValidationError(`Row ${row.rowNumber} in "${preview.fileName}" needs an event assignment.`, 400);
+    }
+    const eventId = cleanText(assignment.eventId);
+    const eventName = cleanText(assignment.eventName);
+    if ((!eventId && !eventName) || (eventId && eventName)) {
+      throw createValidationError(`Choose an existing event or a new event name for row ${row.rowNumber}.`, 400);
+    }
+    const startAt = normalizeOptionalTimestamp(assignment.eventStartAt, "Event start at");
+    const endAt = normalizeOptionalTimestamp(assignment.eventEndAt, "Event end at");
+    if (startAt.error || endAt.error || (startAt.value && endAt.value &&
+        new Date(endAt.value).getTime() < new Date(startAt.value).getTime())) {
+      throw createValidationError(`Invalid event date range for row ${row.rowNumber}.`, 400);
+    }
+    return {
+      ...row,
+      eventId: eventId || undefined,
+      eventName: eventName,
+      eventStartAt: startAt.value ?? undefined,
+      eventEndAt: endAt.value ?? undefined,
+      // Only explicit create decisions may create a new independent event.
+      eventForceCreate: !eventId && Boolean(assignment.forceCreateEvent),
+    };
+  });
+  return { ...preview, rows };
+}
+
 function assertNoInvalidAttendanceColleges(preview: AttendancePreviewResult) {
   const errors = preview.rows.flatMap((row) =>
     row.errors.filter((error) => error.includes(": unrecognised college ")),
@@ -3347,10 +3414,11 @@ async function saveAttendanceRowsWithClient(
     : prepareAttendanceRowsForSave(originalInput);
   let input = prepared.input;
   const selectedCollege = requireAttendanceUploadCollege(input.college);
-  const preview = scopeAttendancePreviewToCollege(
+  let preview = scopeAttendancePreviewToCollege(
     prepared.preview, selectedCollege.label, input.rowCollegeOverrides,
   );
   assertNoInvalidAttendanceColleges(preview);
+  preview = applyReviewedRowEvents(preview, input);
   const validRows = preview.rows.filter((row) => !row.errors.length);
 
   if (!validRows.length) {
@@ -3381,7 +3449,7 @@ async function saveAttendanceRowsWithClient(
   }
 
   const defaultEvent =
-    cleanText(input.eventId) || cleanText(input.eventName)
+    !input.rowEventsReviewed && (cleanText(input.eventId) || cleanText(input.eventName))
       ? await findOrCreateAttendanceEvent(client, input)
       : existingImport?.event_id
         ? await getAttendanceEventById(client, existingImport.event_id)
@@ -3491,6 +3559,7 @@ async function saveAttendanceRowsWithClient(
       errors: row.errors,
     }));
   const mergeResult = mergeAttendanceImportRowsByStudentAndEvent(validRows, input);
+  const reviewedEventCache = new Map<string, AttendanceEventRecord>();
   const rowsToSave = mergeResult.rows;
   if (!input.allowExemptedRows) {
     await assertImportYearLevelsNotExempt(client, rowsToSave, defaultEvent, input);
@@ -3519,18 +3588,35 @@ async function saveAttendanceRowsWithClient(
   for (const [index, row] of rowsToSave.entries()) {
     assertAttendanceImportNotCancelled(input);
 
-    const event = row.eventName && !defaultEvent
-      ? await findOrCreateAttendanceEvent(
-          client,
-          {
-            ...input,
-            eventName: row.eventName,
-            eventStartAt: row.eventStartAt ?? input.eventStartAt,
-            eventEndAt: row.eventEndAt ?? input.eventEndAt,
-          },
-          row.eventName,
-        )
-      : defaultEvent;
+    const rowEventId = input.rowEventsReviewed ? cleanText(row.eventId) : "";
+    const rowEventName = input.rowEventsReviewed ? cleanText(row.eventName) : "";
+    const rowEventKey = JSON.stringify([
+      rowEventId, rowEventName, cleanText(row.eventStartAt),
+      cleanText(row.eventEndAt), Boolean(row.eventForceCreate),
+    ]);
+    let event = input.rowEventsReviewed ? reviewedEventCache.get(rowEventKey) ?? null : defaultEvent;
+    if (!event && input.rowEventsReviewed) {
+      event = await findOrCreateAttendanceEvent(client, {
+        schoolYearId: resolvedSchoolYearId,
+        eventId: rowEventId || undefined,
+        eventName: rowEventName || undefined,
+        eventStartAt: row.eventStartAt,
+        eventEndAt: row.eventEndAt,
+        forceCreateEvent: Boolean(row.eventForceCreate),
+      });
+      if (event && event.school_year_id !== resolvedSchoolYearId) {
+        throw createValidationError(`Row ${row.rowNumber} references an event in a different school year.`, 400);
+      }
+      if (event) reviewedEventCache.set(rowEventKey, event);
+    }
+    if (!event && row.eventName && !defaultEvent) {
+      event = await findOrCreateAttendanceEvent(client, {
+        ...input,
+        eventName: row.eventName,
+        eventStartAt: row.eventStartAt ?? input.eventStartAt,
+        eventEndAt: row.eventEndAt ?? input.eventEndAt,
+      }, row.eventName);
+    }
 
     if (!event) {
       throw createValidationError(
@@ -3794,9 +3880,12 @@ export async function saveAttendanceFiles(
     options.map((option) => option.rowCollegeOverrides ?? {}),
   );
   previews.forEach(assertNoInvalidAttendanceColleges);
+  previews.forEach((preview, index) => {
+    applyReviewedRowEvents(preview, options[index]);
+  });
 
   previews.forEach((preview, index) => {
-    if (hasUnresolvedAttendanceMergeCandidate(preview, index, options[index])) {
+    if (!options[index].rowEventsReviewed && hasUnresolvedAttendanceMergeCandidate(preview, index, options[index])) {
       throw createValidationError(
         `The event detected in "${preview.fileName}" looks like an existing or earlier batch event. Confirm whether to merge it or create a separate event before saving.`,
         409,
@@ -3826,7 +3915,9 @@ export async function saveAttendanceFiles(
       }
 
       let selectedEvent: AttendanceEventRecord | null = null;
-      if (cleanText(option.mergeIntoEventId)) {
+      if (option.rowEventsReviewed) {
+        // Each row has an explicit, reviewed event assignment instead.
+      } else if (cleanText(option.mergeIntoEventId)) {
         selectedEvent = await getAttendanceEventById(
           client,
           cleanText(option.mergeIntoEventId),
@@ -3857,8 +3948,8 @@ export async function saveAttendanceFiles(
         uploadedBy: option.uploadedBy,
         schoolYearId:
           (selectedEvent?.school_year_id ?? detectedSchoolYearId) || undefined,
-        eventId: selectedEvent?.id || undefined,
-        eventName:
+        eventId: option.rowEventsReviewed ? undefined : selectedEvent?.id || undefined,
+        eventName: option.rowEventsReviewed ? undefined :
           selectedEvent?.name ||
           cleanText(option.eventName) ||
           cleanText(preview.detectedEvent.eventName) ||
@@ -3871,7 +3962,7 @@ export async function saveAttendanceFiles(
           selectedEvent?.event_end_at
             ? cleanText(selectedEvent.event_end_at)
             : option.eventEndAt || preview.detectedEvent.eventEndAt || undefined,
-        forceCreateEvent: Boolean(option.forceCreateEvent && !selectedEvent),
+        forceCreateEvent: Boolean(option.forceCreateEvent && !selectedEvent && !option.rowEventsReviewed),
         fileName: preview.fileName,
         fileType: preview.fileType,
         rows: preview.rows,
