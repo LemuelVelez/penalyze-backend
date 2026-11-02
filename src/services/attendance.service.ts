@@ -3230,7 +3230,7 @@ function scopeAttendancePreviewToCollege(
 // first detected event applies to every row of an all-events export.
 function applyReviewedRowEvents(
   preview: AttendancePreviewResult,
-  option: SaveRowsInput,
+  option: Pick<SaveRowsInput, "rowEventOverrides" | "rowEventsReviewed">,
 ): AttendancePreviewResult {
   const rowEventIdentities = new Set(preview.rows
     .filter((row) => !row.errors.length)
