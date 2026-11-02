@@ -112,6 +112,11 @@ import {
   transfer as transferSchoolYearRecords,
   update as updateSchoolYear,
 } from "./controller/school-years.controller";
+import {
+  changeRepositorySync,
+  downloadRepositoryUpload,
+  listRepositoryUploads,
+} from "./controller/penalyze-sync.controller";
 import { query } from "./lib/db";
 import { purgeExpiredAttendanceImports } from "./services/attendance.service";
 import { auditMutation } from "./services/audit-log.service";
@@ -238,6 +243,13 @@ app.put("/api/users/:id", requireAuth, requireAdmin, updateUser);
 app.delete("/api/users/:id", requireAuth, requireAdmin, deleteUser);
 
 app.get("/api/audit-logs", requireAuth, requireAdmin, listAuditLogs);
+
+// Browser calls Penalyze only; the repository integration key stays server-side.
+app.get("/api/repository-sync/uploads", requireAuth, listRepositoryUploads);
+app.get("/api/repository-sync/uploads/:id/download", requireAuth, downloadRepositoryUpload);
+app.post("/api/repository-sync/pending", requireAuth, changeRepositorySync("pending"));
+app.post("/api/repository-sync/uploaded", requireAuth, changeRepositorySync("uploaded"));
+app.post("/api/repository-sync/reset", requireAuth, changeRepositorySync("reset"));
 
 app.get("/api/school-years", schoolYears);
 app.post("/api/school-years", saveSchoolYear);
