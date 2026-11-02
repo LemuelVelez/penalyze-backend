@@ -3561,9 +3561,8 @@ async function saveAttendanceRowsWithClient(
   const mergeResult = mergeAttendanceImportRowsByStudentAndEvent(validRows, input);
   const reviewedEventCache = new Map<string, AttendanceEventRecord>();
   const rowsToSave = mergeResult.rows;
-  if (!input.allowExemptedRows) {
-    await assertImportYearLevelsNotExempt(client, rowsToSave, defaultEvent, input);
-  }
+  const exemptionCache = new Map<string, string | null>();
+  const rowsExempted: AttendanceImportReconciliation["rowsExempted"] = [];
   const stageCounts = {
     parsed: preview.rowsTotal,
     normalized: preview.rows.length,
@@ -3629,14 +3628,27 @@ async function saveAttendanceRowsWithClient(
       row.studentId,
       row.college,
     );
-    if (!input.allowExemptedRows) {
-      await assertEventCollegeNotExempt(
-        client,
-        event,
-        recordCollege,
-        row.yearLevel,
-        "Remove the exempted college or year-level rows from the attendance file or choose a different event.",
-      );
+    const exemptionReason = await getImportRowExemptionReason(
+      client, event, recordCollege, row.yearLevel, exemptionCache,
+    );
+    if (exemptionReason) {
+      rowsExempted.push({
+        rowNumber: row.rowNumber,
+        studentId: row.studentId,
+        name: row.name,
+        eventName: event.name,
+        reason: exemptionReason,
+      });
+      await emitAttendanceImportProgress(input.onProgress, {
+        stage: "saving",
+        percent: getAttendanceRowSaveProgressPercent(index + 1, rowsToSave.length),
+        message: `${rowsExempted.length} event-exempted attendee row(s) excluded.`,
+        processedRows: index + 1,
+        totalRows: rowsToSave.length,
+        savedRecords: savedRecordIds.length,
+        stageCounts: { ...stageCounts, saved: savedRecordIds.length },
+      });
+      continue;
     }
 
     await upsertStudent(client, row);
@@ -3660,6 +3672,13 @@ async function saveAttendanceRowsWithClient(
       savedRecords: savedRecordIds.length,
       stageCounts: { ...stageCounts, saved: savedRecordIds.length },
     });
+  }
+
+  if (!savedRecordIds.length && rowsExempted.length) {
+    throw createValidationError(
+      `No eligible attendance records remain in "${preview.fileName}" after excluding ${rowsExempted.length} event-exempted attendee row(s). No attendance was saved.`,
+      400,
+    );
   }
 
   assertAttendanceImportNotCancelled(input);
@@ -3714,6 +3733,7 @@ async function saveAttendanceRowsWithClient(
       (left, right) => left.rowNumber - right.rowNumber,
     ),
     rowsMerged: mergeResult.mergedRows,
+    rowsExempted,
     rowsSaved: savedRecords.length,
     stageCounts: finalStageCounts,
   };
@@ -4121,6 +4141,40 @@ async function getEffectiveAttendanceCollege(
   return cleanText(result.rows[0]?.college);
 }
 
+/** Import filtering is per event and per attendee: an exempt student must never
+ * create an attendance record for that event, but may attend other events in
+ * the same workbook. The database is authoritative even if the UI is stale. */
+async function getImportRowExemptionReason(
+  client: PoolClient,
+  event: AttendanceEventRecord,
+  collegeValue: unknown,
+  yearLevelValue: unknown,
+  cache: Map<string, string | null>,
+): Promise<string | null> {
+  const collegeKey = normalizeCollegeKey(cleanText(collegeValue));
+  const yearLevelKey = normalizeYearLevelKey(cleanText(yearLevelValue));
+  const cacheKey = JSON.stringify([event.id, collegeKey, yearLevelKey]);
+  if (cache.has(cacheKey)) return cache.get(cacheKey) ?? null;
+
+  const result = await client.query<{
+    college_exempt: boolean;
+    year_level_exempt: boolean;
+  }>(
+    `SELECT
+      NOT (${getEventCollegeExemptionFilterSql("$1::uuid", "$2::text")}) AS college_exempt,
+      NOT (${getEventYearLevelExemptionFilterSql("$1::uuid", "$3::text", "$2::text")}) AS year_level_exempt`,
+    [event.id, collegeKey, yearLevelKey],
+  );
+  const exempt = result.rows[0];
+  const reason = exempt?.college_exempt
+    ? `College exempted from ${event.name}`
+    : exempt?.year_level_exempt
+      ? `Year level exempted from ${event.name}`
+      : null;
+  cache.set(cacheKey, reason);
+  return reason;
+}
+
 async function assertEventCollegeNotExempt(
   client: PoolClient,
   event: AttendanceEventRecord,
@@ -4169,86 +4223,6 @@ async function assertEventCollegeNotExempt(
       );
     }
   }
-}
-
-async function assertImportYearLevelsNotExempt(
-  client: PoolClient,
-  rows: ParsedAttendanceRow[],
-  defaultEvent: AttendanceEventRecord | null,
-  input: SaveRowsInput,
-) {
-  const affected = new Map<
-    string,
-    { eventName: string; yearLevelLabel: string; rowCount: number }
-  >();
-
-  for (const row of rows) {
-    const yearLevelKey = normalizeYearLevelKey(row.yearLevel);
-    if (!yearLevelKey) continue;
-
-    const event =
-      row.eventName && !defaultEvent
-        ? await findOrCreateAttendanceEvent(
-            client,
-            {
-              ...input,
-              eventName: row.eventName,
-              eventStartAt: row.eventStartAt ?? input.eventStartAt,
-              eventEndAt: row.eventEndAt ?? input.eventEndAt,
-            },
-            row.eventName,
-          )
-        : defaultEvent;
-    if (!event) continue;
-
-    const college = await getEffectiveAttendanceCollege(
-      client,
-      row.studentId,
-      row.college,
-    );
-    const collegeKey = normalizeCollegeKey(college);
-    const allowedResult = await client.query<{ is_allowed: boolean }>(
-      `
-        SELECT ${getEventYearLevelExemptionFilterSql(
-          "$1::uuid",
-          "$2::text",
-          "$3::text",
-        )} AS is_allowed
-      `,
-      [event.id, yearLevelKey, collegeKey],
-    );
-    if (allowedResult.rows[0]?.is_allowed !== false) continue;
-
-    const yearLevelLabel = getCanonicalYearLevelLabel(yearLevelKey);
-    const key = `${event.id}:${yearLevelKey}`;
-    const current = affected.get(key);
-    affected.set(key, {
-      eventName: event.name,
-      yearLevelLabel,
-      rowCount: (current?.rowCount ?? 0) + 1,
-    });
-  }
-
-  if (!affected.size) return;
-
-  const details = Array.from(affected.values())
-    .map(
-      (item) =>
-        `${item.yearLevelLabel} from ${item.eventName} (${item.rowCount} ${
-          item.rowCount === 1 ? "row" : "rows"
-        })`,
-    )
-    .join(", ");
-  const totalRows = Array.from(affected.values()).reduce(
-    (sum, item) => sum + item.rowCount,
-    0,
-  );
-
-  throw createValidationError(
-    `Year level exemption blocks ${totalRows} ${
-      totalRows === 1 ? "row" : "rows"
-    }: ${details}. Remove the exempted year-level rows from the attendance file or choose a different event.`,
-  );
 }
 
 async function getManualAttendanceEvent(

@@ -431,6 +431,13 @@ export type AttendanceImportReconciliation = {
   rowsInSource: number;
   rowsInvalid: AttendanceImportInvalidRow[];
   rowsMerged: AttendanceImportMergedRow[];
+  rowsExempted: Array<{
+    rowNumber: number;
+    studentId: string;
+    name: string;
+    eventName: string;
+    reason: string;
+  }>;
   rowsSaved: number;
   stageCounts: AttendanceImportStageCounts;
 };
