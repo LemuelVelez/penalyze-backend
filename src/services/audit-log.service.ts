@@ -49,6 +49,7 @@ function getAuditContext(method: string, path: string): AuditContext {
     action: string;
     resourceType: string;
   }> = [
+    { matches: (m, p) => m === "POST" && p === "/api/repository-sync/restore", action: "Restored repository uploaded status", resourceType: "repository upload" },
     { matches: (m, p) => m === "POST" && p === "/api/auth/login", action: "Login attempt", resourceType: "authentication" },
     { matches: (m, p) => m === "POST" && p === "/api/auth/register", action: "Created user account", resourceType: "user" },
     { matches: (m, p) => m === "POST" && p === "/api/auth/change-password", action: "Changed account password", resourceType: "user" },

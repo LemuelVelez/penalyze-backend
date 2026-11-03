@@ -118,6 +118,7 @@ import {
   changeRepositorySync,
   downloadRepositoryUpload,
   listRepositoryUploads,
+  restoreRepositoryUploadedStatus,
 } from "./controller/penalyze-sync.controller";
 import { query } from "./lib/db";
 import { purgeExpiredAttendanceImports } from "./services/attendance.service";
@@ -252,6 +253,7 @@ app.get("/api/repository-sync/uploads/:id/download", requireAuth, downloadReposi
 app.post("/api/repository-sync/pending", requireAuth, changeRepositorySync("pending"));
 app.post("/api/repository-sync/uploaded", requireAuth, changeRepositorySync("uploaded"));
 app.post("/api/repository-sync/reset", requireAuth, changeRepositorySync("reset"));
+app.post("/api/repository-sync/restore", requireAuth, restoreRepositoryUploadedStatus);
 
 app.get("/api/school-years", schoolYears);
 app.post("/api/school-years", saveSchoolYear);
