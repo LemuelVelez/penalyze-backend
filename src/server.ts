@@ -22,6 +22,8 @@ import {
   removeRequestEvent as removeAttendanceRequestEvent,
   reviewRequest as reviewAttendanceRequest,
   reviewRequestWithProgress as reviewAttendanceRequestWithProgress,
+  reviewRequestGroup as reviewAttendanceRequestGroup,
+  reviewRequestGroupWithProgress as reviewAttendanceRequestGroupWithProgress,
 } from "./controller/attendance-requests.controller";
 import {
   attendanceUpload,
@@ -269,6 +271,8 @@ app.delete("/api/school-years/:id", deleteSchoolYear);
 app.post("/api/attendance/requests", createAttendanceRequest);
 app.get("/api/attendance/requests/student-status", publicStudentStatusRateLimit, publicAttendanceStudentRequests);
 app.get("/api/attendance/requests", requireAuth, attendanceRequests);
+app.patch("/api/attendance/requests/group-review", requireAuth, reviewAttendanceRequestGroup);
+app.patch("/api/attendance/requests/group-review/progress", requireAuth, reviewAttendanceRequestGroupWithProgress);
 app.patch(
   "/api/attendance/requests/:id/review",
   requireAuth,

@@ -50,6 +50,21 @@ export type AttendanceRequestReviewInput = {
   reviewNote?: unknown;
 };
 
+export type AttendanceRequestGroupReviewInput = AttendanceRequestReviewInput & {
+  studentId?: unknown;
+  requestIds?: unknown;
+};
+
+export type AttendanceRequestGroupReviewResult = {
+  requests: AttendanceRequestView[];
+  approvedCount: number;
+  rejectedCount: number;
+  autoClosedCount: number;
+  createdAttendanceCount: number;
+  updatedRowCount: number;
+  removedExemptedEventCount: number;
+};
+
 export type AttendanceRequestReviewProgress = {
   stage:
     | "validating"
@@ -1572,6 +1587,300 @@ export async function reviewAttendanceRequest(
         removedExemptedEventCount: result.removedExemptedEventCount,
         autoClosedByExemption: result.autoClosedByExemption,
       };
+}
+
+function normalizeGroupReviewInput(
+  reviewerIdValue: unknown,
+  input: AttendanceRequestGroupReviewInput,
+) {
+  const reviewerId = cleanText(reviewerIdValue);
+  const studentId = cleanText(input.studentId).toLowerCase();
+  const status = normalizeRequestStatus(input.status, false);
+  const reviewNote = cleanOptionalText(input.reviewNote);
+
+  if (!reviewerId) throw createHttpError("Authenticated reviewer is required.", 401);
+  if (!studentId) throw createHttpError("Student ID is required.");
+  if (!Array.isArray(input.requestIds) || !input.requestIds.length) {
+    throw createHttpError("Select at least one attendance request.");
+  }
+  const requestIds = Array.from(
+    new Set(input.requestIds.map((id: unknown) => cleanText(id).toLowerCase())),
+  );
+  if (requestIds.some((id) => !isUuid(id))) {
+    throw createHttpError("One or more attendance request IDs are invalid.");
+  }
+  return { reviewerId, studentId, requestIds, status, reviewNote };
+}
+
+function validateGroupReviewRequests(
+  requests: AttendanceRequestRecord[],
+  requestIds: string[],
+  studentId: string,
+) {
+  if (requests.length !== requestIds.length) {
+    throw createHttpError("One or more attendance requests were not found.", 404);
+  }
+  if (requests.some((request) => cleanText(request.student_id).toLowerCase() !== studentId)) {
+    throw createHttpError("All attendance requests must belong to the specified student.");
+  }
+  if (requests.some((request) => request.status !== "pending")) {
+    throw createHttpError("One or more attendance requests have already been reviewed.", 409);
+  }
+}
+
+export async function preflightAttendanceRequestGroupReview(
+  reviewerIdValue: unknown,
+  input: AttendanceRequestGroupReviewInput,
+) {
+  const { reviewerId, studentId, requestIds } = normalizeGroupReviewInput(
+    reviewerIdValue,
+    input,
+  );
+  const [reviewerResult, requestResult] = await Promise.all([
+    query<{ id: string }>(`SELECT id FROM users WHERE id = $1 LIMIT 1`, [reviewerId]),
+    query<AttendanceRequestRecord>(
+      `SELECT * FROM attendance_requests WHERE id = ANY($1::uuid[]) ORDER BY id`,
+      [requestIds],
+    ),
+  ]);
+  if (!reviewerResult.rows[0]) {
+    throw createHttpError("Authenticated reviewer account was not found.", 401);
+  }
+  validateGroupReviewRequests(requestResult.rows, requestIds, studentId);
+  return requestResult.rows;
+}
+
+export async function reviewAttendanceRequestGroup(
+  reviewerIdValue: unknown,
+  input: AttendanceRequestGroupReviewInput,
+  onProgress?: AttendanceRequestReviewProgressCallback,
+): Promise<AttendanceRequestGroupReviewResult> {
+  const { reviewerId, studentId, requestIds, status, reviewNote } =
+    normalizeGroupReviewInput(reviewerIdValue, input);
+  let lastProgressPercent = 0;
+  const emit = (
+    progress: Omit<AttendanceRequestReviewProgress, "percent"> & { percent: number },
+  ) => {
+    if (!onProgress) return;
+    const percent = Math.max(
+      lastProgressPercent,
+      Math.min(100, Math.round(progress.percent)),
+    );
+    lastProgressPercent = percent;
+    onProgress({ ...progress, percent });
+  };
+
+  emit({ stage: "validating", percent: 4, message: "Validating requests and reviewer." });
+  const result = await withTransaction(async (client) => {
+    const reviewerResult = await client.query<{ id: string }>(
+      `SELECT id FROM users WHERE id = $1 LIMIT 1`,
+      [reviewerId],
+    );
+    if (!reviewerResult.rows[0]) {
+      throw createHttpError("Authenticated reviewer account was not found.", 401);
+    }
+    const requestResult = await client.query<AttendanceRequestRecord>(
+      `SELECT * FROM attendance_requests WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
+      [requestIds],
+    );
+    validateGroupReviewRequests(requestResult.rows, requestIds, studentId);
+    const selected = requestResult.rows;
+    const details = selected.filter((request) => request.request_type === "details_correction");
+    const events = selected.filter((request) => request.request_type === "event_review");
+    const total = selected.length;
+    let approvedCount = 0;
+    let rejectedCount = 0;
+    let autoClosedCount = 0;
+    let createdAttendanceCount = 0;
+    let updatedRowCount = 0;
+    let removedExemptedEventCount = 0;
+    const approvedIds: string[] = [];
+    const approvedEventSchoolYearIds = new Set<string>();
+
+    if (status === "rejected") {
+      emit({
+        stage: "finalizing",
+        percent: 90,
+        message: `Rejecting ${total} selected request(s).`,
+        completed: total,
+        total,
+      });
+      await client.query(
+        `UPDATE attendance_requests
+         SET status = $2, reviewed_by = $3,
+             review_note = CONCAT_WS(E'\n', NULLIF(review_note, ''), NULLIF($4::text, '')),
+             reviewed_at = NOW(), updated_at = NOW()
+         WHERE id = ANY($1::uuid[])`,
+        [requestIds, status, reviewerId, reviewNote],
+      );
+      rejectedCount = total;
+    } else {
+      for (let index = 0; index < details.length; index += 1) {
+        const request = details[index];
+        const completed = index + 1;
+        emit({
+          stage: "updating_records",
+          percent: 10,
+          message: `Request ${completed} of ${total}: updating student details.`,
+          completed,
+          total,
+        });
+        updatedRowCount += await applyApprovedDetailsCorrection(
+          client,
+          request,
+          (progress) => emit({
+            ...progress,
+            percent: 10 + (progress.percent / 100) * 24,
+            message: `Request ${completed} of ${total}: ${progress.message}`,
+            completed,
+            total,
+          }),
+        );
+        const exemptions = await applyExemptionsToPendingAttendanceRequests(client, {
+          schoolYearId: request.school_year_id,
+          studentId: request.student_id,
+        });
+        removedExemptedEventCount += exemptions.eventsRemoved;
+        approvedIds.push(request.id);
+      }
+
+      // A correction can automatically close pending event reviews in the same group.
+      const remainingEventRows = events.length
+        ? await client.query<AttendanceRequestRecord>(
+            `SELECT * FROM attendance_requests WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
+            [events.map((request) => request.id)],
+          )
+        : { rows: [] as AttendanceRequestRecord[] };
+      for (let index = 0; index < remainingEventRows.rows.length; index += 1) {
+        const request = remainingEventRows.rows[index];
+        const completed = details.length + index + 1;
+        if (request.status !== "pending") {
+          autoClosedCount += 1;
+          emit({
+            stage: "resolving_events",
+            percent: 36 + (index / Math.max(events.length, 1)) * 16,
+            message: `Request ${completed} of ${total}: closed automatically by exemptions.`,
+            completed,
+            total,
+          });
+          continue;
+        }
+        emit({
+          stage: "resolving_events",
+          percent: 36 + (index / Math.max(events.length, 1)) * 16,
+          message: `Request ${completed} of ${total}: resolving events and exemptions.`,
+          completed,
+          total,
+        });
+        const resolved = await resolveRequestEventsForApproval(client, request);
+        removedExemptedEventCount += resolved.removedEventNames.length;
+        if (resolved.autoClosed) {
+          autoClosedCount += 1;
+          continue;
+        }
+        createdAttendanceCount += await addApprovedManualAttendance(
+          client,
+          request,
+          resolved.events,
+          (event, eventIndex, eventTotal) => emit({
+            stage: "adding_attendance",
+            percent: 37 + ((index + eventIndex / Math.max(eventTotal, 1)) / Math.max(events.length, 1)) * 16,
+            message: `Request ${completed} of ${total}: adding event ${eventIndex} of ${eventTotal}: ${event.event_name}`,
+            completed,
+            total,
+          }),
+        );
+        approvedIds.push(request.id);
+        approvedEventSchoolYearIds.add(request.school_year_id);
+      }
+
+      if (approvedEventSchoolYearIds.size) {
+        emit({
+          stage: "waiting_for_lock",
+          percent: 54,
+          message: "Waiting for attendance recalculation access.",
+          completed: approvedIds.length,
+          total,
+        });
+        await lockAttendanceAbsenceSync(client);
+        const schoolYearIds = [...approvedEventSchoolYearIds];
+        for (let index = 0; index < schoolYearIds.length; index += 1) {
+          emit({
+            stage: "syncing_absences",
+            percent: 56 + ((index + 1) / schoolYearIds.length) * 10,
+            message: `Syncing absences for school year ${index + 1} of ${schoolYearIds.length}.`,
+            completed: approvedIds.length,
+            total,
+          });
+          await syncAbsencesForStudents(client, [studentId], schoolYearIds[index]);
+        }
+        await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+          client,
+          schoolYearIds,
+          (progress) => {
+            const mapped = {
+              refreshing_final_results: { percent: 72, message: "Refreshing final attendance results." },
+              refreshing_calculations: { percent: 83, message: "Refreshing attendance calculations." },
+              refreshing_penalties: { percent: 92, message: "Refreshing fines and penalties." },
+            } as const;
+            emit({
+              stage: progress.stage,
+              ...mapped[progress.stage],
+              completed: progress.scopeIndex,
+              total: progress.scopeTotal,
+            });
+          },
+        );
+      }
+
+      emit({
+        stage: "finalizing",
+        percent: 96,
+        message: `Finalizing ${approvedIds.length} approved request(s).`,
+        completed: approvedIds.length,
+        total,
+      });
+      if (approvedIds.length) {
+        await client.query(
+          `UPDATE attendance_requests
+           SET status = $2, reviewed_by = $3,
+               review_note = CONCAT_WS(E'\n', NULLIF(review_note, ''), NULLIF($4::text, '')),
+               reviewed_at = NOW(), updated_at = NOW()
+           WHERE id = ANY($1::uuid[])`,
+          [approvedIds, status, reviewerId, reviewNote],
+        );
+      }
+      approvedCount = approvedIds.length;
+    }
+    return {
+      approvedCount,
+      rejectedCount,
+      autoClosedCount,
+      createdAttendanceCount,
+      updatedRowCount,
+      removedExemptedEventCount,
+    };
+  });
+
+  emit({
+    stage: "finalizing",
+    percent: 98,
+    message: "Group review saved. Loading updated requests.",
+    completed: requestIds.length,
+    total: requestIds.length,
+  });
+  const views = await Promise.all(requestIds.map((id) => getRequestViewById(id)));
+  emit({
+    stage: "finalizing",
+    percent: 100,
+    message: "Attendance request group review completed.",
+    completed: requestIds.length,
+    total: requestIds.length,
+  });
+  return {
+    ...result,
+    requests: views.filter((view): view is AttendanceRequestView => view !== null),
+  };
 }
 
 export async function removeAttendanceRequestEvent(

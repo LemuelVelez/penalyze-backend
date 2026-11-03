@@ -62,6 +62,7 @@ function getAuditContext(method: string, path: string): AuditContext {
     { matches: (m, p) => m === "DELETE" && p.endsWith("/records"), action: "Deleted school year records", resourceType: "school year records" },
     { matches: (m, p) => m === "DELETE" && /^\/api\/school-years\//.test(p), action: "Deleted school year", resourceType: "school year" },
     { matches: (m, p) => m === "POST" && p === "/api/attendance/requests", action: "Submitted attendance request", resourceType: "attendance request" },
+    { matches: (m, p) => m === "PATCH" && /^\/api\/attendance\/requests\/group-review(\/progress)?$/.test(p), action: "Reviewed attendance request group", resourceType: "attendance request" },
     { matches: (m, p) => m === "PATCH" && (p.endsWith("/review") || p.endsWith("/review/progress")), action: "Reviewed attendance request", resourceType: "attendance request" },
     { matches: (m, p) => m === "DELETE" && /^\/api\/attendance\/requests\/[^/]+\/events\/[^/]+$/.test(p), action: "Removed event from attendance request", resourceType: "attendance request" },
     { matches: (m, p) => m === "POST" && (p === "/api/attendance/event-exemptions" || p === "/api/attendance/event-exemptions/progress"), action: "Created attendance event college exemptions", resourceType: "attendance event college exemption" },
@@ -259,7 +260,7 @@ export function auditMutation(req: AuthenticatedRequest, res: Response, next: Ne
     if (attendanceRequestType === "details_correction") {
       if (req.method.toUpperCase() === "POST" && path === "/api/attendance/requests") {
         context.action = "Submitted details correction request";
-      } else if (req.method.toUpperCase() === "PATCH" && (path.endsWith("/review") || path.endsWith("/review/progress"))) {
+      } else if (req.method.toUpperCase() === "PATCH" && /^\/api\/attendance\/requests\/[^/]+\/review(\/progress)?$/.test(path)) {
         context.action = "Reviewed details correction request";
       }
     }

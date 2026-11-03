@@ -7,6 +7,8 @@ import {
   listPublicAttendanceRequestsForStudent,
   removeAttendanceRequestEvent,
   preflightAttendanceRequestReview,
+  preflightAttendanceRequestGroupReview,
+  reviewAttendanceRequestGroup,
   reviewAttendanceRequest,
 } from "../services/attendance-requests.service";
 import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
@@ -148,6 +150,76 @@ export async function reviewRequestWithProgress(
       return;
     }
 
+    next(error);
+  }
+}
+
+function getGroupReviewSuccessMessage(
+  result: Awaited<ReturnType<typeof reviewAttendanceRequestGroup>>,
+  studentId: string,
+  status: "approved" | "rejected",
+) {
+  const count = status === "approved" ? result.approvedCount : result.rejectedCount;
+  const autoClosed = result.autoClosedCount
+    ? ` ${result.autoClosedCount} request(s) auto-closed by exemption.`
+    : "";
+  return `${status === "approved" ? "Approved" : "Rejected"} ${count} request(s) for ${studentId}.${autoClosed}`;
+}
+
+export async function reviewRequestGroup(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const result = await reviewAttendanceRequestGroup(req.user?.sub, req.body ?? {});
+    res.locals.auditAttendanceRequestType = result.requests.every(
+      (request) => request.request_type === "details_correction",
+    ) ? "details_correction" : "event_review";
+    res.json({
+      message: getGroupReviewSuccessMessage(result, String(req.body.studentId).trim(), result.rejectedCount ? "rejected" : "approved"),
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function reviewRequestGroupWithProgress(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const preflight = await preflightAttendanceRequestGroupReview(
+      req.user?.sub,
+      req.body ?? {},
+    );
+    res.locals.auditAttendanceRequestType = preflight.every(
+      (request) => request.request_type === "details_correction",
+    ) ? "details_correction" : "event_review";
+    prepareProgressStream(res, 200);
+    const result = await reviewAttendanceRequestGroup(
+      req.user?.sub,
+      req.body ?? {},
+      (progress) => writeProgressStreamMessage(res, { type: "progress", progress }),
+    );
+    writeProgressStreamMessage(res, {
+      type: "success",
+      message: getGroupReviewSuccessMessage(result, String(req.body.studentId).trim(), result.rejectedCount ? "rejected" : "approved"),
+      data: result,
+    });
+    res.end();
+  } catch (error) {
+    if (res.headersSent) {
+      res.locals.auditOutcome = "failed";
+      writeProgressStreamMessage(res, {
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to review attendance request group.",
+      });
+      res.end();
+      return;
+    }
     next(error);
   }
 }
