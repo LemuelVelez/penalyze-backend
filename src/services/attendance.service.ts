@@ -8932,7 +8932,9 @@ export function getSavedFinalGroupRepairQuery() {
  * Uploaded attendance is never modified. All result/fine updates are atomic.
  */
 export async function repairCalculationConsistency(
-  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes">,
+  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> & {
+    actor?: { sub: string; name?: string | null; email?: string | null; role?: string | null };
+  },
 ) {
   const schoolYearId = cleanText(options.schoolYearId);
   if (!schoolYearId) {
