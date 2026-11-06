@@ -10,6 +10,7 @@ type AuditLogRow = {
   actor_email: string | null;
   actor_role: string | null;
   action: string;
+  category: string;
   resource_type: string;
   resource_id: string | null;
   method: string;
@@ -38,73 +39,66 @@ function validDate(value: string) {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+function auditLogFilters(req: AuthenticatedRequest, includeCategory: boolean) {
+  const search = cleanText(req.query.search);
+  const outcome = cleanText(req.query.outcome).toLowerCase();
+  const category = cleanText(req.query.category);
+  const from = validDate(cleanText(req.query.from));
+  const to = validDate(cleanText(req.query.to));
+  const where: string[] = [];
+  const params: unknown[] = [];
+
+  if (search) {
+    params.push(`%${search}%`);
+    const index = params.length;
+    where.push(`(
+      actor_name ILIKE $${index}
+      OR actor_email ILIKE $${index}
+      OR action ILIKE $${index}
+      OR category ILIKE $${index}
+      OR resource_type ILIKE $${index}
+      OR COALESCE(resource_id, '') ILIKE $${index}
+      OR route ILIKE $${index}
+      OR COALESCE(details->>'summary', '') ILIKE $${index}
+    )`);
+  }
+  if (outcome === "success") {
+    where.push("status_code >= 200 AND status_code < 400");
+  } else if (outcome === "failed") {
+    where.push("status_code >= 400");
+  }
+  if (from) {
+    params.push(from);
+    where.push(`created_at >= $${params.length}`);
+  }
+  if (to) {
+    params.push(to);
+    where.push(`created_at <= $${params.length}`);
+  }
+  if (includeCategory && category) {
+    params.push(category);
+    where.push(`category = $${params.length}`);
+  }
+  return { whereSql: where.length ? `WHERE ${where.join(" AND ")}` : "", params };
+}
+
 export async function listAuditLogs(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   try {
     const page = positiveInteger(req.query.page, 1);
     const limit = Math.min(100, positiveInteger(req.query.limit, 50));
     const offset = (page - 1) * limit;
-    const search = cleanText(req.query.search);
-    const outcome = cleanText(req.query.outcome).toLowerCase();
-    const sort =
-      cleanText(req.query.sort).toLowerCase() === "oldest" ? "oldest" : "newest";
+    const sort = cleanText(req.query.sort).toLowerCase() === "oldest" ? "oldest" : "newest";
     const sortDirection = sort === "oldest" ? "ASC" : "DESC";
-    const from = validDate(cleanText(req.query.from));
-    const to = validDate(cleanText(req.query.to));
-
-    const where: string[] = [];
-    const params: unknown[] = [];
-
-    if (search) {
-      params.push(`%${search}%`);
-      const index = params.length;
-      where.push(`(
-        actor_name ILIKE $${index}
-        OR actor_email ILIKE $${index}
-        OR action ILIKE $${index}
-        OR resource_type ILIKE $${index}
-        OR COALESCE(resource_id, '') ILIKE $${index}
-        OR route ILIKE $${index}
-      )`);
-    }
-
-    if (outcome === "success") {
-      where.push("status_code >= 200 AND status_code < 400");
-    } else if (outcome === "failed") {
-      where.push("status_code >= 400");
-    }
-
-    if (from) {
-      params.push(from);
-      where.push(`created_at >= $${params.length}`);
-    }
-
-    if (to) {
-      params.push(to);
-      where.push(`created_at <= $${params.length}`);
-    }
-
-    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const { whereSql, params } = auditLogFilters(req, true);
     const countParams = [...params];
 
     params.push(limit, offset);
     const rows = await query<AuditLogRow>(
       `
         SELECT
-          id,
-          user_id,
-          actor_name,
-          actor_email,
-          actor_role,
-          action,
-          resource_type,
-          resource_id,
-          method,
-          route,
-          status_code,
-          ip_address,
-          user_agent,
-          details,
-          created_at
+          id, user_id, actor_name, actor_email, actor_role,
+          action, category, resource_type, resource_id,
+          method, route, status_code, ip_address, user_agent, details, created_at
         FROM audit_logs
         ${whereSql}
         ORDER BY created_at ${sortDirection}, id ${sortDirection}
@@ -113,22 +107,32 @@ export async function listAuditLogs(req: AuthenticatedRequest, res: Response, ne
       `,
       params,
     );
-
     const count = await query<CountRow>(
       `SELECT COUNT(*)::text AS total FROM audit_logs ${whereSql}`,
       countParams,
     );
-
     const total = Number(count.rows[0]?.total ?? 0);
     res.json({
       data: rows.rows,
-      meta: {
-        page,
-        limit,
-        total,
-        totalPages: Math.max(1, Math.ceil(total / limit)),
-      },
+      meta: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
     });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function listAuditLogCategories(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  try {
+    const { whereSql, params } = auditLogFilters(req, false);
+    const categories = await query<{ category: string; total: string }>(
+      `SELECT category, COUNT(*)::text AS total
+       FROM audit_logs
+       ${whereSql}
+       GROUP BY category
+       ORDER BY category ASC`,
+      params,
+    );
+    res.json({ data: categories.rows.map(({ category, total }) => ({ category, total: Number(total) })) });
   } catch (error) {
     next(error);
   }

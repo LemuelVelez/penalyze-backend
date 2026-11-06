@@ -1253,12 +1253,13 @@ export async function calculationStatus(
 }
 
 export async function repairCalculationConsistencyRows(
-  req: Request,
+  req: AuthenticatedRequest,
   res: Response,
   next: NextFunction,
 ) {
   try {
     const result = await repairCalculationConsistency({
+      actor: req.user,
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
       importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
       sourceTypes: parseCalculationSourceTypes(

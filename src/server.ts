@@ -14,7 +14,7 @@ import {
   requireAuth,
   updateUser,
 } from "./controller/auth.controller";
-import { listAuditLogs } from "./controller/audit-logs.controller";
+import { listAuditLogCategories, listAuditLogs } from "./controller/audit-logs.controller";
 import {
   createRequest as createAttendanceRequest,
   requests as attendanceRequests,
@@ -246,6 +246,7 @@ app.put("/api/users/:id", requireAuth, requireAdmin, updateUser);
 app.delete("/api/users/:id", requireAuth, requireAdmin, deleteUser);
 
 app.get("/api/audit-logs", requireAuth, requireAdmin, listAuditLogs);
+app.get("/api/audit-logs/categories", requireAuth, requireAdmin, listAuditLogCategories);
 
 // Browser calls Penalyze only; the repository integration key stays server-side.
 app.get("/api/repository-sync/uploads", requireAuth, listRepositoryUploads);

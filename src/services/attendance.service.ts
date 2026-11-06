@@ -7069,8 +7069,10 @@ async function assertExpectedEventConsistencyWithClient(
     `
       SELECT details->'violations' AS violations
       FROM audit_logs
-      WHERE action = 'attendance_expected_events_consistency_violation'
-        AND resource_type = $1::TEXT
+      WHERE (action = 'attendance_expected_events_consistency_violation'
+             OR details->>'eventCode' = 'attendance_expected_events_consistency_violation')
+        AND (details->>'consistencyTable' = $1::TEXT
+             OR (details->>'consistencyTable' IS NULL AND resource_type = $1::TEXT))
         AND (details->>'schoolYearId') IS NOT DISTINCT FROM $2::TEXT
         AND (details->>'calculationScopeKey') IS NOT DISTINCT FROM $3::TEXT
       ORDER BY created_at DESC, id DESC
@@ -7096,16 +7098,19 @@ async function assertExpectedEventConsistencyWithClient(
   await client.query(
     `
       INSERT INTO audit_logs (
-        action, resource_type, method, route, status_code, details
+        action, category, resource_type, method, route, status_code, details
       ) VALUES (
-        'attendance_expected_events_consistency_violation',
-        $1::TEXT, 'SYSTEM', '/internal/attendance/refresh', 409, $2::jsonb
+        'Detected expected-event total inconsistency', 'System',
+        'calculation result', 'SYSTEM', '/internal/attendance/refresh', 409, $1::jsonb
       )
     `,
-    [table, JSON.stringify({
+    [JSON.stringify({
+      eventCode: "attendance_expected_events_consistency_violation",
+      consistencyTable: table,
       schoolYearId,
       calculationScopeKey: calculationScopeKey ?? null,
       violations,
+      summary: `Detected ${violations.length} inconsistent expected-event groups`,
     })],
   );
 
@@ -8293,7 +8298,9 @@ export async function getCalculationPendingSummary(
 
 async function acknowledgeCalculationInputChangesWithClient(
   client: PoolClient,
-  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes">,
+  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> & {
+    actor?: { sub: string; name?: string | null; email?: string | null; role?: string | null };
+  },
 ) {
   const schoolYearId = cleanText(options.schoolYearId) || null;
   const importIds = normalizeImportIds(options.importIds ?? []);
@@ -9077,10 +9084,25 @@ export async function repairCalculationConsistency(
     });
     if (targets.length) {
       await client.query(
-        `INSERT INTO audit_logs (action, resource_type, method, route, status_code, details)
-         VALUES ('attendance_expected_events_auto_repaired', 'calculation_results',
-           'SYSTEM', '/api/attendance/calculation-results/repair-consistency', 200, $1::jsonb)`,
-        [JSON.stringify({ schoolYearId, calculationScopeKey, targets, directlyRepairedRows, directlyRepairedFinalRows })],
+        `INSERT INTO audit_logs (
+           user_id, actor_name, actor_email, actor_role, action, category,
+           resource_type, method, route, status_code, details
+         ) VALUES (
+           $1, $2, $3, $4, 'Automatically repaired expected-event totals', 'System',
+           'calculation result', 'SYSTEM', '/api/attendance/calculation-results/repair-consistency',
+           200, $5::jsonb
+         )`,
+        [
+          options.actor?.sub ?? null,
+          options.actor?.name ?? null,
+          options.actor?.email ?? null,
+          options.actor?.role ?? null,
+          JSON.stringify({
+            eventCode: "attendance_expected_events_auto_repaired",
+            schoolYearId, calculationScopeKey, targets, directlyRepairedRows, directlyRepairedFinalRows,
+            summary: `${targets.length} groups repaired · ${directlyRepairedRows} calculation rows · ${directlyRepairedFinalRows} final-result rows`,
+          }),
+        ],
       );
     }
     return {
