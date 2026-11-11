@@ -11034,11 +11034,7 @@ export type EventCollegeCheckerRow = {
   has_upload: boolean;
   is_exempt: boolean;
   exemption_id: string | null;
-  is_verified: boolean;
-  verified_at: string | null;
-  verified_by_name: string | null;
-  note: string | null;
-  status: "exempt" | "missing" | "uploaded" | "verified";
+  status: "exempt" | "missing" | "uploaded";
 };
 
 export async function getEventCollegeChecker(input: {
@@ -11109,13 +11105,8 @@ export async function getEventCollegeChecker(input: {
       (COALESCE(r.record_count, 0) > 0 OR u.event_id IS NOT NULL) AS has_upload,
       (x.id IS NOT NULL) AS is_exempt,
       x.id AS exemption_id,
-      (v.id IS NOT NULL) AS is_verified,
-      v.verified_at,
-      verifier.name AS verified_by_name,
-      v.note,
       CASE
         WHEN x.id IS NOT NULL THEN 'exempt'
-        WHEN v.id IS NOT NULL THEN 'verified'
         WHEN COALESCE(r.record_count, 0) > 0 OR u.event_id IS NOT NULL THEN 'uploaded'
         ELSE 'missing'
       END AS status
@@ -11125,80 +11116,9 @@ export async function getEventCollegeChecker(input: {
     LEFT JOIN import_uploads u ON u.event_id = e.id AND u.college_key = c.college_key
     LEFT JOIN attendance_event_college_exemptions x
       ON x.event_id = e.id AND x.college_key = c.college_key
-    LEFT JOIN attendance_event_college_verifications v
-      ON v.event_id = e.id AND v.college_key = c.college_key
-    LEFT JOIN users verifier ON verifier.id = v.verified_by
     ORDER BY e.event_order ASC NULLS LAST, e.name, e.id, c.college_order
   `, [schoolYearId, eventId, collegeOptions.map((college) => college.key), collegeOptions.map((college) => college.label)]);
   return result.rows;
-}
-
-export async function setEventCollegeVerifications(input: {
-  schoolYearId: unknown;
-  items: Array<{ eventId: string; college: string; verified: boolean; note?: string | null }>;
-  userId: unknown;
-}): Promise<EventCollegeCheckerRow[]> {
-  const schoolYearId = cleanText(input.schoolYearId);
-  const userId = cleanText(input.userId);
-  if (!isUuid(schoolYearId)) throw createValidationError("A valid school year is required.");
-  if (!isUuid(userId)) throw createValidationError("An authenticated user is required.");
-  if (!Array.isArray(input.items) || !input.items.length) {
-    throw createValidationError("Select at least one college to verify.");
-  }
-
-  const items = input.items.map((item) => {
-    const eventId = cleanText(item?.eventId);
-    if (!isUuid(eventId) || typeof item?.verified !== "boolean") {
-      throw createValidationError("Each verification needs a valid event and verified value.");
-    }
-    const college = requireAttendanceUploadCollege(item.college);
-    return {
-      eventId,
-      collegeKey: college.key,
-      collegeLabel: college.label,
-      verified: item.verified,
-      note: item.note === undefined ? undefined : cleanText(item.note) || null,
-    };
-  });
-  const keys = items.map((item) => `${item.eventId}:${item.collegeKey}`);
-  if (new Set(keys).size !== keys.length) {
-    throw createValidationError("A college may only appear once per event in a request.");
-  }
-
-  await withTransaction(async (client) => {
-    const eventIds = Array.from(new Set(items.map((item) => item.eventId)));
-    const found = await client.query<{ id: string }>(
-      `SELECT id FROM attendance_events WHERE school_year_id = $1::uuid AND id = ANY($2::uuid[])`,
-      [schoolYearId, eventIds],
-    );
-    if (found.rows.length !== eventIds.length) {
-      throw createValidationError("One or more events do not belong to the selected school year.");
-    }
-    for (const item of items) {
-      if (item.verified) {
-        await client.query(`
-          INSERT INTO attendance_event_college_verifications
-            (school_year_id, event_id, college_key, college_label, note, verified_by, verified_at)
-          VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::uuid, NOW())
-          ON CONFLICT (event_id, college_key) DO UPDATE SET
-            school_year_id = EXCLUDED.school_year_id,
-            college_label = EXCLUDED.college_label,
-            note = COALESCE($5::text, attendance_event_college_verifications.note),
-            verified_by = EXCLUDED.verified_by,
-            verified_at = NOW()
-        `, [schoolYearId, item.eventId, item.collegeKey, item.collegeLabel, item.note ?? null, userId]);
-      } else {
-        await client.query(`
-          DELETE FROM attendance_event_college_verifications
-          WHERE school_year_id = $1::uuid AND event_id = $2::uuid AND college_key = $3
-        `, [schoolYearId, item.eventId, item.collegeKey]);
-      }
-    }
-  });
-
-  const changed = new Set(keys);
-  const updatedRows = await getEventCollegeChecker({ schoolYearId });
-  return updatedRows.filter((row) => changed.has(`${row.event_id}:${row.college_key}`));
 }
 
 export async function listEventCollegeExemptions(options: { schoolYearId?: unknown; eventId?: unknown; college?: unknown } = {}) {

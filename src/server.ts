@@ -45,7 +45,6 @@ import {
   eventDuplicateGroups as attendanceEventDuplicateGroups,
   eventExemptions as attendanceEventExemptions,
   eventCollegeChecker as attendanceEventCollegeChecker,
-  verifyEventColleges as verifyAttendanceEventColleges,
   eventExemptionImpact as attendanceEventExemptionImpact,
   eventYearLevelExemptions as attendanceEventYearLevelExemptions,
   eventYearLevelExemptionImpact as attendanceEventYearLevelExemptionImpact,
@@ -304,7 +303,6 @@ app.delete(
 app.get("/api/attendance/colleges", requireAuth, attendanceColleges);
 app.get("/api/attendance/event-exemptions", requireAuth, attendanceEventExemptions);
 app.get("/api/attendance/event-college-checker", requireAuth, attendanceEventCollegeChecker);
-app.post("/api/attendance/event-college-checker/verify", requireAuth, requireAdmin, verifyAttendanceEventColleges);
 app.post("/api/attendance/event-exemptions/impact", requireAuth, requireAdmin, attendanceEventExemptionImpact);
 app.post("/api/attendance/event-exemptions", requireAuth, requireAdmin, saveAttendanceEventExemptions);
 app.post(

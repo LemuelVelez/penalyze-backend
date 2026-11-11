@@ -35,7 +35,6 @@ import {
   listAttendanceEvents,
   listAttendanceColleges,
   listEventCollegeExemptions,
-  setEventCollegeVerifications,
   listEventYearLevelExemptions,
   listAttendanceEventDuplicateGroups,
   listAttendanceFinalResults,
@@ -342,19 +341,6 @@ export async function eventCollegeChecker(req: Request, res: Response, next: Nex
       eventId: req.query.eventId ?? req.query.event_id,
     });
     res.json({ message: "College attendance checker loaded.", data });
-  } catch (error) {
-    next(error);
-  }
-}
-
-export async function verifyEventColleges(req: Request, res: Response, next: NextFunction) {
-  try {
-    const data = await setEventCollegeVerifications({
-      schoolYearId: req.body?.schoolYearId,
-      items: req.body?.items,
-      userId: getAuthenticatedUserId(req),
-    });
-    res.json({ message: "College attendance verifications updated.", data });
   } catch (error) {
     next(error);
   }
