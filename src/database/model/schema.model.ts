@@ -1,5 +1,6 @@
 export const TABLES = {
   users: "users",
+  authLoginThrottles: "auth_login_throttles",
   students: "students",
   schoolYears: "school_years",
   attendanceEvents: "attendance_events",

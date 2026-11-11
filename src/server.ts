@@ -125,8 +125,13 @@ import {
 import { query } from "./lib/db";
 import { purgeExpiredAttendanceImports } from "./services/attendance.service";
 import { auditMutation } from "./services/audit-log.service";
+import { limitLoginTraffic } from "./services/login-protection.service";
 
 const app = express();
+// Trust forwarded client IPs only when a known number of reverse proxies are
+// enforced by the deployment. Never trust arbitrary X-Forwarded-For headers.
+const trustedProxyHops = Number(process.env.TRUST_PROXY_HOPS ?? 0);
+app.set("trust proxy", Number.isInteger(trustedProxyHops) && trustedProxyHops >= 0 ? trustedProxyHops : 0);
 const attendanceBatchUpload = attendanceUpload.fields([
   { name: "files", maxCount: 20 },
   { name: "file", maxCount: 20 },
@@ -194,6 +199,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
+// Reject login floods before parsing bodies, including oversized JSON requests.
+app.use("/api/auth/login", limitLoginTraffic);
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(attachAuthUser);
@@ -237,7 +244,7 @@ function publicStudentStatusRateLimit(req: Request, res: Response, next: NextFun
   next();
 }
 
-app.post("/api/auth/register", register);
+app.post("/api/auth/register", requireAuth, requireAdmin, register);
 app.post("/api/auth/login", login);
 app.get("/api/auth/me", requireAuth, me);
 app.post("/api/auth/change-password", requireAuth, changePassword);

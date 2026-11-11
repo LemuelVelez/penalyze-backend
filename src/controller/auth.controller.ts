@@ -3,6 +3,12 @@ import { NextFunction, Request, Response } from "express";
 
 import type { UserRecord, UserRole } from "../database/model/schema.model";
 import { query } from "../lib/db";
+import {
+  clearSuccessfulLogin,
+  getLoginBlockSeconds,
+  recordFailedLogin,
+  respondToBlockedLogin,
+} from "../services/login-protection.service";
 
 type JwtPayload = {
   sub: string;
@@ -89,6 +95,8 @@ function hashPassword(password: string) {
   const hash = crypto.scryptSync(password, salt, 64).toString("hex");
   return `${salt}:${hash}`;
 }
+
+const DUMMY_PASSWORD_HASH = hashPassword("nonexistent-user-placeholder");
 
 function verifyPassword(password: string, storedHash: string) {
   const [salt, hash] = storedHash.split(":");
@@ -191,26 +199,34 @@ export async function login(req: Request, res: Response, next: NextFunction) {
     const email = normalizeEmail(req.body?.email);
     const password = String(req.body?.password ?? "");
 
-    if (!email || !password) {
-      res.status(400).json({ message: "Email and password are required." });
+    // Check both IP-wide and IP/email-specific blocks before any password work.
+    const blockedSeconds = await getLoginBlockSeconds(req, email);
+    if (blockedSeconds > 0) {
+      respondToBlockedLogin(res, blockedSeconds);
+      return;
+    }
+
+    if (!email || !password || email.length > 254 || password.length > 1024) {
+      const retrySeconds = await recordFailedLogin(req, email);
+      if (retrySeconds > 0) respondToBlockedLogin(res, retrySeconds);
+      else res.status(400).json({ message: "Email and password are required." });
       return;
     }
 
     const result = await query<UserRecord>("SELECT * FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1", [email]);
     const user = result.rows[0];
 
-    if (!user) {
-      res.status(401).json({ message: "Invalid email or password." });
-      return;
-    }
-
-    const isCurrentPassword = verifyPassword(password, user.password_hash);
-    const isLegacyPassword = isCurrentPassword
+    // Equalize the local password-check cost for unknown emails to reduce
+    // account enumeration via response timing.
+    const isCurrentPassword = verifyPassword(password, user?.password_hash ?? DUMMY_PASSWORD_HASH);
+    const isLegacyPassword = !user || isCurrentPassword
       ? false
       : await verifyLegacyPostgresPassword(password, user.password_hash);
 
-    if (!isCurrentPassword && !isLegacyPassword) {
-      res.status(401).json({ message: "Invalid email or password." });
+    if (!user || (!isCurrentPassword && !isLegacyPassword)) {
+      const retrySeconds = await recordFailedLogin(req, email);
+      if (retrySeconds > 0) respondToBlockedLogin(res, retrySeconds);
+      else res.status(401).json({ message: "Invalid email or password." });
       return;
     }
 
@@ -226,6 +242,8 @@ export async function login(req: Request, res: Response, next: NextFunction) {
         [migratedPasswordHash, user.id]
       );
     }
+
+    await clearSuccessfulLogin(req, email);
 
     const remember = req.body?.remember;
     if (remember !== undefined && typeof remember !== "boolean") {
