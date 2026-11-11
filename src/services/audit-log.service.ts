@@ -235,6 +235,7 @@ function getAuditContext(method: string, path: string): AuditContext {
     { matches: (m, p) => m === "PATCH" && /^\/api\/attendance\/requests\/group-review(\/progress)?$/.test(p), action: "Reviewed attendance request group", resourceType: "attendance request", category: "Attendance Requests", describe: describeReview },
     { matches: (m, p) => m === "PATCH" && /^\/api\/attendance\/requests\/[^/]+\/review(?:\/progress)?$/.test(p), action: "Reviewed attendance request", resourceType: "attendance request", category: "Attendance Requests", describe: describeReview },
     { matches: (m, p) => m === "DELETE" && /^\/api\/attendance\/requests\/[^/]+\/events\/[^/]+$/.test(p), action: "Removed event from attendance request", resourceType: "attendance request", category: "Attendance Requests", describe: describeReview },
+    { matches: (m, p) => m === "POST" && p === "/api/attendance/event-college-checker/verify", action: "Updated college attendance verification", resourceType: "attendance event college verification", category: "Attendance Events", describe: describeIds },
     { matches: (m, p) => m === "POST" && p === "/api/attendance/event-exemptions/impact", action: "Previewed attendance event college exemption impact", resourceType: "attendance event college exemption", category: "Attendance Exemptions", describe: describeExemptions },
     { matches: (m, p) => m === "POST" && (p === "/api/attendance/event-exemptions" || p === "/api/attendance/event-exemptions/progress"), action: "Created attendance event college exemptions", resourceType: "attendance event college exemption", category: "Attendance Exemptions", describe: describeExemptions },
     { matches: (m, p) => m === "POST" && p === "/api/attendance/event-exemptions/bulk-delete", action: "Removed attendance event college exemptions (bulk)", resourceType: "attendance event college exemption", category: "Attendance Exemptions", describe: describeExemptions },
@@ -310,7 +311,7 @@ function categoryFromRoute(method: string, path: string): AuditCategory {
   if (path.startsWith("/api/school-years")) return "School Years";
   if (path.startsWith("/api/attendance/requests")) return "Attendance Requests";
   if (/^\/api\/attendance\/event-(?:year-level-)?exemptions(?:\/|$)/.test(path)) return "Attendance Exemptions";
-  if (path.startsWith("/api/attendance/events")) return "Attendance Events";
+  if (path.startsWith("/api/attendance/events") || path.startsWith("/api/attendance/event-college-checker")) return "Attendance Events";
   if (/^\/api\/attendance\/imports?(?:\/|$)/.test(path)) return "Attendance Imports";
   if (path.startsWith("/api/attendance/manual")) return "Manual Attendance";
   if (path.startsWith("/api/attendance/calculation-results")) return "Calculation Results";

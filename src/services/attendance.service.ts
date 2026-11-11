@@ -11023,6 +11023,184 @@ export async function listAttendanceColleges() {
     .sort((a, b) => a.label.localeCompare(b.label));
 }
 
+export type EventCollegeCheckerRow = {
+  event_id: string;
+  event_name: string;
+  college_key: string;
+  college_label: string;
+  record_count: number;
+  uploaded_student_count: number;
+  last_record_at: string | null;
+  has_upload: boolean;
+  is_exempt: boolean;
+  exemption_id: string | null;
+  is_verified: boolean;
+  verified_at: string | null;
+  verified_by_name: string | null;
+  note: string | null;
+  status: "exempt" | "missing" | "uploaded" | "verified";
+};
+
+export async function getEventCollegeChecker(input: {
+  schoolYearId: unknown;
+  eventId?: unknown;
+}): Promise<EventCollegeCheckerRow[]> {
+  const schoolYearId = cleanText(input.schoolYearId);
+  const eventId = cleanText(input.eventId) || null;
+  if (!schoolYearId || !isUuid(schoolYearId)) {
+    throw createValidationError("A valid school year is required.");
+  }
+  if (eventId && !isUuid(eventId)) {
+    throw createValidationError("A valid event is required.");
+  }
+
+  const collegeOptions = ATTENDANCE_UPLOAD_COLLEGES.map((label) => ({
+    key: normalizeCollegeKey(label)!, label,
+  }));
+  const result = await query<EventCollegeCheckerRow>(`
+    WITH target_events AS (
+      SELECT e.id, e.event_order, e.name
+      FROM attendance_events e
+      WHERE e.school_year_id = $1::uuid
+        AND ($2::uuid IS NULL OR e.id = $2::uuid)
+    ), college_options AS (
+      SELECT keys.key AS college_key, labels.label AS college_label, keys.ordinality AS college_order
+      FROM UNNEST($3::text[]) WITH ORDINALITY AS keys(key, ordinality)
+      JOIN UNNEST($4::text[]) WITH ORDINALITY AS labels(label, ordinality)
+        ON labels.ordinality = keys.ordinality
+    ), record_sources AS (
+      SELECT COALESCE(ar.event_id, ai.event_id) AS event_id,
+        ${getCanonicalCollegeKeySql("ar")} AS college_key,
+        LOWER(TRIM(ar.student_id)) AS student_key,
+        COALESCE(ar.scanned_at, ar.created_at) AS record_at
+      FROM attendance_records ar
+      LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
+      WHERE ar.deleted_at IS NULL
+        AND COALESCE(ar.event_id, ai.event_id) IN (SELECT id FROM target_events)
+
+      UNION ALL
+
+      SELECT mar.event_id,
+        ${getCanonicalCollegeKeySql("mar")} AS college_key,
+        LOWER(TRIM(mar.student_id)) AS student_key,
+        COALESCE(mar.scanned_at, mar.created_at) AS record_at
+      FROM manual_attendance_records mar
+      WHERE mar.event_id IN (SELECT id FROM target_events)
+        AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+        AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('Zero attendance registration from landing page.')
+    ), record_totals AS (
+      SELECT event_id, college_key,
+        COUNT(*)::int AS record_count,
+        COUNT(DISTINCT student_key)::int AS uploaded_student_count,
+        MAX(record_at) AS last_record_at
+      FROM record_sources
+      GROUP BY event_id, college_key
+    ), import_uploads AS (
+      SELECT DISTINCT ai.event_id, ai.college_key
+      FROM attendance_imports ai
+      WHERE ai.deleted_at IS NULL
+        AND ai.event_id IN (SELECT id FROM target_events)
+        AND ai.college_key IS NOT NULL
+    )
+    SELECT e.id AS event_id, e.name AS event_name, c.college_key, c.college_label,
+      COALESCE(r.record_count, 0)::int AS record_count,
+      COALESCE(r.uploaded_student_count, 0)::int AS uploaded_student_count,
+      r.last_record_at,
+      (COALESCE(r.record_count, 0) > 0 OR u.event_id IS NOT NULL) AS has_upload,
+      (x.id IS NOT NULL) AS is_exempt,
+      x.id AS exemption_id,
+      (v.id IS NOT NULL) AS is_verified,
+      v.verified_at,
+      verifier.name AS verified_by_name,
+      v.note,
+      CASE
+        WHEN x.id IS NOT NULL THEN 'exempt'
+        WHEN v.id IS NOT NULL THEN 'verified'
+        WHEN COALESCE(r.record_count, 0) > 0 OR u.event_id IS NOT NULL THEN 'uploaded'
+        ELSE 'missing'
+      END AS status
+    FROM target_events e
+    CROSS JOIN college_options c
+    LEFT JOIN record_totals r ON r.event_id = e.id AND r.college_key = c.college_key
+    LEFT JOIN import_uploads u ON u.event_id = e.id AND u.college_key = c.college_key
+    LEFT JOIN attendance_event_college_exemptions x
+      ON x.event_id = e.id AND x.college_key = c.college_key
+    LEFT JOIN attendance_event_college_verifications v
+      ON v.event_id = e.id AND v.college_key = c.college_key
+    LEFT JOIN users verifier ON verifier.id = v.verified_by
+    ORDER BY e.event_order ASC NULLS LAST, e.name, e.id, c.college_order
+  `, [schoolYearId, eventId, collegeOptions.map((college) => college.key), collegeOptions.map((college) => college.label)]);
+  return result.rows;
+}
+
+export async function setEventCollegeVerifications(input: {
+  schoolYearId: unknown;
+  items: Array<{ eventId: string; college: string; verified: boolean; note?: string | null }>;
+  userId: unknown;
+}): Promise<EventCollegeCheckerRow[]> {
+  const schoolYearId = cleanText(input.schoolYearId);
+  const userId = cleanText(input.userId);
+  if (!isUuid(schoolYearId)) throw createValidationError("A valid school year is required.");
+  if (!isUuid(userId)) throw createValidationError("An authenticated user is required.");
+  if (!Array.isArray(input.items) || !input.items.length) {
+    throw createValidationError("Select at least one college to verify.");
+  }
+
+  const items = input.items.map((item) => {
+    const eventId = cleanText(item?.eventId);
+    if (!isUuid(eventId) || typeof item?.verified !== "boolean") {
+      throw createValidationError("Each verification needs a valid event and verified value.");
+    }
+    const college = requireAttendanceUploadCollege(item.college);
+    return {
+      eventId,
+      collegeKey: college.key,
+      collegeLabel: college.label,
+      verified: item.verified,
+      note: item.note === undefined ? undefined : cleanText(item.note) || null,
+    };
+  });
+  const keys = items.map((item) => `${item.eventId}:${item.collegeKey}`);
+  if (new Set(keys).size !== keys.length) {
+    throw createValidationError("A college may only appear once per event in a request.");
+  }
+
+  await withTransaction(async (client) => {
+    const eventIds = Array.from(new Set(items.map((item) => item.eventId)));
+    const found = await client.query<{ id: string }>(
+      `SELECT id FROM attendance_events WHERE school_year_id = $1::uuid AND id = ANY($2::uuid[])`,
+      [schoolYearId, eventIds],
+    );
+    if (found.rows.length !== eventIds.length) {
+      throw createValidationError("One or more events do not belong to the selected school year.");
+    }
+    for (const item of items) {
+      if (item.verified) {
+        await client.query(`
+          INSERT INTO attendance_event_college_verifications
+            (school_year_id, event_id, college_key, college_label, note, verified_by, verified_at)
+          VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::uuid, NOW())
+          ON CONFLICT (event_id, college_key) DO UPDATE SET
+            school_year_id = EXCLUDED.school_year_id,
+            college_label = EXCLUDED.college_label,
+            note = COALESCE($5::text, attendance_event_college_verifications.note),
+            verified_by = EXCLUDED.verified_by,
+            verified_at = NOW()
+        `, [schoolYearId, item.eventId, item.collegeKey, item.collegeLabel, item.note ?? null, userId]);
+      } else {
+        await client.query(`
+          DELETE FROM attendance_event_college_verifications
+          WHERE school_year_id = $1::uuid AND event_id = $2::uuid AND college_key = $3
+        `, [schoolYearId, item.eventId, item.collegeKey]);
+      }
+    }
+  });
+
+  const changed = new Set(keys);
+  const updatedRows = await getEventCollegeChecker({ schoolYearId });
+  return updatedRows.filter((row) => changed.has(`${row.event_id}:${row.college_key}`));
+}
+
 export async function listEventCollegeExemptions(options: { schoolYearId?: unknown; eventId?: unknown; college?: unknown } = {}) {
   const clauses: string[] = [];
   const params: unknown[] = [];

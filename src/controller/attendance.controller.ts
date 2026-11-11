@@ -30,10 +30,12 @@ import {
   getCalculationStatus,
   getCalculationPendingSummary,
   getEventCollegeExemptionImpact,
+  getEventCollegeChecker,
   getEventYearLevelExemptionImpact,
   listAttendanceEvents,
   listAttendanceColleges,
   listEventCollegeExemptions,
+  setEventCollegeVerifications,
   listEventYearLevelExemptions,
   listAttendanceEventDuplicateGroups,
   listAttendanceFinalResults,
@@ -328,6 +330,31 @@ export async function eventExemptions(req: Request, res: Response, next: NextFun
       college: req.query.college,
     });
     res.json({ data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function eventCollegeChecker(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await getEventCollegeChecker({
+      schoolYearId: req.query.schoolYearId ?? req.query.school_year_id,
+      eventId: req.query.eventId ?? req.query.event_id,
+    });
+    res.json({ message: "College attendance checker loaded.", data });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function verifyEventColleges(req: Request, res: Response, next: NextFunction) {
+  try {
+    const data = await setEventCollegeVerifications({
+      schoolYearId: req.body?.schoolYearId,
+      items: req.body?.items,
+      userId: getAuthenticatedUserId(req),
+    });
+    res.json({ message: "College attendance verifications updated.", data });
   } catch (error) {
     next(error);
   }

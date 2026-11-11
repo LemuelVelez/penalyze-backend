@@ -3,6 +3,7 @@ export const TABLES = {
   students: "students",
   schoolYears: "school_years",
   attendanceEvents: "attendance_events",
+  attendanceEventCollegeVerifications: "attendance_event_college_verifications",
   attendanceImports: "attendance_imports",
   attendanceRecords: "attendance_records",
   attendanceFinalResults: "attendance_final_results",
