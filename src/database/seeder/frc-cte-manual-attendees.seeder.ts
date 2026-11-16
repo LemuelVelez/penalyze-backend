@@ -246,14 +246,40 @@ function combineManilaEventDateAndTime(eventDate: string, value: unknown) {
 
 function parseQuotedCsvRecord(record: string) {
   const normalized = record.replace(/\r/g, "").trim();
-  if (!normalized.startsWith('"') || !normalized.endsWith('"')) {
-    return null;
+  const values: string[] = [];
+  let position = 0;
+
+  while (position < normalized.length) {
+    if (normalized[position] !== '"') return null;
+    position += 1;
+
+    let value = "";
+    let closed = false;
+    while (position < normalized.length) {
+      const character = normalized[position];
+      position += 1;
+
+      if (character === '"') {
+        if (normalized[position] === '"') {
+          value += '"';
+          position += 1;
+        } else {
+          closed = true;
+          break;
+        }
+      } else {
+        value += character;
+      }
+    }
+
+    if (!closed) return null;
+    values.push(value);
+    if (position === normalized.length) return values;
+    if (normalized[position] !== ",") return null;
+    position += 1;
   }
 
-  return normalized
-    .slice(1, -1)
-    .split('\",\"')
-    .map((value) => value.replace(/\"\"/g, '"'));
+  return null;
 }
 
 function normalizeFixtureDate(value: unknown, expectedEventDate: string) {
