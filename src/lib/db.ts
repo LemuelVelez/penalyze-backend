@@ -1,11 +1,22 @@
 import "dotenv/config";
 import { Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
 
-const connectionString =
-  process.env.PostgreDatabase ||
-  process.env.POSTGRE_DATABASE ||
-  process.env.DATABASE_URL ||
-  "postgresql://postgres:password@localhost:5432/penalyze";
+const databaseUrlKey = (["PostgreDatabase", "POSTGRE_DATABASE", "DATABASE_URL"] as const)
+  .find((key) => Boolean(process.env[key]?.trim()));
+const connectionString = databaseUrlKey
+  ? process.env[databaseUrlKey]!.trim()
+  : "postgresql://postgres:password@localhost:5432/penalyze";
+
+// DNS EAI_AGAIN is temporary; retry establishing a connection, never replay a
+// statement after it has been sent on an established connection.
+const configuredDnsRetryAttempts = Number(process.env.DB_DNS_RETRY_ATTEMPTS ?? 3);
+const dnsRetryAttempts = Number.isFinite(configuredDnsRetryAttempts)
+  ? Math.min(5, Math.max(1, Math.floor(configuredDnsRetryAttempts)))
+  : 3;
+const configuredDnsRetryDelayMs = Number(process.env.DB_DNS_RETRY_BASE_DELAY_MS ?? 500);
+const dnsRetryDelayMs = Number.isFinite(configuredDnsRetryDelayMs)
+  ? Math.min(10000, Math.max(0, configuredDnsRetryDelayMs))
+  : 500;
 
 const TRANSACTION_RETRY_ERROR_CODES = new Set([
   "40P01", // deadlock_detected
@@ -72,6 +83,39 @@ function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function dnsFailureError(error: unknown): Error {
+  let host = "the configured host";
+  try {
+    host = new URL(connectionString).hostname || host;
+  } catch {
+    // Invalid connection strings will be reported separately by pg.
+  }
+
+  const source = databaseUrlKey ? `${databaseUrlKey} in your .env` : "the default database URL";
+  return new Error(
+    `PostgreSQL hostname ${host} could not be resolved (EAI_AGAIN) after ${dnsRetryAttempts} attempt(s). ` +
+      `Check ${source} for the correct hostname, your internet/DNS connection, and the database provider's status. ` +
+      "If running locally with a private/internal database hostname, use the provider's public connection URL instead.",
+    { cause: error },
+  );
+}
+
+// pool.query() and pool.connect() resolve the host before handing out a client.
+// Retry only temporary DNS failures at this boundary, not SQL execution errors.
+async function retryTemporaryDnsFailure<T>(connectOrQuery: () => Promise<T>): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await connectOrQuery();
+    } catch (error) {
+      if (getDatabaseErrorCode(error) !== "EAI_AGAIN") throw error;
+      attempt += 1;
+      if (attempt >= dnsRetryAttempts) throw dnsFailureError(error);
+      await wait(dnsRetryDelayMs * 2 ** (attempt - 1));
+    }
+  }
+}
+
 function getRetryDelayMs(attemptIndex: number) {
   if (transactionRetryBaseDelayMs <= 0) return 0;
 
@@ -99,7 +143,7 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
   text: string,
   params: unknown[] = [],
 ): Promise<QueryResult<T>> {
-  return pool.query<T>(text, params);
+  return retryTemporaryDnsFailure(() => pool.query<T>(text, params));
 }
 
 export async function withTransaction<T>(
@@ -111,7 +155,7 @@ export async function withTransaction<T>(
     let client: PoolClient | null = null;
 
     try {
-      client = await pool.connect();
+      client = await retryTemporaryDnsFailure(() => pool.connect());
       await client.query("BEGIN");
       await applyTransactionTimeouts(client);
 

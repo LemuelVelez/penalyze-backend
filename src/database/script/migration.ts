@@ -1,8 +1,9 @@
 import "dotenv/config";
 import fs from "fs/promises";
 import path from "path";
+import type { PoolClient } from "pg";
 
-import { closeDatabasePool, query } from "../../lib/db";
+import { closeDatabasePool, query, withTransaction } from "../../lib/db";
 import { consoleUi, formatDuration } from "./console-ui";
 
 const MIGRATIONS_TABLE = "schema_migrations";
@@ -35,8 +36,8 @@ async function isMigrationApplied(filename: string) {
   return Boolean(result.rows[0]);
 }
 
-async function registerMigration(filename: string) {
-  await query(
+async function registerMigration(filename: string, client: PoolClient) {
+  await client.query(
     `
       INSERT INTO ${MIGRATIONS_TABLE} (filename)
       VALUES ($1)
@@ -148,30 +149,20 @@ async function runMigrations() {
         .filter(Boolean).length;
 
       migrationTask.update(file, `Opening transaction • ~${statementCount} SQL statement${statementCount === 1 ? "" : "s"}`);
-      await query("BEGIN");
+      await withTransaction(async (client) => {
+        migrationTask.update(file, "Executing SQL changes");
+        await client.query(sql);
 
-      migrationTask.update(file, "Executing SQL changes");
-      await query(sql);
+        migrationTask.update(file, "Recording migration in schema_migrations");
+        await registerMigration(file, client);
 
-      migrationTask.update(file, "Recording migration in schema_migrations");
-      await registerMigration(file);
-
-      migrationTask.update(file, "Committing transaction");
-      await query("COMMIT");
+        migrationTask.update(file, "Committing transaction");
+      });
 
       appliedCount += 1;
       migrationTask.succeed(file, `${statementCount} statement${statementCount === 1 ? "" : "s"} committed`);
     } catch (error) {
-      migrationTask.update(file, "Error detected • rolling back transaction");
-      try {
-        await query("ROLLBACK");
-        migrationTask.fail(file, "Transaction rolled back — no partial migration kept");
-      } catch (rollbackError) {
-        migrationTask.fail(file, "Migration failed and rollback also reported an error");
-        consoleUi.warning(
-          `Rollback error: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
-        );
-      }
+      migrationTask.fail(file, "Migration failed — no successful commit confirmed");
       throw error;
     }
   }
