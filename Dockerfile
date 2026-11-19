@@ -2,9 +2,9 @@ FROM node:22-alpine AS dependencies
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY package.json package-lock.json ./
 
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+RUN npm ci --no-audit --no-fund
 
 
 FROM node:22-alpine AS builder
@@ -23,9 +23,9 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
-COPY package*.json ./
+COPY package.json package-lock.json ./
 
-RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi \
+RUN npm ci --omit=dev --no-audit --no-fund \
   && npm cache clean --force
 
 COPY --chown=node:node --from=builder /app/dist ./dist
