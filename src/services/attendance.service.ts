@@ -171,6 +171,7 @@ export type AttendanceFinalResultProfileField =
 export type AttendanceFinalResultProfileUpdateResult = {
   finalResult: AttendanceFinalResultRecord;
   updatedFields: AttendanceFinalResultProfileField[];
+  mergedIntoExistingStudent: boolean;
 };
 
 export type DeletedCalculationResultsResult = {
@@ -9950,6 +9951,10 @@ export async function updateAttendanceFinalResultProfile(
   const fieldSet = new Set(updatedFields);
 
   return withTransaction(async (client) => {
+    // Use the same transaction lock as the attendance refresh and event-update
+    // paths. A merge must not race a recalculation or another student-ID edit.
+    await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
+
     const finalResultQuery = await client.query<AttendanceFinalResultRecord>(
       `
         SELECT *
@@ -9975,74 +9980,12 @@ export async function updateAttendanceFinalResultProfile(
       throw createValidationError("Student ID is required.");
     }
 
-    const targetName = fieldSet.has("name")
-      ? cleanText(input.name)
-      : cleanText(finalResult.name);
-
-    if (!targetName) {
-      throw createValidationError("Name is required.");
-    }
-
     const normalizedIdChanged =
       targetStudentId.toLowerCase() !== originalStudentId.toLowerCase();
 
-    if (normalizedIdChanged) {
-      const conflictQuery = await client.query<{ exists: boolean }>(
-        `
-          SELECT EXISTS (
-            SELECT 1 FROM students WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-            UNION ALL
-            SELECT 1 FROM attendance_records WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-            UNION ALL
-            SELECT 1 FROM manual_attendance_records WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-            UNION ALL
-            SELECT 1 FROM attendance_requests WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-            UNION ALL
-            SELECT 1 FROM attendance_final_results WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-            UNION ALL
-            SELECT 1 FROM calculation_results WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-            UNION ALL
-            SELECT 1 FROM penalty_results WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-            UNION ALL
-            SELECT 1 FROM fines WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-          ) AS exists
-        `,
-        [targetStudentId],
-      );
-
-      if (conflictQuery.rows[0]?.exists) {
-        throw createValidationError(
-          `Student ID ${targetStudentId} already belongs to another student.`,
-          409,
-        );
-      }
-    }
-
-    const affectedSchoolYearsQuery = await client.query<{ school_year_id: string | null }>(
-      `
-        SELECT DISTINCT school_year_id
-        FROM (
-          SELECT school_year_id
-          FROM attendance_records
-          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-            AND deleted_at IS NULL
-          UNION ALL
-          SELECT school_year_id
-          FROM manual_attendance_records
-          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-          UNION ALL
-          SELECT school_year_id
-          FROM attendance_final_results
-          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-        ) scoped_years
-      `,
-      [originalStudentId],
-    );
-    const affectedSchoolYearIds = affectedSchoolYearsQuery.rows.map(
-      (row) => row.school_year_id,
-    );
-
-    const existingStudentQuery = await client.query<{
+    // Lock both identities in deterministic row order. The destination student
+    // is canonical if it already exists; the source must not replace it.
+    const studentsQuery = await client.query<{
       id: string;
       student_id: string;
       name: string;
@@ -10054,32 +9997,140 @@ export async function updateAttendanceFinalResultProfile(
       `
         SELECT id, student_id, name, year_level, college, program, institution
         FROM students
-        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-        ORDER BY updated_at DESC, created_at DESC, id DESC
-        LIMIT 1
+        WHERE LOWER(TRIM(student_id)) IN (LOWER(TRIM($1)), LOWER(TRIM($2)))
+        ORDER BY id
         FOR UPDATE
       `,
-      [originalStudentId],
+      [originalStudentId, targetStudentId],
     );
-    const existingStudent = existingStudentQuery.rows[0] ?? null;
+    const existingStudent = studentsQuery.rows.find(
+      (student) => student.student_id.trim().toLowerCase() === originalStudentId.toLowerCase(),
+    ) ?? null;
+    const targetStudent = normalizedIdChanged
+      ? studentsQuery.rows.find(
+          (student) => student.student_id.trim().toLowerCase() === targetStudentId.toLowerCase(),
+        ) ?? null
+      : null;
 
+    // A destination ID may have attendance evidence but no students row.
+    // Prefer its existing profile over the source profile when merging.
+    const targetSourceProfileQuery = normalizedIdChanged && !targetStudent
+      ? await client.query<{
+          name: string;
+          year_level: string | null;
+          college: string | null;
+          program: string | null;
+          institution: string | null;
+        }>(
+          `
+            SELECT name, year_level, college, program, institution
+            FROM (
+              SELECT student_id, school_year_id, name, year_level, college,
+                     program, institution, updated_at, 0 AS priority
+              FROM attendance_final_results
+              WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+              UNION ALL
+              SELECT student_id, school_year_id, name, year_level, college,
+                     program, institution, updated_at, 1 AS priority
+              FROM attendance_records
+              WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND deleted_at IS NULL
+              UNION ALL
+              SELECT student_id, school_year_id, name, year_level, college,
+                     program, institution, updated_at, 2 AS priority
+              FROM manual_attendance_records
+              WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+            ) destination_profile
+            ORDER BY (school_year_id IS NOT DISTINCT FROM $2::uuid) DESC,
+                     priority ASC, updated_at DESC
+            LIMIT 1
+          `,
+          [targetStudentId, finalResult.school_year_id],
+        )
+      : null;
+    const targetSourceProfile = targetSourceProfileQuery?.rows[0] ?? null;
+    const destinationProfile = targetStudent ?? targetSourceProfile;
+
+    // The destination might exist only in imported/manual records (without a
+    // row in students). That is still a merge, not an unused-ID correction.
+    const destinationExistsQuery = normalizedIdChanged
+      ? await client.query<{ exists: boolean }>(
+          `
+            SELECT EXISTS (
+              SELECT 1 FROM students WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+              UNION ALL
+              SELECT 1 FROM attendance_records WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+              UNION ALL
+              SELECT 1 FROM manual_attendance_records WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+              UNION ALL
+              SELECT 1 FROM attendance_requests WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+              UNION ALL
+              SELECT 1 FROM attendance_final_results WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+              UNION ALL
+              SELECT 1 FROM calculation_results WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+              UNION ALL
+              SELECT 1 FROM penalty_results WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+              UNION ALL
+              SELECT 1 FROM fines WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+              UNION ALL
+              SELECT 1 FROM attendance_student_event_overrides WHERE student_key = LOWER(TRIM($1))
+            ) AS exists
+          `,
+          [targetStudentId],
+        )
+      : null;
+    const mergedIntoExistingStudent = destinationExistsQuery?.rows[0]?.exists ?? false;
+
+    const targetName = fieldSet.has("name")
+      ? cleanText(input.name)
+      : cleanText(destinationProfile?.name) || cleanText(existingStudent?.name) || cleanText(finalResult.name);
+
+    if (!targetName) {
+      throw createValidationError("Name is required.");
+    }
+
+    const affectedSchoolYearsQuery = await client.query<{ school_year_id: string | null }>(
+      `
+        SELECT DISTINCT school_year_id
+        FROM (
+          SELECT school_year_id FROM attendance_records
+          WHERE LOWER(TRIM(student_id)) IN (LOWER(TRIM($1)), LOWER(TRIM($2)))
+            AND deleted_at IS NULL
+          UNION ALL
+          SELECT school_year_id FROM manual_attendance_records
+          WHERE LOWER(TRIM(student_id)) IN (LOWER(TRIM($1)), LOWER(TRIM($2)))
+          UNION ALL
+          SELECT school_year_id FROM attendance_final_results
+          WHERE LOWER(TRIM(student_id)) IN (LOWER(TRIM($1)), LOWER(TRIM($2)))
+          UNION ALL
+          SELECT school_year_id FROM attendance_student_event_overrides
+          WHERE student_key IN (LOWER(TRIM($1)), LOWER(TRIM($2)))
+        ) scoped_years
+      `,
+      [originalStudentId, targetStudentId],
+    );
+    const affectedSchoolYearIds = affectedSchoolYearsQuery.rows.map(
+      (row) => row.school_year_id,
+    );
+
+    const canonicalStudent = targetStudent ?? existingStudent;
+    const adoptDestinationProfile = normalizedIdChanged && !targetStudent && !!targetSourceProfile;
     const profileValues = {
       name: targetName,
       yearLevel: fieldSet.has("yearLevel")
         ? cleanText(input.yearLevel ?? input.year_level)
-        : cleanText(existingStudent?.year_level ?? finalResult.year_level),
+        : cleanText(destinationProfile?.year_level ?? canonicalStudent?.year_level ?? finalResult.year_level),
       college: fieldSet.has("college")
         ? cleanText(input.college)
-        : cleanText(existingStudent?.college ?? finalResult.college),
+        : cleanText(destinationProfile?.college ?? canonicalStudent?.college ?? finalResult.college),
       program: fieldSet.has("program")
         ? cleanText(input.program)
-        : cleanText(existingStudent?.program ?? finalResult.program),
+        : cleanText(destinationProfile?.program ?? canonicalStudent?.program ?? finalResult.program),
       institution: fieldSet.has("institution")
         ? cleanText(input.institution)
-        : cleanText(existingStudent?.institution ?? finalResult.institution),
+        : cleanText(destinationProfile?.institution ?? canonicalStudent?.institution ?? finalResult.institution),
     };
 
-    if (existingStudent) {
+    if (canonicalStudent) {
       await client.query(
         `
           UPDATE students
@@ -10094,31 +10145,32 @@ export async function updateAttendanceFinalResultProfile(
           WHERE id = $1
         `,
         [
-          existingStudent.id,
+          canonicalStudent.id,
           targetStudentId,
           profileValues.name,
           profileValues.yearLevel,
           profileValues.college,
           profileValues.program,
           profileValues.institution,
-          fieldSet.has("studentId"),
-          fieldSet.has("name"),
-          fieldSet.has("yearLevel"),
-          fieldSet.has("college"),
-          fieldSet.has("program"),
-          fieldSet.has("institution"),
+          fieldSet.has("studentId") && !targetStudent,
+          fieldSet.has("name") || (adoptDestinationProfile && !!cleanText(targetSourceProfile?.name)),
+          fieldSet.has("yearLevel") || (adoptDestinationProfile && !!cleanText(targetSourceProfile?.year_level)),
+          fieldSet.has("college") || (adoptDestinationProfile && !!cleanText(targetSourceProfile?.college)),
+          fieldSet.has("program") || (adoptDestinationProfile && !!cleanText(targetSourceProfile?.program)),
+          fieldSet.has("institution") || (adoptDestinationProfile && !!cleanText(targetSourceProfile?.institution)),
         ],
       );
+
+      if (targetStudent && existingStudent && targetStudent.id !== existingStudent.id) {
+        // Both students have their own UUID. Preserve the destination row,
+        // then remove the source identity after its records have been merged.
+        await client.query(`DELETE FROM students WHERE id = $1`, [existingStudent.id]);
+      }
     } else {
       await client.query(
         `
           INSERT INTO students (
-            student_id,
-            name,
-            year_level,
-            college,
-            program,
-            institution
+            student_id, name, year_level, college, program, institution
           )
           VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''))
         `,
@@ -10153,6 +10205,7 @@ export async function updateAttendanceFinalResultProfile(
         profileValues.program,
         fieldSet.has("institution"),
         profileValues.institution,
+        targetStudentId,
       ];
       const sourceProfileSetSql = `
         name = CASE WHEN $2::BOOLEAN THEN $3 ELSE name END,
@@ -10163,41 +10216,32 @@ export async function updateAttendanceFinalResultProfile(
         updated_at = NOW()
       `;
 
-      // Keep the student's profile copies consistent without invoking the
-      // attendance-event mutation path for every row. Event IDs, attendance
-      // values, scan times and remarks stay untouched, so a pre-existing
-      // exempted manual row cannot block an unrelated name/college edit.
-      await client.query(
-        `
-          UPDATE attendance_records
-          SET ${sourceProfileSetSql}
-          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-            AND deleted_at IS NULL
-        `,
-        sourceProfileParams,
-      );
-      await client.query(
-        `
-          UPDATE manual_attendance_records
-          SET ${sourceProfileSetSql}
-          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-        `,
-        sourceProfileParams,
-      );
+      // Only explicitly edited profile fields change. Do not alter event IDs,
+      // attendance counts, scan times, remarks, or imported file provenance.
+      for (const table of ["attendance_records", "manual_attendance_records"]) {
+        await client.query(
+          `
+            UPDATE ${table}
+            SET ${sourceProfileSetSql}
+            WHERE (LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+               OR LOWER(TRIM(student_id)) = LOWER(TRIM($12)))
+            ${table === "attendance_records" ? "AND deleted_at IS NULL" : ""}
+          `,
+          sourceProfileParams,
+        );
+      }
     }
 
-    if (targetStudentId !== originalStudentId) {
-      const studentIdTables = [
+    if (normalizedIdChanged) {
+      // These are the original evidence and transaction rows. Preserve every
+      // source row and its primary key rather than collapsing event attendance,
+      // paid fine records, or separately submitted correction requests.
+      for (const table of [
         "attendance_records",
         "manual_attendance_records",
         "attendance_requests",
-        "attendance_final_results",
-        "calculation_results",
-        "penalty_results",
         "fines",
-      ];
-
-      for (const table of studentIdTables) {
+      ]) {
         await client.query(
           `
             UPDATE ${table}
@@ -10207,13 +10251,127 @@ export async function updateAttendanceFinalResultProfile(
           [targetStudentId, originalStudentId],
         );
       }
-      // Corrections are keyed by normalized student ID rather than raw row IDs.
+
+      // Derived tables have unique student/school-year/scope indexes. Retain
+      // the destination row on overlap and rekey source-only rows, then
+      // recalculate the consolidated figures from all merged evidence.
+      for (const { table, scope } of [
+        {
+          table: "attendance_final_results",
+          scope: "destination.school_year_id IS NOT DISTINCT FROM source.school_year_id AND destination.import_id IS NOT DISTINCT FROM source.import_id",
+        },
+        {
+          table: "calculation_results",
+          scope: "destination.school_year_id IS NOT DISTINCT FROM source.school_year_id AND destination.calculation_scope_key = source.calculation_scope_key",
+        },
+      ]) {
+        await client.query(
+          `
+            DELETE FROM ${table} AS source
+            WHERE LOWER(TRIM(source.student_id)) = LOWER(TRIM($2))
+              AND EXISTS (
+                SELECT 1 FROM ${table} AS destination
+                WHERE LOWER(TRIM(destination.student_id)) = LOWER(TRIM($1))
+                  AND ${scope}
+                  AND destination.id <> source.id
+              )
+          `,
+          [targetStudentId, originalStudentId],
+        );
+        await client.query(
+          `
+            UPDATE ${table}
+            SET student_id = $1
+            WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($2))
+          `,
+          [targetStudentId, originalStudentId],
+        );
+      }
+
+      // Penalty statuses are not derived. Never reset a paid or waived result
+      // to unpaid when two student identities collide for the same year.
       await client.query(
-        `UPDATE attendance_student_event_overrides
-         SET student_key = LOWER(TRIM($1::text)), updated_at = NOW()
-         WHERE student_key = LOWER(TRIM($2::text))`,
+        `
+          UPDATE penalty_results AS destination
+          SET status = CASE
+            WHEN destination.status = 'paid' OR source.status = 'paid' THEN 'paid'
+            WHEN destination.status = 'waived' OR source.status = 'waived' THEN 'waived'
+            ELSE destination.status
+          END,
+          updated_at = NOW()
+          FROM penalty_results AS source
+          WHERE LOWER(TRIM(destination.student_id)) = LOWER(TRIM($1))
+            AND LOWER(TRIM(source.student_id)) = LOWER(TRIM($2))
+            AND destination.school_year_id IS NOT DISTINCT FROM source.school_year_id
+            AND destination.id <> source.id
+        `,
         [targetStudentId, originalStudentId],
       );
+      await client.query(
+        `
+          DELETE FROM penalty_results AS source
+          WHERE LOWER(TRIM(source.student_id)) = LOWER(TRIM($2))
+            AND EXISTS (
+              SELECT 1 FROM penalty_results AS destination
+              WHERE LOWER(TRIM(destination.student_id)) = LOWER(TRIM($1))
+                AND destination.school_year_id IS NOT DISTINCT FROM source.school_year_id
+                AND destination.id <> source.id
+            )
+        `,
+        [targetStudentId, originalStudentId],
+      );
+      await client.query(
+        `
+          UPDATE penalty_results
+          SET student_id = $1
+          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($2))
+        `,
+        [targetStudentId, originalStudentId],
+      );
+
+      // Existing destination corrections win when both identifiers have an
+      // explicit adjustment for the same event. All non-conflicting source
+      // corrections move to the destination key, then the old key is removed.
+      await client.query(
+        `
+          INSERT INTO attendance_student_event_overrides (
+            school_year_id, student_key, event_id, attended, updated_by,
+            created_at, updated_at
+          )
+          SELECT school_year_id, LOWER(TRIM($1::text)), event_id, attended,
+                 updated_by, created_at, updated_at
+          FROM attendance_student_event_overrides
+          WHERE student_key = LOWER(TRIM($2::text))
+          ON CONFLICT (school_year_id, student_key, event_id) DO NOTHING
+        `,
+        [targetStudentId, originalStudentId],
+      );
+      await client.query(
+        `
+          DELETE FROM attendance_student_event_overrides
+          WHERE student_key = LOWER(TRIM($1::text))
+        `,
+        [originalStudentId],
+      );
+    } else if (targetStudentId !== originalStudentId) {
+      // Only the capitalization changed: normalize stored ID copies without
+      // merging rows or touching the already-normalized correction keys.
+      for (const table of [
+        "attendance_records",
+        "manual_attendance_records",
+        "attendance_requests",
+        "attendance_final_results",
+        "calculation_results",
+        "penalty_results",
+        "fines",
+      ]) {
+        await client.query(
+          `UPDATE ${table}
+           SET student_id = $1
+           WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($2))`,
+          [targetStudentId, originalStudentId],
+        );
+      }
     }
 
     if (!affectedSchoolYearIds.length) {
@@ -10225,14 +10383,19 @@ export async function updateAttendanceFinalResultProfile(
       affectedSchoolYearIds,
     );
 
+    // The source final-result row can legitimately disappear when its scope
+    // collides with the destination. Return the merged result by canonical ID.
     const refreshedResultQuery = await client.query<AttendanceFinalResultRecord>(
       `
         SELECT *
         FROM attendance_final_results
-        WHERE id = $1
+        WHERE import_id IS NULL
+          AND school_year_id IS NOT DISTINCT FROM $2::uuid
+          AND LOWER(TRIM(student_id)) = LOWER(TRIM($3))
+        ORDER BY (id = $1::uuid) DESC, updated_at DESC
         LIMIT 1
       `,
-      [id],
+      [id, finalResult.school_year_id, targetStudentId],
     );
     const refreshedResult = refreshedResultQuery.rows[0];
 
@@ -10243,6 +10406,7 @@ export async function updateAttendanceFinalResultProfile(
     return {
       finalResult: refreshedResult,
       updatedFields,
+      mergedIntoExistingStudent,
     };
   });
 }
