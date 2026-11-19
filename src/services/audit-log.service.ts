@@ -468,20 +468,13 @@ export function auditMutation(req: AuthenticatedRequest, res: Response, next: Ne
         ? extractAuthenticatedResponseActor(responseBody)
         : null;
     const actor = req.user ?? responseActor;
-    const summary = context.describe?.(req, responseBody) ?? null;
+    // Never persist untrusted request bodies, query strings, notes, names, or file names.
+    // A minimal audit trail needs the actor, action, resource, outcome and timing only.
     const details = {
-      ...(summary ? { summary: sanitizeValue(summary) } : {}),
+      outcome: res.locals.auditOutcome === "failed" || res.statusCode >= 400 ? "failed" : "success",
+      durationMs: Math.min(86_400_000, Math.max(0, Date.now() - startedAt)),
+      ...(files.length ? { uploadCount: files.length, uploadBytes: files.reduce((sum, f) => sum + f.size, 0) } : {}),
       ...(context.unmappedRoute ? { unmappedRoute: true } : {}),
-      outcome:
-        res.locals.auditOutcome === "failed"
-          ? "failed"
-          : res.statusCode >= 200 && res.statusCode < 400
-            ? "success"
-            : "failed",
-      durationMs: Date.now() - startedAt,
-      ...(Object.keys(req.query ?? {}).length ? { query: sanitizeValue(req.query) } : {}),
-      ...(path !== "/api/auth/change-password" && req.body && Object.keys(req.body).length ? { body: sanitizeValue(req.body) } : {}),
-      ...(files.length ? { files } : {}),
     };
 
     void query(
@@ -506,8 +499,8 @@ export function auditMutation(req: AuthenticatedRequest, res: Response, next: Ne
       `,
       [
         actor?.sub ?? null,
-        actor?.name ?? null,
-        actor?.email ?? null,
+        null,
+        null,
         actor?.role ?? null,
         context.action,
         context.category,
@@ -516,8 +509,8 @@ export function auditMutation(req: AuthenticatedRequest, res: Response, next: Ne
         req.method.toUpperCase(),
         path,
         res.statusCode,
-        getIpAddress(req),
-        req.get("user-agent") ?? null,
+        path.startsWith("/api/auth/") ? getIpAddress(req) : null,
+        null,
         JSON.stringify(details),
       ],
     ).catch((error) => {

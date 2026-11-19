@@ -10,7 +10,7 @@ import { normalizeAttendanceEventIdentityName } from "../../services/attendance-
 
 const TARGET_SCHOOL_YEAR = "2026-2027";
 const TARGET_SEMESTER = "first_semester";
-const PLACEHOLDER_STUDENT_ID = "TC-20-A-00000";
+const PLACEHOLDER_STUDENT_ID = "TC-99-A-01689";
 const DEFAULT_COLLEGE = "School of Engineering";
 const DEFAULT_PROGRAM = "Agricultural Biosystems Engineering";
 const DEFAULT_INSTITUTION =
@@ -34,7 +34,7 @@ type EventDefinition = {
 
 const FIXTURES = [
   {
-    fileName: "FRC__August_24_2026_.csv",
+    fileName: "synthetic-frc-august-24-2026.csv",
     eventDate: "2026-08-24",
     eventDateLabel: "August 24, 2026",
     eventName: "FRC August 24",
@@ -44,7 +44,7 @@ const FIXTURES = [
       "Seeded manual attendance event for the August 24, 2026 SOE Flag Raising Ceremony.",
   },
   {
-    fileName: "attendance_Aug_24_2026.csv",
+    fileName: "synthetic-attendance-aug-24-2026.csv",
     eventDate: "2026-08-24",
     eventDateLabel: "August 24, 2026",
     eventName: "FRC August 24",
@@ -65,14 +65,14 @@ const WALK_IN_GROUPS = [
     description:
       "Seeded manual attendance event for the August 24, 2026 SOE Flag Raising Ceremony.",
     attendees: [
-      { name: "Christian Kurl E. Sumangil", studentId: "TC-26-A-00413" },
-      { name: "Achilles D. Sanchez", studentId: "TC-26-A-00471" },
-      { name: "Bobby Jose C. Sanchez", studentId: "TC-26-A-00470" },
-      { name: "John Cydie Bagutua", studentId: "" },
-      { name: "Albert Fanuncio", studentId: "TC-26-A-00670" },
-      { name: "Angelou Ozarraga", studentId: "TC-26-A-01076" },
-      { name: "Deo E. Garcia", studentId: "TC-26-A-00578" },
-      { name: "Vinzent E. Alub", studentId: "TC-26-A-00236" },
+      { name: "Avery Example", studentId: "TC-99-A-00100" },
+      { name: "Jordan Sample", studentId: "TC-99-A-00101" },
+      { name: "Taylor Fiction", studentId: "TC-99-A-00102" },
+      { name: "Morgan Demo", studentId: "TC-99-A-00103" },
+      { name: "Robin Placeholder", studentId: "TC-99-A-00104" },
+      { name: "Alex Example", studentId: "TC-99-A-00105" },
+      { name: "Sam Sample", studentId: "TC-99-A-00106" },
+      { name: "Casey Fiction", studentId: "TC-99-A-00107" },
     ],
   },
   {
@@ -83,7 +83,7 @@ const WALK_IN_GROUPS = [
       "Seeded as manual attendance from the September 1, 2026 SOE FRC walk-in attendee list.",
     description:
       "Seeded manual attendance event for the September 1, 2026 SOE Flag Raising Ceremony.",
-    attendees: [{ name: "Celio Rendoque", studentId: "TC-24-A-00339" }],
+    attendees: [{ name: "Drew Demo", studentId: "TC-99-A-00108" }],
   },
 ] as const satisfies readonly (EventDefinition & {
   attendees: readonly { name: string; studentId: string }[];

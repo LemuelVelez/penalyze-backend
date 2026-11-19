@@ -18,6 +18,11 @@ import { seedManualAttendanceCcsCollege } from "../seeder/manual-attendance-ccs-
 import { closeDatabasePool, query } from "../../lib/db";
 import { consoleUi, formatDuration } from "./console-ui";
 
+
+if (process.env.NODE_ENV === "production" && process.env.ALLOW_PRODUCTION_SEED !== "true") {
+  throw new Error("Production seeding is disabled. Set ALLOW_PRODUCTION_SEED=true to explicitly allow synthetic fixture seeding.");
+}
+
 const DATA_SEED_HISTORY_TABLE = "data_seed_history";
 const FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-09-01-frc-manual-attendees-v1";
 const CAF_FRC_MANUAL_ATTENDEES_SEED_KEY = "2026-caf-frc-manual-attendees-v1";

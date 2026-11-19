@@ -24,6 +24,15 @@ async function repositoryRequest(path: string, init: RequestInit = {}): Promise<
   if (!REPOSITORY_BASE || !INTEGRATION_KEY) {
     throw Object.assign(new Error("AttendanceRepository integration is not configured."), { status: 503 });
   }
+  let url: URL;
+  try {
+    url = new URL(REPOSITORY_BASE);
+    if ((url.protocol !== "https:" && !(process.env.NODE_ENV !== "production" && url.hostname === "localhost")) || url.username || url.password || url.search || url.hash) {
+      throw new Error("Unsafe repository origin");
+    }
+  } catch {
+    throw Object.assign(new Error("AttendanceRepository URL is not configured securely."), { status: 503 });
+  }
   let response: globalThis.Response;
   try {
     response = await fetch(`${REPOSITORY_BASE}/api/penalyze-sync${path}`, {

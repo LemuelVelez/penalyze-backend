@@ -21,11 +21,15 @@ import {
 
 type AttendanceRequestEventInput = {
   eventId?: unknown;
+  eventName?: unknown;
   evidenceUrl?: unknown;
 };
 
 export type AttendanceRequestInput = {
   requestType?: unknown;
+  lastName?: unknown;
+  honeypot?: unknown;
+  formStartedAt?: unknown;
   schoolYearId?: unknown;
   studentId?: unknown;
   name?: unknown;
@@ -396,6 +400,28 @@ async function getRequestViewById(
   return result.rows[0] ?? null;
 }
 
+function verifiedLastName(name: string, input: unknown): boolean {
+  const expected = String(input ?? "").trim().toLocaleLowerCase().replace(/\s+/g, " ");
+  const normalizedName = name.trim().toLocaleLowerCase();
+  const actual = normalizedName.includes(",")
+    ? normalizedName.split(",")[0].trim()
+    : normalizedName.split(/\s+/).slice(-1)[0];
+  return expected.length >= 2 && expected.length <= 80 && actual === expected;
+}
+
+function cleanPublicField(value: unknown, max: number, label: string): string {
+  if (value !== undefined && typeof value !== "string") throw createHttpError(`${label} is invalid.`);
+  const text = String(value ?? "").replace(/<[^>]*>/g, "").trim();
+  if (text.length > max) throw createHttpError(`${label} is too long.`);
+  return text;
+}
+
+export async function studentIdentityMatches(studentId: string, lastName: unknown): Promise<boolean> {
+  if (!/^[A-Za-z0-9-]{4,36}$/.test(studentId)) return false;
+  const details = await withTransaction((client) => getCurrentStudentDetails(client, studentId));
+  return details.exists && verifiedLastName(details.name, lastName);
+}
+
 export async function createAttendanceRequest(input: AttendanceRequestInput) {
   const requestType = normalizeRequestType(input.requestType);
   const inputSchoolYearId = cleanText(input.schoolYearId);
@@ -404,9 +430,30 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
   if (inputSchoolYearId && !isUuid(inputSchoolYearId)) {
     throw createHttpError("School year / semester ID is invalid.");
   }
-  if (!studentId) throw createHttpError("Student ID is required.");
+  if (!studentId || !/^[A-Za-z0-9-]{4,36}$/.test(studentId)) throw createHttpError("Invalid student information.");
+  if (cleanText(input.honeypot)) throw createHttpError("Invalid submission.");
+  const fillTime = Date.now() - Number(input.formStartedAt);
+  if (!Number.isFinite(fillTime) || fillTime < 3000 || fillTime > 24 * 60 * 60 * 1000) {
+    throw createHttpError("Please complete the form normally and try again.");
+  }
+  // Check the original types, length-limit every public field, and persist only
+  // the sanitized values rather than merely validating a cleaned copy.
+  input = {
+    ...input,
+    name: cleanPublicField(input.name, 160, "name"),
+    yearLevel: cleanPublicField(input.yearLevel, 80, "yearLevel"),
+    college: cleanPublicField(input.college, 160, "college"),
+    program: cleanPublicField(input.program, 160, "program"),
+    institution: cleanPublicField(input.institution, 160, "institution"),
+    note: cleanPublicField(input.note, 1000, "note"),
+  };
 
   return withTransaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext(LOWER(TRIM($1))))", [studentId]);
+    const identity = await getCurrentStudentDetails(client, studentId);
+    if (!identity.exists || !verifiedLastName(identity.name, input.lastName)) {
+      throw createHttpError("Invalid student information.", 404);
+    }
     const schoolYearId = inputSchoolYearId || (await getActiveSchoolYearId(client));
     if (!schoolYearId) {
       throw createHttpError(
@@ -428,11 +475,6 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
           "Details correction requests cannot include attendance events.",
         );
       }
-
-      await client.query(
-        `SELECT pg_advisory_xact_lock(hashtext(LOWER(TRIM($1))))`,
-        [studentId],
-      );
 
       const current = await getCurrentStudentDetails(client, studentId);
       if (!current.exists || !current.name) {
@@ -518,8 +560,21 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       return (await getRequestViewById(requestResult.rows[0].id, client))!;
     }
 
-    let name = cleanText(input.name);
-    let events = normalizeRequestEvents(input.events);
+    let name = identity.name;
+    // A verified student can enter an event name without needing the private event roster.
+    const submittedEvents = Array.isArray(input.events) ? await Promise.all(input.events.map(async (raw) => {
+      const submitted = raw as AttendanceRequestEventInput;
+      if (submitted?.eventId || !submitted?.eventName) return raw;
+      const eventName = cleanPublicField(submitted.eventName, 160, "event name");
+      const matched = await client.query<{id: string}>(`
+        SELECT id FROM attendance_events
+        WHERE school_year_id = $1 AND LOWER(TRIM(name)) = LOWER(TRIM($2))
+        ORDER BY created_at DESC LIMIT 1
+      `, [schoolYearId, eventName]);
+      if (!matched.rows.length) throw createHttpError("Selected event was not found.", 404);
+      return { eventId: matched.rows[0].id, evidenceUrl: submitted.evidenceUrl };
+    })) : input.events;
+    let events = normalizeRequestEvents(submittedEvents);
     if (!name) {
       const currentStudent = await getCurrentStudentDetails(client, studentId);
       name = currentStudent.name ?? "";
@@ -529,6 +584,16 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
         "Name is required. Submit a Request Details Correction first, then try the attendance review again.",
       );
     }
+
+    const duplicates = await client.query<{ id: string }>(`
+      SELECT ar.id FROM attendance_requests ar
+      JOIN attendance_request_events are ON are.request_id = ar.id
+      WHERE ar.status = 'pending' AND ar.request_type = 'event_review'
+        AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM($1))
+        AND ar.school_year_id = $2 AND are.event_id = ANY($3::uuid[])
+      LIMIT 1
+    `, [studentId, schoolYearId, events.map((event) => event.eventId)]);
+    if (duplicates.rows.length) throw createHttpError("A pending request already exists for one or more selected events.", 409);
 
     let eventIds = events.map((event) => event.eventId);
     const eventResult = await client.query<{
@@ -559,17 +624,8 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       }
     }
 
-    let requestCollege = cleanText(input.college);
-    if (!requestCollege) {
-      const currentStudent = await getCurrentStudentDetails(client, studentId);
-      requestCollege = currentStudent.college ?? "";
-    }
-
-    let requestYearLevel = cleanText(input.yearLevel);
-    if (!requestYearLevel) {
-      const currentStudent = await getCurrentStudentDetails(client, studentId);
-      requestYearLevel = currentStudent.year_level ?? "";
-    }
+    const requestCollege = identity.college ?? "";
+    const requestYearLevel = identity.year_level ?? "";
     const requestCollegeKey = normalizeCollegeKey(requestCollege);
     const requestYearLevelKey = normalizeYearLevelKey(requestYearLevel);
 
@@ -888,170 +944,32 @@ export type PublicStudentAttendanceRequestStatus = {
   school_year_name: string;
   semester: SchoolSemester;
   request_type: AttendanceRequestType;
-  name: string;
-  year_level: string | null;
-  college: string | null;
-  program: string | null;
-  current_name: string | null;
-  current_year_level: string | null;
-  current_college: string | null;
-  current_program: string | null;
   status: AttendanceRequestStatus;
-  request_note: string | null;
   review_note: string | null;
   reviewed_at: string | null;
   created_at: string;
-  events: Array<{ event_id: string | null; event_name: string }>;
 };
-
-type PublicStudentAttendanceRequestStatusRow =
-  PublicStudentAttendanceRequestStatus & {
-    student_college: string | null;
-  };
 
 export async function listPublicAttendanceRequestsForStudent(
   studentIdValue: unknown,
+  lastNameValue: unknown,
   schoolYearIdValue?: unknown,
 ): Promise<PublicStudentAttendanceRequestStatus[]> {
   const studentId = cleanText(studentIdValue);
   const schoolYearId = cleanText(schoolYearIdValue);
-  if (!studentId) return [];
-  if (schoolYearId && !isUuid(schoolYearId)) {
-    throw createHttpError("School year / semester ID is invalid.");
-  }
-
-  const params: unknown[] = [studentId];
-  const schoolYearClause = schoolYearId
-    ? `AND ar.school_year_id = $${params.push(schoolYearId)}`
-    : "";
-
-  const result = await query<PublicStudentAttendanceRequestStatusRow>(
-    `
-      SELECT
-        ar.id,
-        ar.school_year_id,
-        sy.name AS school_year_name,
-        sy.semester,
-        ar.request_type,
-        ar.name,
-        ar.year_level,
-        ar.college,
-        ar.program,
-        ar.current_name,
-        ar.current_year_level,
-        ar.current_college,
-        ar.current_program,
-        (
-          SELECT NULLIF(TRIM(student.college), '')
-          FROM students student
-          WHERE LOWER(TRIM(student.student_id)) = LOWER(TRIM(ar.student_id))
-          ORDER BY student.updated_at DESC, student.created_at DESC, student.id DESC
-          LIMIT 1
-        ) AS student_college,
-        ar.status,
-        ar.request_note,
-        ar.review_note,
-        ar.reviewed_at,
-        ar.created_at,
-        COALESCE(
-          JSON_AGG(
-            JSON_BUILD_OBJECT(
-              'event_id', are.event_id,
-              'event_name', are.event_name
-            ) ORDER BY are.created_at, are.event_name
-          ) FILTER (WHERE are.id IS NOT NULL),
-          '[]'::JSON
-        ) AS events
-      FROM attendance_requests ar
-      JOIN school_years sy ON sy.id = ar.school_year_id
-      LEFT JOIN attendance_request_events are ON are.request_id = ar.id
-      WHERE LOWER(TRIM(ar.student_id)) = LOWER(TRIM($1))
-        ${schoolYearClause}
-      GROUP BY ar.id, sy.id
-      ORDER BY
-        CASE WHEN ar.status = 'pending' THEN 0 ELSE 1 END,
-        COALESCE(ar.reviewed_at, ar.created_at) DESC,
-        ar.created_at DESC
-      LIMIT 20
-    `,
-    params,
-  );
-
-  const eventReviewRows = result.rows.filter(
-    (request) => request.request_type === "event_review",
-  );
-  const candidateEventIds: string[] = [];
-  const candidateCollegeKeys: Array<string | null> = [];
-  const candidateYearLevelKeys: Array<string | null> = [];
-
-  eventReviewRows.forEach((request) => {
-    const collegeKey = normalizeCollegeKey(
-      request.student_college || request.college,
-    );
-    const yearLevelKey = normalizeYearLevelKey(request.year_level);
-
-    request.events.forEach((event) => {
-      const eventId = cleanText(event.event_id);
-      if (!eventId) return;
-      candidateEventIds.push(eventId);
-      candidateCollegeKeys.push(collegeKey);
-      candidateYearLevelKeys.push(yearLevelKey);
-    });
-  });
-
-  const visibleEventPairs = new Set<string>();
-  if (candidateEventIds.length) {
-    const visibleEventResult = await query<{
-      event_id: string;
-      college_key: string;
-      year_level_key: string;
-    }>(
-      `
-        WITH candidate_events AS (
-          SELECT *
-          FROM UNNEST($1::uuid[], $2::text[], $3::text[]) AS candidate(event_id, college_key, year_level_key)
-        )
-        SELECT candidate.event_id, COALESCE(candidate.college_key, '') AS college_key, COALESCE(candidate.year_level_key, '') AS year_level_key
-        FROM candidate_events candidate
-        WHERE ${getEventCollegeExemptionFilterSql(
-          "candidate.event_id",
-          "candidate.college_key",
-        )}
-          AND ${getEventYearLevelExemptionFilterSql(
-            "candidate.event_id",
-            "candidate.year_level_key",
-            "candidate.college_key",
-          )}
-      `,
-      [candidateEventIds, candidateCollegeKeys, candidateYearLevelKeys],
-    );
-
-    visibleEventResult.rows.forEach((event) => {
-      visibleEventPairs.add(`${event.event_id}:${event.college_key}:${event.year_level_key}`);
-    });
-  }
-
-  return result.rows
-    .map((request): PublicStudentAttendanceRequestStatus | null => {
-      const { student_college: studentCollege, ...publicRequest } = request;
-      if (request.request_type !== "event_review") return publicRequest;
-
-      const collegeKey = normalizeCollegeKey(studentCollege || request.college) ?? "";
-      const yearLevelKey = normalizeYearLevelKey(request.year_level) ?? "";
-
-      const events = request.events.filter((event) => {
-        const eventId = cleanText(event.event_id);
-        if (!eventId) return true;
-        return visibleEventPairs.has(`${eventId}:${collegeKey}:${yearLevelKey}`);
-      });
-
-      if (!events.length) return null;
-      return { ...publicRequest, events };
-    })
-    .filter(
-      (request): request is PublicStudentAttendanceRequestStatus =>
-        request !== null,
-    );
+  if (!await studentIdentityMatches(studentId, lastNameValue)) return [];
+  if (schoolYearId && !isUuid(schoolYearId)) return [];
+  const result = await query<PublicStudentAttendanceRequestStatus>(`
+    SELECT ar.id, ar.school_year_id, sy.name AS school_year_name,
+      sy.semester, ar.request_type, ar.status, ar.review_note,
+      ar.reviewed_at, ar.created_at
+    FROM attendance_requests ar
+    JOIN school_years sy ON sy.id = ar.school_year_id
+    WHERE LOWER(TRIM(ar.student_id)) = LOWER(TRIM($1))
+      AND ($2::uuid IS NULL OR ar.school_year_id = $2::uuid)
+    ORDER BY ar.created_at DESC LIMIT 20
+  `, [studentId, schoolYearId || null]);
+  return result.rows;
 }
 
 async function resolveRequestEventsForApproval(

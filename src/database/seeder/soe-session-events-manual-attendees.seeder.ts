@@ -50,7 +50,7 @@ type FixtureDefinition = {
 
 const FIXTURES = [
   {
-    fileName: "Opening_Program__August_17__2026_.csv",
+    fileName: "synthetic-opening-program-august-17-2026.csv",
     eventDate: "2026-08-17",
     eventDateLabel: "August 17, 2026",
     eventName: "School of Engineering Opening Program Log In",
@@ -61,7 +61,7 @@ const FIXTURES = [
       "School of Engineering session attendance imported from the August 17, 2026 Opening Program Log In sheet.",
   },
   {
-    fileName: "Opening_Program__out__August_17__2026.csv",
+    fileName: "synthetic-opening-program-out-august-17-2026.csv",
     eventDate: "2026-08-17",
     eventDateLabel: "August 17, 2026",
     eventName: "School of Engineering Opening Program Log Out",
@@ -72,7 +72,7 @@ const FIXTURES = [
       "School of Engineering session attendance imported from the August 17, 2026 Opening Program Log Out sheet.",
   },
   {
-    fileName: "Buwan_ng_Wika__Log_in_August_27_2026_.csv",
+    fileName: "synthetic-buwan-ng-wika-log-in-august-27-2026.csv",
     eventDate: "2026-08-27",
     eventDateLabel: "August 27, 2026",
     eventName: "School of Engineering Buwan ng Wika Morning Log In",
@@ -83,7 +83,7 @@ const FIXTURES = [
       "School of Engineering session attendance imported from the August 27, 2026 Buwan ng Wika Morning Log In sheet.",
   },
   {
-    fileName: "Buwan_ng_Wika__Out_.csv",
+    fileName: "synthetic-buwan-ng-wika-out.csv",
     eventDate: "2026-08-27",
     eventDateLabel: "August 27, 2026",
     eventName: "School of Engineering Buwan ng Wika Morning Log Out",
@@ -94,7 +94,7 @@ const FIXTURES = [
       "School of Engineering session attendance imported from the August 27, 2026 Buwan ng Wika Morning Log Out sheet.",
   },
   {
-    fileName: "Buwan_ng_Wika_afternoon_in_.csv",
+    fileName: "synthetic-buwan-ng-wika-afternoon-in.csv",
     eventDate: "2026-08-27",
     eventDateLabel: "August 27, 2026",
     eventName: "School of Engineering Buwan ng Wika Afternoon Log In",
@@ -105,7 +105,7 @@ const FIXTURES = [
       "School of Engineering session attendance imported from the August 27, 2026 Buwan ng Wika Afternoon Log In sheet.",
   },
   {
-    fileName: "Buwan_ng_Wika__Out__1.csv",
+    fileName: "synthetic-buwan-ng-wika-out-1.csv",
     eventDate: "2026-08-27",
     eventDateLabel: "August 27, 2026",
     eventName: "School of Engineering Buwan ng Wika Afternoon Log Out",

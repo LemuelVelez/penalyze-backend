@@ -27,10 +27,10 @@ const DATA_DIRECTORY = path.join(
 );
 
 const SCANNER_FILES = [
-  "FRC ATTENDANCE (BSCS) SEPTEMBER 1, 2026.csv",
-  "FRC ATTENDANCE (BSIS) Sep,1 2026.csv",
+  "synthetic-frc-attendance-(bscs)-september-1,-2026.csv",
+  "synthetic-frc-attendance-(bsis)-sep,1-2026.csv",
 ] as const;
-const NO_QR_FILE = "no QR during flag raising.txt";
+const NO_QR_FILE = "synthetic-no-qr-during-flag-raising.txt";
 const LEGACY_IMPORT_FILE_NAMES = [...SCANNER_FILES, NO_QR_FILE] as const;
 
 type AttendeeSource = "scanner" | "no_qr";

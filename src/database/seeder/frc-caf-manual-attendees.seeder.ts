@@ -28,19 +28,19 @@ const DATA_DIRECTORY = path.join(
 
 const FIXTURES = [
   {
-    fileName: "FRC__08-17-26_.xlsx",
+    fileName: "synthetic-frc-08-17-26.csv",
     eventDate: "2026-08-17",
     eventDateLabel: "August 17, 2026",
     eventName: "FRC August 17",
   },
   {
-    fileName: "FRC__08-24-26_.xlsx",
+    fileName: "synthetic-frc-08-24-26.csv",
     eventDate: "2026-08-24",
     eventDateLabel: "August 24, 2026",
     eventName: "FRC August 24",
   },
   {
-    fileName: "FRC__09-01-26_.xlsx",
+    fileName: "synthetic-frc-09-01-26.csv",
     eventDate: "2026-09-01",
     eventDateLabel: "September 1, 2026",
     eventName: "FRC September 01",

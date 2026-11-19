@@ -1,6 +1,8 @@
 import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
 import multer from "multer";
+import crypto from "crypto";
+import helmet from "helmet";
 
 import {
   attachAuthUser,
@@ -8,6 +10,8 @@ import {
   deleteUser,
   listUsers,
   login,
+  logoutSession,
+  logoutEverywhere,
   me,
   register,
   requireAdmin,
@@ -125,84 +129,81 @@ import { query } from "./lib/db";
 import { purgeExpiredAttendanceImports } from "./services/attendance.service";
 import { auditMutation } from "./services/audit-log.service";
 import { limitLoginTraffic } from "./services/login-protection.service";
+import { rateLimit, limits, clientIp } from "./services/rate-limit.service";
 
 const app = express();
+app.disable("x-powered-by");
+app.use(helmet({ contentSecurityPolicy: false }));
 // Trust forwarded client IPs only when a known number of reverse proxies are
 // enforced by the deployment. Never trust arbitrary X-Forwarded-For headers.
 const trustedProxyHops = Number(process.env.TRUST_PROXY_HOPS ?? 0);
 app.set("trust proxy", Number.isInteger(trustedProxyHops) && trustedProxyHops >= 0 ? trustedProxyHops : 0);
 const attendanceBatchUpload = attendanceUpload.fields([
-  { name: "files", maxCount: 20 },
-  { name: "file", maxCount: 20 },
+  { name: "files", maxCount: 10 },
+  { name: "file", maxCount: 10 },
 ]);
 
 const PORT = Number(process.env.PORT ?? 3000);
-const DEFAULT_FRONTEND_ORIGINS = [
-  "http://localhost:5173",
-  "http://localhost:8081",
-  "https://penalyze.jrmsu-tc.online",
-];
-
-function normalizeOrigin(value: string) {
-  return value.trim().replace(/\/+$/, "");
-}
-
-function parseAllowedOrigins() {
-  const configuredOrigins = [
-    process.env.CORS_ORIGIN,
-    process.env.FRONTEND_ORIGINS,
-    process.env.FRONTEND_URL,
-    process.env.Frontend_URL,
-  ]
-    .flatMap((value) => String(value ?? "").split(","))
-    .map(normalizeOrigin)
-    .filter(Boolean);
-
-  return Array.from(
-    new Set([...configuredOrigins, ...DEFAULT_FRONTEND_ORIGINS]),
-  );
-}
-
-const ALLOWED_ORIGINS = parseAllowedOrigins();
-app.use((req: Request, res: Response, next: NextFunction) => {
-  const requestOrigin = req.headers.origin
-    ? normalizeOrigin(req.headers.origin)
-    : "";
-  const allowedOrigin =
-    requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin)
-      ? requestOrigin
-      : "";
-
-  if (allowedOrigin) {
-    res.header("Access-Control-Allow-Origin", allowedOrigin);
-    res.header("Vary", "Origin");
-  } else if (!requestOrigin && ALLOWED_ORIGINS[0]) {
-    res.header("Access-Control-Allow-Origin", ALLOWED_ORIGINS[0]);
+const DEFAULT_FRONTEND_ORIGINS = ["http://localhost:5173", "http://localhost:8081"];
+function parseAllowedOrigins(): string[] {
+  const fromEnv = (process.env.FRONTEND_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+  const list = process.env.NODE_ENV === "production" ? fromEnv : [...fromEnv, ...DEFAULT_FRONTEND_ORIGINS];
+  for (const origin of list) {
+    try { if (new URL(origin).origin !== origin) throw new Error("Invalid origin"); }
+    catch { throw new Error(`Invalid FRONTEND_ORIGINS entry: ${origin}`); }
   }
+  if (process.env.NODE_ENV === "production" && !list.length) {
+    throw new Error("FRONTEND_ORIGINS must be configured explicitly in production.");
+  }
+  return Array.from(new Set(list));
+}
+const ALLOWED_ORIGINS = parseAllowedOrigins();
+const API_ORIGIN = process.env.BACKEND_URL?.trim() || "";
 
-  res.header("Access-Control-Allow-Credentials", "true");
-  res.header(
-    "Access-Control-Allow-Methods",
-    "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-  );
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With",
-  );
-
-  if (req.method === "OPTIONS") {
-    res.sendStatus(204);
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const origin = req.get("origin") ?? "";
+  const allowed = ALLOWED_ORIGINS.includes(origin) || (API_ORIGIN !== "" && origin === API_ORIGIN);
+  res.setHeader("Vary", "Origin");
+  if (origin && !allowed) {
+    res.status(403).json({ message: "Origin not allowed." });
     return;
   }
-
+  if (allowed) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-Penalyze-Request");
+  if (req.method === "OPTIONS") { res.sendStatus(204); return; }
+  if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && req.path.startsWith("/api/")) {
+    if (!allowed || req.get("x-penalyze-request") !== "1") {
+      res.status(403).json({ message: "Request origin verification failed." });
+      return;
+    }
+  }
   next();
 });
 
-// Reject login floods before parsing bodies, including oversized JSON requests.
-app.use("/api/auth/login", limitLoginTraffic);
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+// Verify the cookie against the database before any large request body is parsed.
 app.use(attachAuthUser);
+app.use("/api/auth/login", limitLoginTraffic);
+const smallJson = express.json({ limit: "100kb" });
+const largeJson = express.json({ limit: "5mb" });
+const smallForm = express.urlencoded({ extended: false, limit: "100kb", parameterLimit: 80 });
+const largeRoutes = [
+  /^\/api\/attendance\/bulk$/,
+  /^\/api\/attendance\/calculation-results\/(preview|refresh|repair-consistency)$/,
+  /^\/api\/attendance\/events\/merge$/,
+  /^\/api\/attendance\/final-results\/[^/]+\/events\/batch\/progress$/,
+  /^\/api\/school-years\/transfer$/,
+];
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (largeRoutes.some((pattern) => pattern.test(req.path))) {
+    return requireAuth(req, res, () => largeJson(req, res, next));
+  }
+  smallJson(req, res, next);
+});
+app.use(smallForm);
 app.use(auditMutation);
 
 app.get("/", (_req: Request, res: Response) => {
@@ -217,7 +218,7 @@ app.get(
   async (_req: Request, res: Response, next: NextFunction) => {
     try {
       await query("SELECT 1");
-      res.json({ ok: true, database: "connected" });
+      res.json({ ok: true });
     } catch (error) {
       next(error);
     }
@@ -225,26 +226,20 @@ app.get(
 );
 
 
-const publicStudentStatusHits = new Map<string, { count: number; resetAt: number }>();
-function publicStudentStatusRateLimit(req: Request, res: Response, next: NextFunction) {
-  const now = Date.now();
-  const key = req.ip || req.socket.remoteAddress || "unknown";
-  const current = publicStudentStatusHits.get(key);
-  if (!current || current.resetAt <= now) {
-    publicStudentStatusHits.set(key, { count: 1, resetAt: now + 60_000 });
-    next();
-    return;
-  }
-  if (current.count >= 30) {
-    res.status(429).json({ message: "Too many requests. Please try again shortly." });
-    return;
-  }
-  current.count += 1;
-  next();
-}
+const publicStudentStatusRateLimit = limits(
+  ["student-status:minute", 10, 60, clientIp],
+  ["student-status:day", 50, 86400, clientIp],
+  ["student-status:id", 10, 3600, (req) => String(req.query.studentId ?? "").slice(0, 50)],
+);
+const publicRequestRateLimit = limits(
+  ["requests:ip", 5, 3600, clientIp],
+  ["requests:id", 5, 3600, (req) => String(req.body?.studentId ?? "").slice(0, 50)],
+);
 
 app.post("/api/auth/register", requireAuth, requireAdmin, register);
 app.post("/api/auth/login", login);
+app.post("/api/auth/logout", requireAuth, logoutSession);
+app.post("/api/auth/logout-everywhere", requireAuth, logoutEverywhere);
 app.get("/api/auth/me", requireAuth, me);
 app.post("/api/auth/change-password", requireAuth, changePassword);
 
@@ -257,47 +252,44 @@ app.get("/api/audit-logs", requireAuth, requireAdmin, listAuditLogs);
 app.get("/api/audit-logs/categories", requireAuth, requireAdmin, listAuditLogCategories);
 
 // Browser calls Penalyze only; the repository integration key stays server-side.
-app.get("/api/repository-sync/uploads", requireAuth, listRepositoryUploads);
-app.get("/api/repository-sync/uploads/:id/download", requireAuth, downloadRepositoryUpload);
-app.post("/api/repository-sync/pending", requireAuth, changeRepositorySync("pending"));
-app.post("/api/repository-sync/uploaded", requireAuth, changeRepositorySync("uploaded"));
-app.post("/api/repository-sync/reset", requireAuth, changeRepositorySync("reset"));
-app.post("/api/repository-sync/restore", requireAuth, restoreRepositoryUploadedStatus);
+app.get("/api/repository-sync/uploads", requireAuth, requireAdmin, listRepositoryUploads);
+app.get("/api/repository-sync/uploads/:id/download", requireAuth, requireAdmin, downloadRepositoryUpload);
+app.post("/api/repository-sync/pending", requireAuth, requireAdmin, changeRepositorySync("pending"));
+app.post("/api/repository-sync/uploaded", requireAuth, requireAdmin, changeRepositorySync("uploaded"));
+app.post("/api/repository-sync/reset", requireAuth, requireAdmin, changeRepositorySync("reset"));
+app.post("/api/repository-sync/restore", requireAuth, requireAdmin, restoreRepositoryUploadedStatus);
 
-app.get("/api/school-years", schoolYears);
-app.post("/api/school-years", saveSchoolYear);
-app.patch("/api/school-years/transfer", transferSchoolYearRecords);
+app.get("/api/school-years", requireAuth, schoolYears);
+app.post("/api/school-years", requireAuth, requireAdmin, saveSchoolYear);
+app.patch("/api/school-years/transfer", requireAuth, requireAdmin, transferSchoolYearRecords);
 app.patch(
   "/api/school-years/:id/assign-current",
-  assignCurrentSchoolYearRecords,
+  requireAuth, requireAdmin, assignCurrentSchoolYearRecords,
 );
-app.get("/api/school-years/:id/delete-impact", schoolYearDeleteImpact);
-app.delete("/api/school-years/:id/records", deleteSchoolYearRecords);
-app.patch("/api/school-years/:id/activate", activateSchoolYear);
-app.patch("/api/school-years/:id", updateSchoolYear);
-app.put("/api/school-years/:id", updateSchoolYear);
-app.delete("/api/school-years/:id", deleteSchoolYear);
+app.get("/api/school-years/:id/delete-impact", requireAuth, schoolYearDeleteImpact);
+app.delete("/api/school-years/:id/records", requireAuth, requireAdmin, deleteSchoolYearRecords);
+app.patch("/api/school-years/:id/activate", requireAuth, requireAdmin, activateSchoolYear);
+app.patch("/api/school-years/:id", requireAuth, requireAdmin, updateSchoolYear);
+app.put("/api/school-years/:id", requireAuth, requireAdmin, updateSchoolYear);
+app.delete("/api/school-years/:id", requireAuth, requireAdmin, deleteSchoolYear);
 
 
-app.post("/api/attendance/requests", createAttendanceRequest);
+app.post("/api/attendance/requests", publicRequestRateLimit, createAttendanceRequest);
 app.get("/api/attendance/requests/student-status", publicStudentStatusRateLimit, publicAttendanceStudentRequests);
 app.get("/api/attendance/requests", requireAuth, attendanceRequests);
 app.patch("/api/attendance/requests/group-review", requireAuth, reviewAttendanceRequestGroup);
 app.patch("/api/attendance/requests/group-review/progress", requireAuth, reviewAttendanceRequestGroupWithProgress);
 app.patch(
   "/api/attendance/requests/:id/review",
-  requireAuth,
-  reviewAttendanceRequest,
+  requireAuth, reviewAttendanceRequest,
 );
 app.patch(
   "/api/attendance/requests/:id/review/progress",
-  requireAuth,
-  reviewAttendanceRequestWithProgress,
+  requireAuth, reviewAttendanceRequestWithProgress,
 );
 app.delete(
   "/api/attendance/requests/:id/events/:eventId",
-  requireAuth,
-  removeAttendanceRequestEvent,
+  requireAuth, requireAdmin, removeAttendanceRequestEvent,
 );
 
 app.get("/api/attendance/colleges", requireAuth, attendanceColleges);
@@ -307,16 +299,12 @@ app.post("/api/attendance/event-exemptions/impact", requireAuth, requireAdmin, a
 app.post("/api/attendance/event-exemptions", requireAuth, requireAdmin, saveAttendanceEventExemptions);
 app.post(
   "/api/attendance/event-exemptions/progress",
-  requireAuth,
-  requireAdmin,
-  saveAttendanceEventExemptionsWithProgress,
+  requireAuth, requireAdmin, saveAttendanceEventExemptionsWithProgress,
 );
 app.post("/api/attendance/event-exemptions/bulk-delete", requireAuth, requireAdmin, removeAttendanceEventExemptionsBulk);
 app.post(
   "/api/attendance/event-exemptions/remove-selected/progress",
-  requireAuth,
-  requireAdmin,
-  removeSelectedAttendanceEventExemptionsWithProgress,
+  requireAuth, requireAdmin, removeSelectedAttendanceEventExemptionsWithProgress,
 );
 app.delete("/api/attendance/event-exemptions/:id", requireAuth, requireAdmin, removeAttendanceEventExemption);
 
@@ -325,170 +313,148 @@ app.post("/api/attendance/event-year-level-exemptions/impact", requireAuth, requ
 app.post("/api/attendance/event-year-level-exemptions", requireAuth, requireAdmin, saveAttendanceEventYearLevelExemptions);
 app.post(
   "/api/attendance/event-year-level-exemptions/progress",
-  requireAuth,
-  requireAdmin,
-  saveAttendanceEventYearLevelExemptionsWithProgress,
+  requireAuth, requireAdmin, saveAttendanceEventYearLevelExemptionsWithProgress,
 );
 app.post("/api/attendance/event-year-level-exemptions/bulk-delete", requireAuth, requireAdmin, removeAttendanceEventYearLevelExemptionsBulk);
 app.delete("/api/attendance/event-year-level-exemptions/:id", requireAuth, requireAdmin, removeAttendanceEventYearLevelExemption);
 
-app.get("/api/attendance/events", attendanceEvents);
+app.get("/api/attendance/events", requireAuth, attendanceEvents);
 app.get(
   "/api/attendance/events/duplicates",
-  requireAuth,
-  attendanceEventDuplicateGroups,
+  requireAuth, attendanceEventDuplicateGroups,
 );
 app.post(
   "/api/attendance/events/merge-impact",
-  requireAuth,
-  requireAdmin,
-  attendanceEventMergeImpact,
+  requireAuth, requireAdmin, attendanceEventMergeImpact,
 );
 app.post(
   "/api/attendance/events/merge",
-  requireAuth,
-  requireAdmin,
-  mergeAttendanceEvents,
+  requireAuth, requireAdmin, mergeAttendanceEvents,
 );
-app.post("/api/attendance/events", saveAttendanceEvent);
-app.put("/api/attendance/events/:eventId", updateAttendanceEvent);
-app.patch("/api/attendance/events/:eventId", updateAttendanceEvent);
-app.delete("/api/attendance/events/:eventId", deleteAttendanceEvent);
+app.post("/api/attendance/events", requireAuth, requireAdmin, saveAttendanceEvent);
+app.put("/api/attendance/events/:eventId", requireAuth, requireAdmin, updateAttendanceEvent);
+app.patch("/api/attendance/events/:eventId", requireAuth, requireAdmin, updateAttendanceEvent);
+app.delete("/api/attendance/events/:eventId", requireAuth, requireAdmin, deleteAttendanceEvent);
 app.get("/api/attendance/dashboard-overview", requireAuth, attendanceDashboardOverview);
-app.get("/api/attendance/final-results", attendanceFinalResults);
+app.get("/api/attendance/final-results", requireAuth, attendanceFinalResults);
 app.patch(
   "/api/attendance/final-results/:id/events/batch/progress",
-  requireAuth,
-  requireAdmin,
-  updateStudentEventAttendancesWithProgress,
+  requireAuth, requireAdmin, updateStudentEventAttendancesWithProgress,
 );
 app.patch(
   "/api/attendance/final-results/:id/events/:eventId",
-  requireAuth,
-  requireAdmin,
-  updateStudentEventAttendance,
+  requireAuth, requireAdmin, updateStudentEventAttendance,
 );
 app.patch(
   "/api/attendance/final-results/:id/events/:eventId/progress",
-  requireAuth,
-  requireAdmin,
-  updateStudentEventAttendanceWithProgress,
+  requireAuth, requireAdmin, updateStudentEventAttendanceWithProgress,
 );
 app.patch(
   "/api/attendance/final-results/:id/profile",
-  updateAttendanceFinalResultProfile,
+  requireAuth, requireAdmin, updateAttendanceFinalResultProfile,
 );
-app.delete("/api/attendance/final-results", deleteAttendanceFinalResults);
-app.delete("/api/attendance/final-results/:id", deleteAttendanceFinalResult);
+app.delete("/api/attendance/final-results", requireAuth, requireAdmin, deleteAttendanceFinalResults);
+app.delete("/api/attendance/final-results/:id", requireAuth, requireAdmin, deleteAttendanceFinalResult);
 app.post(
   "/api/attendance/final-results/refresh",
-  refreshAttendanceFinalResults,
+  requireAuth, requireAdmin, refreshAttendanceFinalResults,
 );
-app.get("/api/attendance/calculation-results", attendanceCalculationResults);
+app.get("/api/attendance/calculation-results", requireAuth, attendanceCalculationResults);
 app.get(
   "/api/attendance/calculation-results/pending-summary",
-  attendanceCalculationPendingSummary,
+  requireAuth, attendanceCalculationPendingSummary,
 );
 app.post(
   "/api/attendance/calculation-results/status",
-  attendanceCalculationStatus,
+  requireAuth, attendanceCalculationStatus,
 );
 app.delete(
   "/api/attendance/calculation-results",
-  deleteAttendanceCalculationResults,
+  requireAuth, requireAdmin, deleteAttendanceCalculationResults,
 );
 app.post(
   "/api/attendance/calculation-results/preview",
-  previewAttendanceCalculationResults,
+  requireAuth, requireAdmin, previewAttendanceCalculationResults,
 );
 app.post(
   "/api/attendance/calculation-results/refresh",
-  refreshAttendanceCalculationResults,
+  requireAuth, requireAdmin, refreshAttendanceCalculationResults,
 );
 app.post(
   "/api/attendance/calculation-results/repair-consistency",
-  requireAuth,
-  repairAttendanceCalculationConsistency,
+  requireAuth, requireAdmin, repairAttendanceCalculationConsistency,
 );
-app.get("/api/attendance/manual-records", attendanceManualRecords);
-app.delete("/api/attendance/manual-records", deleteAttendanceManualRecords);
-app.delete("/api/attendance/manual-records/:id", deleteAttendanceManualRecord);
-app.get("/api/attendance", attendanceIndex);
+app.get("/api/attendance/manual-records", requireAuth, attendanceManualRecords);
+app.delete("/api/attendance/manual-records", requireAuth, requireAdmin, deleteAttendanceManualRecords);
+app.delete("/api/attendance/manual-records/:id", requireAuth, requireAdmin, deleteAttendanceManualRecord);
+app.get("/api/attendance", requireAuth, attendanceIndex);
 app.get("/api/attendance/imports", requireAuth, attendanceImports);
 app.delete(
   "/api/attendance/imports",
-  requireAuth,
-  deleteAttendanceImports,
+  requireAuth, requireAdmin, deleteAttendanceImports,
 );
 app.get(
   "/api/attendance/imports/:importId/delete-impact",
-  requireAuth,
-  attendanceImportDeleteImpact,
+  requireAuth, attendanceImportDeleteImpact,
 );
 app.post(
   "/api/attendance/imports/:importId/restore",
-  requireAuth,
-  restoreAttendanceImport,
+  requireAuth, requireAdmin, restoreAttendanceImport,
 );
 app.delete(
   "/api/attendance/imports/:importId/purge",
-  requireAuth,
-  requireAdmin,
-  purgeAttendanceImport,
+  requireAuth, requireAdmin, purgeAttendanceImport,
 );
 app.get("/api/attendance/imports/:importId", requireAuth, showImport);
 app.delete(
   "/api/attendance/imports/:importId",
-  requireAuth,
-  deleteAttendanceImport,
+  requireAuth, requireAdmin, deleteAttendanceImport,
 );
-app.post("/api/attendance/manual", manualSave);
+app.post("/api/attendance/manual", requireAuth, requireAdmin, manualSave);
 app.post(
   "/api/attendance/import/preview",
-  attendanceBatchUpload,
+  requireAuth, attendanceBatchUpload,
   previewImport,
 );
 app.post(
   "/api/attendance/import/save/progress",
-  requireAuth,
-  attendanceBatchUpload,
+  requireAuth, requireAdmin, attendanceBatchUpload,
   saveImportWithProgress,
 );
 app.post(
   "/api/attendance/import/save",
-  requireAuth,
-  attendanceBatchUpload,
+  requireAuth, requireAdmin, attendanceBatchUpload,
   saveImport,
 );
-app.put("/api/attendance/bulk", updateAttendanceRecordsBulk);
-app.patch("/api/attendance/bulk", updateAttendanceRecordsBulk);
-app.put("/api/attendance/:id", updateAttendanceRecord);
-app.patch("/api/attendance/:id", updateAttendanceRecord);
-app.delete("/api/attendance/:id", deleteAttendanceRecord);
+app.put("/api/attendance/bulk", requireAuth, requireAdmin, updateAttendanceRecordsBulk);
+app.patch("/api/attendance/bulk", requireAuth, requireAdmin, updateAttendanceRecordsBulk);
+app.put("/api/attendance/:id", requireAuth, requireAdmin, updateAttendanceRecord);
+app.patch("/api/attendance/:id", requireAuth, requireAdmin, updateAttendanceRecord);
+app.delete("/api/attendance/:id", requireAuth, requireAdmin, deleteAttendanceRecord);
 
-app.get("/api/fines", fines);
-app.get("/api/fines/summary", summary);
-app.get("/api/fines/penalty-results/colleges", penaltyResultColleges);
-app.get("/api/fines/penalty-results/:id/absent-events", penaltyResultAbsentEvents);
-app.get("/api/fines/penalty-results", penaltyResults);
-app.delete("/api/fines/penalty-results", deletePenaltyResultRows);
-app.delete("/api/fines/penalty-results/:id", deletePenaltyResultRow);
-app.post("/api/fines/penalty-results/refresh", refreshPenaltyResultRows);
-app.put("/api/fines/penalty-results/:id", updatePenaltyResultRow);
-app.patch("/api/fines/penalty-results/:id", updatePenaltyResultRow);
+app.get("/api/fines", requireAuth, fines);
+app.get("/api/fines/summary", requireAuth, summary);
+app.get("/api/fines/penalty-results/colleges", requireAuth, penaltyResultColleges);
+app.get("/api/fines/penalty-results/:id/absent-events", requireAuth, penaltyResultAbsentEvents);
+app.get("/api/fines/penalty-results", requireAuth, penaltyResults);
+app.delete("/api/fines/penalty-results", requireAuth, requireAdmin, deletePenaltyResultRows);
+app.delete("/api/fines/penalty-results/:id", requireAuth, requireAdmin, deletePenaltyResultRow);
+app.post("/api/fines/penalty-results/refresh", requireAuth, requireAdmin, refreshPenaltyResultRows);
+app.put("/api/fines/penalty-results/:id", requireAuth, requireAdmin, updatePenaltyResultRow);
+app.patch("/api/fines/penalty-results/:id", requireAuth, requireAdmin, updatePenaltyResultRow);
 app.patch(
   "/api/fines/penalty-results/:id/status",
-  updatePenaltyResultRowStatus,
+  requireAuth, requireAdmin, updatePenaltyResultRowStatus,
 );
-app.post("/api/fines/zero-attendance", registerZeroAttendance);
-app.patch("/api/fines/:id/status", updateStatus);
-app.get("/api/fines/penalties", penalties);
-app.post("/api/fines/penalties", savePenalty);
-app.post("/api/fines/penalties/seed", seedPenalties);
-app.get("/api/fines/penalties/match/:noOfAbsences", matchPenalty);
-app.put("/api/fines/penalties/:id", updatePenalty);
-app.patch("/api/fines/penalties/:id", updatePenalty);
-app.delete("/api/fines/penalties/:id", deletePenalty);
+app.post("/api/fines/zero-attendance", requireAuth, requireAdmin, registerZeroAttendance);
+app.patch("/api/fines/:id/status", requireAuth, requireAdmin, updateStatus);
+app.get("/api/fines/penalties", requireAuth, penalties);
+app.post("/api/fines/penalties", requireAuth, requireAdmin, savePenalty);
+app.post("/api/fines/penalties/seed", requireAuth, requireAdmin, seedPenalties);
+app.get("/api/fines/penalties/match/:noOfAbsences", requireAuth, matchPenalty);
+app.put("/api/fines/penalties/:id", requireAuth, requireAdmin, updatePenalty);
+app.patch("/api/fines/penalties/:id", requireAuth, requireAdmin, updatePenalty);
+app.delete("/api/fines/penalties/:id", requireAuth, requireAdmin, deletePenalty);
 
 const configuredAttendanceRetentionSweepMs = Number(
   process.env.ATTENDANCE_IMPORT_RETENTION_SWEEP_MS ?? 6 * 60 * 60 * 1000,
@@ -519,19 +485,20 @@ app.use((_req: Request, res: Response) => {
   res.status(404).json({ message: "Route not found." });
 });
 
-app.use((error: any, _req: Request, res: Response, _next: NextFunction) => {
-  const status = Number(
-    error instanceof multer.MulterError
-      ? 400
-      : (error?.statusCode ?? error?.status ?? 500),
-  );
-  const safeStatus = status >= 400 && status < 600 ? status : 500;
-  const message = error?.message || "Internal server error.";
-
-  res.status(safeStatus).json({
-    message,
-    ...(process.env.NODE_ENV === "production" ? {} : { stack: error?.stack }),
-  });
+app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  const requestId = crypto.randomUUID();
+  const raw = error as { statusCode?: number; status?: number; message?: string; stack?: string; expose?: boolean; code?: string };
+  const status = error instanceof multer.MulterError ? 400 : Number(raw?.statusCode ?? raw?.status ?? 500);
+  const safeStatus = status >= 400 && status < 500 ? status : 500;
+  console.error(`[${requestId}] request failed`, error);
+  res.setHeader("X-Request-ID", requestId);
+  const response: { message: string; requestId: string; stack?: string } = {
+    message: safeStatus === 400 ? "Invalid request." : safeStatus === 404 ? "Resource not found." : "Request failed.",
+    requestId,
+  };
+  if (safeStatus < 500 && raw?.expose === true && !raw?.code) response.message = raw.message || response.message;
+  if (process.env.NODE_ENV === "development" && process.env.EXPOSE_ERRORS === "true" && !raw?.code && raw?.stack) response.stack = raw.stack;
+  res.status(safeStatus).json(response);
 });
 
 if (

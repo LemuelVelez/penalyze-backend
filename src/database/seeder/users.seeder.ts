@@ -57,8 +57,8 @@ function getSeedUserCredentials() {
     throw new Error("Missing seeded user email. Add User=superuser@localhost.local or SEED_USER_EMAIL to .env.");
   }
 
-  if (!password) {
-    throw new Error("Missing seeded user password. Add Password=87654321 or SEED_USER_PASSWORD to .env.");
+  if (!password || password.length < 12) {
+    throw new Error("Missing seeded user password. Add SEED_USER_PASSWORD (12+ characters) to .env.");
   }
 
   return {

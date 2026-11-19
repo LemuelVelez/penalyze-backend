@@ -68,7 +68,7 @@ import type { AuthenticatedRequest } from "./auth.controller";
 import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
 
 const MAX_FILE_SIZE = Number(
-  process.env.ATTENDANCE_UPLOAD_MAX_BYTES ?? 10 * 1024 * 1024,
+  Math.max(1024, Math.min(Number(process.env.ATTENDANCE_UPLOAD_MAX_BYTES ?? 5 * 1024 * 1024) || 5 * 1024 * 1024, 5 * 1024 * 1024)),
 );
 
 function getUploadFileExtension(fileName: string) {
@@ -92,10 +92,16 @@ export const attendanceUpload = multer({
   defParamCharset: "utf8",
   limits: {
     fileSize: MAX_FILE_SIZE,
-    files: 20,
+    files: 10,
   },
   fileFilter: (_req, file, callback) => {
-    if (isSupportedAttendanceUpload(file)) {
+    const extension = getUploadFileExtension(file.originalname);
+    const mime = String(file.mimetype ?? "").toLowerCase();
+    const allowedMime = extension === ".xlsx"
+      ? ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream"]
+      : ["text/csv", "text/plain", "application/vnd.ms-excel", "application/octet-stream"];
+    if (isSupportedAttendanceUpload(file) && allowedMime.includes(mime) && file.originalname.length <= 180) {
+      file.originalname = file.originalname.split(/[\\/]/).pop()!.replace(/[^\p{L}\p{N}._() -]/gu, "_");
       callback(null, true);
       return;
     }
@@ -552,7 +558,7 @@ export async function removeEventYearLevelExemption(req: Request, res: Response,
 
 export async function events(req: Request, res: Response, next: NextFunction) {
   try {
-    const limit = toPositiveInt(req.query.limit, 100);
+    const limit = Math.min(200, toPositiveInt(req.query.limit, 100));
     const offset = toPositiveInt(req.query.offset, 0);
     const schoolYearId = req.query.schoolYearId
       ? String(req.query.schoolYearId).trim()
@@ -1001,7 +1007,7 @@ export async function dashboardOverview(
 
 export async function index(req: Request, res: Response, next: NextFunction) {
   try {
-    const limit = toPositiveInt(req.query.limit, 100);
+    const limit = Math.min(200, toPositiveInt(req.query.limit, 100));
     const offset = toPositiveInt(req.query.offset, 0);
     const studentId = req.query.studentId
       ? String(req.query.studentId).trim()
@@ -1046,7 +1052,7 @@ export async function finalResults(
   next: NextFunction,
 ) {
   try {
-    const limit = toPositiveInt(req.query.limit, 100);
+    const limit = Math.min(200, toPositiveInt(req.query.limit, 100));
     const offset = toPositiveInt(req.query.offset, 0);
     const records = await listAttendanceFinalResults({
       schoolYearId: req.query.schoolYearId
@@ -1296,7 +1302,7 @@ export async function calculationResults(
   next: NextFunction,
 ) {
   try {
-    const limit = toPositiveInt(req.query.limit, 100);
+    const limit = Math.min(200, toPositiveInt(req.query.limit, 100));
     const offset = toPositiveInt(req.query.offset, 0);
     const records = await listCalculationResults({
       schoolYearId: req.query.schoolYearId
@@ -1393,7 +1399,7 @@ export async function manualRecords(
   next: NextFunction,
 ) {
   try {
-    const limit = toPositiveInt(req.query.limit, 100);
+    const limit = Math.min(200, toPositiveInt(req.query.limit, 100));
     const offset = toPositiveInt(req.query.offset, 0);
     const records = await listManualAttendanceRecords({
       schoolYearId: req.query.schoolYearId
@@ -1416,7 +1422,7 @@ export async function manualRecords(
 
 export async function imports(req: Request, res: Response, next: NextFunction) {
   try {
-    const limit = toPositiveInt(req.query.limit, 50);
+    const limit = Math.min(200, toPositiveInt(req.query.limit, 50));
     const offset = toPositiveInt(req.query.offset, 0);
     const schoolYearId = req.query.schoolYearId
       ? String(req.query.schoolYearId).trim()

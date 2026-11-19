@@ -28,7 +28,9 @@ COPY package*.json ./
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi \
   && npm cache clean --force
 
-COPY --from=builder /app/dist ./dist
+COPY --chown=node:node --from=builder /app/dist ./dist
+
+USER node
 
 EXPOSE 3000
 

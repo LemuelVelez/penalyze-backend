@@ -1,4 +1,6 @@
 import crypto from "crypto";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 import { NextFunction, Request, Response } from "express";
 
 import type { UserRecord, UserRole } from "../database/model/schema.model";
@@ -15,62 +17,53 @@ type JwtPayload = {
   email: string;
   name: string;
   role: UserRole;
-  exp: number;
+  tokenVersion: number;
+  exp?: number;
 };
 
-export type AuthenticatedRequest = Request & {
-  user?: JwtPayload;
-};
+export type AuthenticatedRequest = Request & { user?: JwtPayload };
 
-const TOKEN_TTL_SECONDS = Number(process.env.JWT_TTL_SECONDS ?? 60 * 60 * 12);
-const LEGACY_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7;
-const REMEMBER_TOKEN_TTL_SECONDS = Number(process.env.JWT_REMEMBER_TTL_SECONDS ?? 60 * 60 * 24 * 30);
-const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-before-production";
+const JWT_SECRET = process.env.JWT_SECRET?.trim() ?? "";
+if (JWT_SECRET.length < 32 || /^(change-this|secret-key|replace|example|your-|test|development)/i.test(JWT_SECRET)) {
+  throw new Error("JWT_SECRET must be a strong, non-placeholder secret of at least 32 characters.");
+}
+const ISSUER = process.env.JWT_ISSUER || "penalyze-api";
+const AUDIENCE = process.env.JWT_AUDIENCE || "penalyze-frontend";
+const TOKEN_TTL_SECONDS = 12 * 60 * 60;
+const REMEMBER_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
+const COOKIE_NAME = "penalyze_session";
 const USER_ROLES: UserRole[] = ["admin", "officer"];
+const COOKIE_SECURE = process.env.NODE_ENV === "production";
 
-function base64UrlEncode(input: Buffer | string) {
-  return Buffer.from(input).toString("base64url");
-}
-
-function base64UrlDecode(input: string) {
-  return Buffer.from(input, "base64url").toString("utf8");
-}
-
-function signData(data: string) {
-  return crypto.createHmac("sha256", JWT_SECRET).update(data).digest("base64url");
-}
-
-function signToken(payload: Omit<JwtPayload, "exp">, ttlSeconds = LEGACY_TOKEN_TTL_SECONDS) {
-  const header = base64UrlEncode(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const body = base64UrlEncode(
-    JSON.stringify({
-      ...payload,
-      exp: Math.floor(Date.now() / 1000) + ttlSeconds
-    })
-  );
-  const signature = signData(`${header}.${body}`);
-
-  return `${header}.${body}.${signature}`;
+function signToken(user: UserRecord, ttlSeconds: number): string {
+  return jwt.sign({ email: user.email, name: user.name, role: user.role, tokenVersion: user.token_version }, JWT_SECRET, {
+    algorithm: "HS256", subject: user.id, issuer: ISSUER, audience: AUDIENCE, expiresIn: ttlSeconds,
+  });
 }
 
 function verifyToken(token: string): JwtPayload | null {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
+  try {
+    const value = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"], issuer: ISSUER, audience: AUDIENCE });
+    if (typeof value !== "object" || typeof value.sub !== "string" || !Number.isInteger(value.tokenVersion)) return null;
+    return value as JwtPayload;
+  } catch { return null; }
+}
 
-  const [header, body, signature] = parts;
-  const expectedSignature = signData(`${header}.${body}`);
+function requestToken(req: Request): string {
+  const cookie = (req.headers.cookie ?? "").split(";").map((part) => part.trim()).find((part) => part.startsWith(`${COOKIE_NAME}=`));
+  return cookie ? decodeURIComponent(cookie.slice(COOKIE_NAME.length + 1)) : "";
+}
 
-  const signatureBuffer = Buffer.from(signature);
-  const expectedBuffer = Buffer.from(expectedSignature);
-  if (signatureBuffer.length !== expectedBuffer.length) return null;
-  if (!crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) return null;
+function setSessionCookie(res: Response, token: string, seconds: number): void {
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true, secure: COOKIE_SECURE, sameSite: "lax", path: "/", maxAge: seconds * 1000,
+  });
+  res.setHeader("Cache-Control", "no-store");
+}
 
-  const payload = JSON.parse(base64UrlDecode(body)) as JwtPayload;
-  if (!payload?.sub || !payload?.email || !payload?.exp) return null;
-  if (!isUserRole(payload.role)) return null;
-  if (payload.exp < Math.floor(Date.now() / 1000)) return null;
-
-  return payload;
+export function clearSessionCookie(res: Response): void {
+  res.clearCookie(COOKIE_NAME, { httpOnly: true, secure: COOKIE_SECURE, sameSite: "lax", path: "/" });
+  res.setHeader("Cache-Control", "no-store");
 }
 
 function normalizeEmail(value: unknown) {
@@ -91,14 +84,13 @@ function parseUserRole(value: unknown, fallback: UserRole = "admin") {
 }
 
 function hashPassword(password: string) {
-  const salt = crypto.randomBytes(16).toString("hex");
-  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
-  return `${salt}:${hash}`;
+  return bcrypt.hashSync(password, 12);
 }
 
 const DUMMY_PASSWORD_HASH = hashPassword("nonexistent-user-placeholder");
 
 function verifyPassword(password: string, storedHash: string) {
+  if (storedHash.startsWith("$2")) return bcrypt.compareSync(password, storedHash);
   const [salt, hash] = storedHash.split(":");
   if (!salt || !hash) return false;
 
@@ -147,21 +139,25 @@ export async function register(req: Request, res: Response, next: NextFunction) 
     const name = cleanText(req.body?.name);
     const email = normalizeEmail(req.body?.email);
     const password = String(req.body?.password ?? "");
-    if (!name) {
-      res.status(400).json({ message: "Name is required." });
+    if (!name || name.length > 160) {
+      res.status(400).json({ message: "Name must be at most 160 characters." });
       return;
     }
 
-    if (!email) {
-      res.status(400).json({ message: "Email is required." });
+    if (!email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ message: "A valid email address is required." });
       return;
     }
 
-    if (password.length < 6) {
-      res.status(400).json({ message: "Password must be at least 6 characters." });
+    if (password.length < 12 || password.length > 128) {
+      res.status(400).json({ message: "Password must be 12 to 128 characters." });
       return;
     }
 
+    if (req.body?.role !== undefined && !isUserRole(req.body.role)) {
+      res.status(400).json({ message: "Role must be admin or officer." });
+      return;
+    }
     const role = parseUserRole(req.body?.role, "admin");
     const passwordHash = hashPassword(password);
 
@@ -175,13 +171,12 @@ export async function register(req: Request, res: Response, next: NextFunction) 
     );
 
     const user = result.rows[0];
-    const token = signToken({ sub: user.id, email: user.email, name: user.name, role: user.role });
+    
 
     res.status(201).json({
       message: "Account created successfully.",
       data: {
-        user: publicUser(user),
-        token
+        user: publicUser(user)
       }
     });
   } catch (error: any) {
@@ -209,7 +204,7 @@ export async function login(req: Request, res: Response, next: NextFunction) {
     if (!email || !password || email.length > 254 || password.length > 1024) {
       const retrySeconds = await recordFailedLogin(req, email);
       if (retrySeconds > 0) respondToBlockedLogin(res, retrySeconds);
-      else res.status(400).json({ message: "Email and password are required." });
+      else res.status(400).json({ message: "Invalid credentials" });
       return;
     }
 
@@ -226,7 +221,7 @@ export async function login(req: Request, res: Response, next: NextFunction) {
     if (!user || (!isCurrentPassword && !isLegacyPassword)) {
       const retrySeconds = await recordFailedLogin(req, email);
       if (retrySeconds > 0) respondToBlockedLogin(res, retrySeconds);
-      else res.status(401).json({ message: "Invalid email or password." });
+      else res.status(401).json({ message: "Invalid credentials" });
       return;
     }
 
@@ -236,7 +231,7 @@ export async function login(req: Request, res: Response, next: NextFunction) {
       await query(
         `
           UPDATE users
-          SET password_hash = $1, updated_at = NOW()
+          SET password_hash = $1, token_version = token_version + 1, updated_at = NOW()
           WHERE id = $2
         `,
         [migratedPasswordHash, user.id]
@@ -250,17 +245,15 @@ export async function login(req: Request, res: Response, next: NextFunction) {
       res.status(400).json({ message: "Remember must be a boolean." });
       return;
     }
-    const ttl = remember === true
-      ? REMEMBER_TOKEN_TTL_SECONDS
-      : remember === false ? TOKEN_TTL_SECONDS : LEGACY_TOKEN_TTL_SECONDS;
-    const expiresAt = new Date((Math.floor(Date.now() / 1000) + ttl) * 1000).toISOString();
-    const token = signToken({ sub: user.id, email: user.email, name: user.name, role: user.role }, ttl);
+    const ttl = remember === true ? REMEMBER_TOKEN_TTL_SECONDS : TOKEN_TTL_SECONDS;
+    const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+    if (isLegacyPassword) user.token_version += 1;
+    setSessionCookie(res, signToken(user, ttl), ttl);
 
     res.json({
       message: "Login successful.",
       data: {
         user: publicUser(user),
-        token,
         expiresAt
       }
     });
@@ -294,8 +287,8 @@ export async function changePassword(req: AuthenticatedRequest, res: Response, n
       return;
     }
 
-    if (newPassword.length < 8 || newPassword.length > 128) {
-      res.status(400).json({ message: "New password must be 8 to 128 characters." });
+    if (newPassword.length < 12 || newPassword.length > 128) {
+      res.status(400).json({ message: "New password must be 12 to 128 characters." });
       return;
     }
 
@@ -327,7 +320,7 @@ export async function changePassword(req: AuthenticatedRequest, res: Response, n
     const updated = await query<{ id: string }>(
       `
         UPDATE users
-        SET password_hash = $1, updated_at = NOW()
+        SET password_hash = $1, token_version = token_version + 1, updated_at = NOW()
         WHERE id = $2 AND password_hash = $3
         RETURNING id
       `,
@@ -339,82 +332,50 @@ export async function changePassword(req: AuthenticatedRequest, res: Response, n
       return;
     }
 
-    res.json({ message: "Password changed successfully." });
+    clearSessionCookie(res);
+    res.json({ message: "Password changed successfully. Please sign in again." });
   } catch (error) {
     next(error);
   }
 }
 
-export function attachAuthUser(req: AuthenticatedRequest, _res: Response, next: NextFunction) {
+export async function attachAuthUser(req: AuthenticatedRequest, _res: Response, next: NextFunction) {
   try {
-    const header = req.headers.authorization ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
-
-    if (token) {
-      const payload = verifyToken(token);
-      if (payload) req.user = payload;
+    const token = requestToken(req);
+    const payload = token ? verifyToken(token) : null;
+    if (payload) {
+      const result = await query<UserRecord>("SELECT * FROM users WHERE id = $1 LIMIT 1", [payload.sub]);
+      const user = result.rows[0];
+      if (user && user.token_version === payload.tokenVersion && isUserRole(user.role)) {
+        req.user = { ...payload, email: user.email, name: user.name, role: user.role };
+      }
     }
-  } catch {
-    // Optional authentication must never block public routes.
-  }
+    next();
+  } catch (error) { next(error); }
+}
 
+export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (!req.user?.sub) { res.status(401).json({ message: "Authentication required." }); return; }
   next();
 }
 
-export async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  try {
-    const header = req.headers.authorization ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
-
-    if (!token) {
-      res.status(401).json({ message: "Authentication token is required." });
-      return;
-    }
-
-    const payload = verifyToken(token);
-    if (!payload) {
-      res.status(401).json({ message: "Invalid or expired authentication token." });
-      return;
-    }
-
-    req.user = payload;
-    next();
-  } catch {
-    res.status(401).json({ message: "Invalid or expired authentication token." });
-  }
+export function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (req.user?.role !== "admin") { res.status(403).json({ message: "Admin access required." }); return; }
+  next();
 }
 
-export async function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+export async function logoutSession(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   try {
-    if (!req.user?.sub) {
-      res.status(401).json({ message: "Authentication token is required." });
-      return;
+    if (req.user?.sub) {
+      await query("UPDATE users SET token_version = token_version + 1 WHERE id = $1", [req.user.sub]);
     }
+    clearSessionCookie(res);
+    res.json({ message: "Signed out." });
+  } catch (error) { next(error); }
+}
 
-    const result = await query<UserRecord>("SELECT * FROM users WHERE id = $1 LIMIT 1", [req.user.sub]);
-    const user = result.rows[0];
-
-    if (!user) {
-      res.status(404).json({ message: "User not found." });
-      return;
-    }
-
-    if (user.role !== "admin") {
-      res.status(403).json({ message: "Only admin users can access user management." });
-      return;
-    }
-
-    req.user = {
-      ...req.user,
-      email: user.email,
-      name: user.name,
-      role: user.role
-    };
-
-    next();
-  } catch (error) {
-    next(error);
-  }
+export async function logoutEverywhere(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  return logoutSession(req, res, next);
 }
 
 export async function me(req: AuthenticatedRequest, res: Response, next: NextFunction) {
@@ -477,8 +438,8 @@ export async function updateUser(req: AuthenticatedRequest, res: Response, next:
       return;
     }
 
-    if (password !== undefined && password.length > 0 && password.length < 6) {
-      res.status(400).json({ message: "Password must be at least 6 characters." });
+    if (password !== undefined && password.length > 0 && (password.length < 12 || password.length > 128)) {
+      res.status(400).json({ message: "Password must be 12 to 128 characters." });
       return;
     }
 
@@ -515,6 +476,9 @@ export async function updateUser(req: AuthenticatedRequest, res: Response, next:
       return;
     }
 
+    if ((password !== undefined && password.length > 0) || role !== undefined) {
+      fields.push("token_version = token_version + 1");
+    }
     params.push(userId);
     const result = await query<UserRecord>(
       `

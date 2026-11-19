@@ -1,2 +1,12 @@
 node_modules/
 .env
+# Never commit operational student attendance exports or original seed data.
+src/database/seeder/data/**
+!src/database/seeder/data/**/
+!src/database/seeder/data/**/synthetic-*.csv
+!src/database/seeder/data/**/synthetic-*.txt
+!src/database/seeder/data/**/synthetic-*.xlsx
+*.xlsx
+*.docx
+**/attendance_*.csv
+**/FRC*.csv

@@ -19,10 +19,10 @@ const FRC_DATA_DIRECTORY = path.join(
 );
 
 const FRC_SCANNER_FILES = [
-  "FRC ATTENDANCE (BSCS) SEPTEMBER 1, 2026.csv",
-  "FRC ATTENDANCE (BSIS) Sep,1 2026.csv",
+  "synthetic-frc-attendance-(bscs)-september-1,-2026.csv",
+  "synthetic-frc-attendance-(bsis)-sep,1-2026.csv",
 ] as const;
-const FRC_NO_QR_FILE = "no QR during flag raising.txt";
+const FRC_NO_QR_FILE = "synthetic-no-qr-during-flag-raising.txt";
 const FRC_IMPORT_FILES = [...FRC_SCANNER_FILES, FRC_NO_QR_FILE] as const;
 
 type ExistingImport = {

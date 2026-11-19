@@ -25,7 +25,7 @@ const DATA_DIRECTORY = path.join(
 
 const FIXTURES = [
   {
-    fileName: "FRC_SEPTEMBER_01_2026.txt",
+    fileName: "synthetic-frc-september-01-2026.txt",
     eventDate: TARGET_EVENT_DATE,
     eventDateLabel: TARGET_EVENT_DATE_LABEL,
     eventName: "FRC September 01",

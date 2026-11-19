@@ -42,6 +42,7 @@ export async function publicStudentRequests(
   try {
     const rows = await listPublicAttendanceRequestsForStudent(
       req.query.studentId ?? req.query.student_id,
+      req.query.lastName,
       req.query.schoolYearId ?? req.query.school_year_id,
     );
     res.json({ data: rows });

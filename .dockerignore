@@ -17,3 +17,7 @@ coverage
 .idea
 .DS_Store
 *.log
+
+# No production images may contain personal-data fixtures.
+src/database/seeder/data/
+**/*.env

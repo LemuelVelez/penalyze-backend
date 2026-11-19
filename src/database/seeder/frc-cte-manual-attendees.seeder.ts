@@ -23,7 +23,7 @@ const EVENT_DESCRIPTION =
   "Seeded manual attendance event for the October 26, 2026 CTE Flag Raising Ceremony.";
 const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
 const SECONDS_PER_DAY = 24 * 60 * 60;
-const FIXTURE_FILE_NAME = "FRC_October_26_2026.csv";
+const FIXTURE_FILE_NAME = "synthetic-frc-october-26-2026.csv";
 const FIXTURE_PATH = path.join(
   __dirname,
   "data",

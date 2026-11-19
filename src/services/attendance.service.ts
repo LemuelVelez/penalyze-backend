@@ -1001,16 +1001,37 @@ function decodeCsvBuffer(buffer: Buffer) {
 }
 
 async function parseExcelFile(file: UploadedAttendanceFile) {
-  const XLSX = loadRequiredModule<any>("xlsx");
   const extension = getFileExtension(file.originalname);
+  if (file.buffer.length > 5 * 1024 * 1024 || file.buffer.length === 0) {
+    throw new Error("Uploaded files must be 5 MB or smaller.");
+  }
+  if (extension === ".xlsx" && !file.buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) {
+    throw new Error("Invalid XLSX file signature.");
+  }
+  if (extension === ".csv" && (file.buffer.includes(0) || file.buffer.some((byte) => byte < 0x09 || (byte > 0x0d && byte < 0x20)))) {
+    throw new Error("Invalid CSV text data.");
+  }
+  if (extension !== ".csv" && extension !== ".xlsx") throw new Error("Unsupported file type.");
+  const XLSX = loadRequiredModule<any>("xlsx");
   const workbook =
     extension === ".csv"
       ? XLSX.read(decodeCsvBuffer(file.buffer), {
           type: "string",
-          cellDates: false,
+          cellDates: false, cellFormula: false, cellHTML: false, sheetRows: 20001,
         })
-      : XLSX.read(file.buffer, { type: "buffer", cellDates: false });
+      : XLSX.read(file.buffer, {
+          type: "buffer", cellDates: false, cellFormula: false, cellHTML: false, sheetRows: 20001,
+        });
   const sheetNames = workbook.SheetNames ?? [];
+  if (sheetNames.length > 8) throw new Error("A workbook can contain at most 8 sheets.");
+  for (const sheetName of sheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet || !sheet["!ref"]) continue;
+    const reference = XLSX.utils.decode_range(sheet["!ref"]);
+    if (reference.e.r - reference.s.r >= 20000 || reference.e.c - reference.s.c > 255) {
+      throw new Error("A sheet can contain at most 20,000 rows and 256 columns.");
+    }
+  }
 
   if (!sheetNames.length) {
     return {
@@ -1038,7 +1059,7 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
           ? { range: studentHeaderRowIndex }
           : {}),
       }) as RawImportRow[]).map((row, index) => ({
-        ...row,
+        ...Object.fromEntries(Object.entries(row).filter(([key]) => !["__proto__", "constructor", "prototype"].includes(key.toLowerCase()))),
         __rowNumber: (studentHeaderRowIndex >= 0 ? studentHeaderRowIndex : 0) + index + 2,
       }));
 
@@ -1085,7 +1106,7 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
           ? { range: studentHeaderRowIndex }
           : {}),
       }) as RawImportRow[]).map((row, index) => ({
-        ...row,
+        ...Object.fromEntries(Object.entries(row).filter(([key]) => !["__proto__", "constructor", "prototype"].includes(key.toLowerCase()))),
         __rowNumber: (studentHeaderRowIndex >= 0 ? studentHeaderRowIndex : 0) + index + 2,
       })),
       detectedEvent: detectAttendanceWorksheetMetadata(

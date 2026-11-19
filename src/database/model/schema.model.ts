@@ -49,6 +49,7 @@ export type UserRecord = {
   name: string;
   email: string;
   password_hash: string;
+  token_version: number;
   role: UserRole;
   created_at: Date;
   updated_at: Date;

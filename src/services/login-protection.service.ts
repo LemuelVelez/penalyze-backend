@@ -3,24 +3,16 @@ import type { NextFunction, Request, Response } from "express";
 
 import { query, withTransaction } from "../lib/db";
 
-// Local traffic limiting mitigates bursts; PostgreSQL counters below remain
-// shared across server instances and survive restarts.
-const MAX_REQUESTS_PER_IP_PER_MINUTE = 40;
-const MAX_FAILURES_PER_IP = 30;
-const MAX_FAILURES_PER_IP_EMAIL = 8;
+// Login floods and failed attempts are counted in PostgreSQL across all API instances.
+import { rateLimit } from "./rate-limit.service";
+const MAX_FAILURES_PER_IP = 5;
+const MAX_FAILURES_PER_IP_EMAIL = 5;
 const FAILURE_WINDOW_MINUTES = 15;
 const BLOCK_MINUTES = 30;
-const LOCAL_BUCKET_LIMIT = 10_000;
-const IDENTIFIER_SECRET = process.env.LOGIN_RATE_LIMIT_SECRET
-  || process.env.JWT_SECRET
-  || "development-only-login-throttle-secret";
-
-type LocalBucket = { count: number; resetAt: number };
-const localBuckets = new Map<string, LocalBucket>();
+const IDENTIFIER_SECRET = process.env.LOGIN_RATE_LIMIT_SECRET || process.env.JWT_SECRET!;
 let lastCleanupAt = 0;
 
 function requestIp(req: Request): string {
-  // Express computes req.ip using ONLY the explicitly configured trusted proxy hops.
   return req.ip || req.socket.remoteAddress || "unknown";
 }
 
@@ -32,52 +24,20 @@ function keysFor(ip: string, email: string) {
   return {
     ip: hashIdentifier(`ip:${ip}`),
     pair: hashIdentifier(`ip-email:${ip}:${email.trim().toLowerCase()}`),
+    account: hashIdentifier(`account:${email.trim().toLowerCase()}`),
   };
 }
 
 function sendBlocked(res: Response, retryAfterSeconds: number) {
   res.setHeader("Retry-After", String(Math.max(1, Math.ceil(retryAfterSeconds))));
   res.setHeader("Cache-Control", "no-store");
-  res.status(429).json({
-    message: "Too many sign-in attempts. Please try again later.",
-  });
+  res.status(429).json({ message: "Too many sign-in attempts. Please try again later." });
 }
 
-/** A small, bounded per-process burst limiter, including malformed login bodies. */
-export function limitLoginTraffic(req: Request, res: Response, next: NextFunction) {
-  const now = Date.now();
-  const key = requestIp(req);
-  const existing = localBuckets.get(key);
-  const bucket = existing && existing.resetAt > now
-    ? existing
-    : { count: 0, resetAt: now + 60_000 };
-
-  bucket.count += 1;
-  // Refresh insertion order so oldest entries are evicted first when necessary.
-  localBuckets.delete(key);
-  localBuckets.set(key, bucket);
-
-  if (localBuckets.size > LOCAL_BUCKET_LIMIT) {
-    for (const [ip, value] of localBuckets) {
-      if (value.resetAt <= now) localBuckets.delete(ip);
-    }
-    while (localBuckets.size > LOCAL_BUCKET_LIMIT) {
-      const oldest = localBuckets.keys().next().value;
-      if (oldest === undefined) break;
-      localBuckets.delete(oldest);
-    }
-  }
-
-  if (bucket.count > MAX_REQUESTS_PER_IP_PER_MINUTE) {
-    sendBlocked(res, (bucket.resetAt - now) / 1000);
-    return;
-  }
-
-  next();
-}
+export const limitLoginTraffic = rateLimit("login:ip", 20, 60);
 
 export async function getLoginBlockSeconds(req: Request, email: string): Promise<number> {
-  const { ip, pair } = keysFor(requestIp(req), email);
+  const { ip, pair, account } = keysFor(requestIp(req), email);
   const result = await query<{ seconds: number }>(
     `
       SELECT COALESCE(
@@ -86,20 +46,21 @@ export async function getLoginBlockSeconds(req: Request, email: string): Promise
       FROM public.auth_login_throttles
       WHERE key_hash = ANY($1::text[]) AND blocked_until > NOW()
     `,
-    [[ip, pair]],
+    [[ip, pair, account]],
   );
   return Math.max(0, Number(result.rows[0]?.seconds ?? 0));
 }
 
 /** Persist each failed attempt atomically, for known AND unknown email addresses. */
 export async function recordFailedLogin(req: Request, email: string): Promise<number> {
-  const { ip, pair } = keysFor(requestIp(req), email);
+  const { ip, pair, account } = keysFor(requestIp(req), email);
   const blockedSeconds = await withTransaction(async (client) => {
     let longestBlock = 0;
     // Always acquire the IP key first; concurrent requests cannot invert lock order.
     for (const [key, threshold] of [
       [ip, MAX_FAILURES_PER_IP],
       [pair, MAX_FAILURES_PER_IP_EMAIL],
+      [account, MAX_FAILURES_PER_IP_EMAIL],
     ] as const) {
       const result = await client.query<{ seconds: number }>(
         `
@@ -152,10 +113,9 @@ export async function recordFailedLogin(req: Request, email: string): Promise<nu
 }
 
 export async function clearSuccessfulLogin(req: Request, email: string): Promise<void> {
-  // Clear only the successful IP/email pair; other failed logins from this IP
-  // must still count toward IP-wide protection.
-  const { pair } = keysFor(requestIp(req), email);
-  await query("DELETE FROM public.auth_login_throttles WHERE key_hash = $1", [pair]);
+  // Clear per-account and IP/account failures, but preserve the IP-wide limit.
+  const { pair, account } = keysFor(requestIp(req), email);
+  await query("DELETE FROM public.auth_login_throttles WHERE key_hash = ANY($1::text[])", [[pair, account]]);
 }
 
 export function respondToBlockedLogin(res: Response, retryAfterSeconds: number) {

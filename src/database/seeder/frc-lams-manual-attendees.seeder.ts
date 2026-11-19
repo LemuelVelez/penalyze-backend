@@ -26,13 +26,13 @@ const DATA_DIRECTORY = path.join(
 
 const FIXTURES = [
   {
-    fileName: "attendance_sheet_08_24_26.txt",
+    fileName: "synthetic-attendance-sheet-08-24-26.txt",
     eventDate: "2026-08-24",
     eventDateLabel: "August 24, 2026",
     eventName: "FRC August 24",
   },
   {
-    fileName: "attendance_sheet_09_01_26.txt",
+    fileName: "synthetic-attendance-sheet-09-01-26.txt",
     eventDate: "2026-09-01",
     eventDateLabel: "September 1, 2026",
     eventName: "FRC September 01",
