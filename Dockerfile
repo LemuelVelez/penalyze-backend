@@ -29,6 +29,7 @@ RUN npm ci --omit=dev --no-audit --no-fund \
   && npm cache clean --force
 
 COPY --chown=node:node --from=builder /app/dist ./dist
+COPY --chown=node:node --from=builder /app/src/database/migration ./src/database/migration
 
 USER node
 
