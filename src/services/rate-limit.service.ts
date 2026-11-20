@@ -2,7 +2,7 @@ import crypto from "crypto";
 import type { NextFunction, Request, Response } from "express";
 import { query } from "../lib/db";
 
-const secret = process.env.RATE_LIMIT_SECRET || process.env.JWT_SECRET;
+const secret = process.env.RATE_LIMIT_SECRET || process.env.JWT_SECRET || "";
 if (!secret || secret.length < 32) throw new Error("RATE_LIMIT_SECRET or JWT_SECRET must contain at least 32 characters.");
 
 function hash(value: string) {
