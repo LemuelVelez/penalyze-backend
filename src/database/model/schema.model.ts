@@ -462,6 +462,7 @@ export type SavedAttendanceImportResult = AttendancePreviewResult & {
   savedRecords: AttendanceRecord[];
   createdFines: FineRecord[];
   reconciliation: AttendanceImportReconciliation;
+  syncWarnings?: string[];
 };
 
 export const ACCEPTED_ATTENDANCE_EXTENSIONS = [
