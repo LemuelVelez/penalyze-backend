@@ -7,6 +7,32 @@ const REPOSITORY_BASE = (process.env.ATTENDANCE_REPOSITORY_URL || process.env.At
   .trim().replace(/\/+$/, "").replace(/\/api$/i, "").replace(/\/+$/, "");
 const INTEGRATION_KEY = (process.env.PENALYZE_INTEGRATION_KEY || process.env.Penalyze_Integration_Key || "").trim();
 const MAX_BATCH = 200;
+const MAX_DOWNLOAD_BYTES = Math.max(1024 * 1024, Math.min(50 * 1024 * 1024,
+  Number(process.env.REPOSITORY_MAX_DOWNLOAD_BYTES) || 25 * 1024 * 1024));
+const MAX_METADATA_BYTES = 2 * 1024 * 1024;
+
+async function readBoundedResponse(response: globalThis.Response, maxBytes: number): Promise<Buffer> {
+  const advertised = Number(response.headers.get("content-length") || 0);
+  if (advertised > maxBytes) throw Object.assign(new Error("Repository file is too large."), { status: 413 });
+  if (!response.body) throw Object.assign(new Error("Repository returned an empty response."), { status: 502 });
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw Object.assign(new Error("Repository response exceeded the allowed size."), { status: 413 });
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, total);
+  } finally { reader.releaseLock(); }
+}
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type SyncAction = "pending" | "uploaded" | "reset";
@@ -48,23 +74,18 @@ async function repositoryRequest(path: string, init: RequestInit = {}): Promise<
     throw Object.assign(new Error("AttendanceRepository is unavailable."), { status: 502 });
   }
   if (!response.ok) {
-    let detail = "";
-    try {
-      const payload = await response.json() as { error?: string };
-      detail = typeof payload.error === "string" ? payload.error : "";
-    } catch { /* No JSON body. */ }
     // An invalid server-to-server key must not sign out an authenticated Penalyze user.
     const status = response.status === 401 || response.status === 403 ? 502 : response.status;
     throw Object.assign(new Error(response.status === 401 || response.status === 403
       ? "AttendanceRepository rejected the integration credentials."
-      : detail || `AttendanceRepository request failed (${response.status}).`), { status });
+      : `AttendanceRepository request failed (${response.status}).`), { status });
   }
   return response;
 }
 
 async function getRepositoryUploads(): Promise<RepositoryUpload[]> {
   const response = await repositoryRequest("/uploads?status=all");
-  const payload = await response.json() as { uploads?: RepositoryUpload[] };
+  const payload = JSON.parse((await readBoundedResponse(response, MAX_METADATA_BYTES)).toString("utf8")) as { uploads?: RepositoryUpload[] };
   if (!Array.isArray(payload.uploads)) {
     throw Object.assign(new Error("AttendanceRepository returned invalid upload metadata."), { status: 502 });
   }
@@ -88,7 +109,7 @@ export async function listRepositoryUploads(req: AuthenticatedRequest, res: Resp
   }
   try {
     const response = await repositoryRequest(`/uploads?status=${encodeURIComponent(status)}`);
-    const payload = await response.json() as { uploads: unknown[] };
+    const payload = JSON.parse((await readBoundedResponse(response, MAX_METADATA_BYTES)).toString("utf8")) as { uploads: unknown[] };
     res.json({ data: payload.uploads, message: "Repository sync statuses loaded." });
   } catch (error) { errorResponse(error, res, next); }
 }
@@ -98,13 +119,12 @@ export async function downloadRepositoryUpload(req: AuthenticatedRequest, res: R
   if (!UUID.test(id)) { res.status(400).json({ message: "Invalid upload ID." }); return; }
   try {
     const response = await repositoryRequest(`/uploads/${encodeURIComponent(id)}/download`);
-    const download = response;
-    const contentType = download.headers.get("content-type") ?? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-    const disposition = download.headers.get("content-disposition");
-    res.setHeader("Content-Type", contentType);
+    const data = await readBoundedResponse(response, MAX_DOWNLOAD_BYTES);
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Cache-Control", "no-store");
-    if (disposition) res.setHeader("Content-Disposition", disposition);
-    res.send(Buffer.from(await download.arrayBuffer()));
+    res.setHeader("Content-Disposition", `attachment; filename="repository-upload-${id}.xlsx"`);
+    res.send(data);
   } catch (error) { errorResponse(error, res, next); }
 }
 

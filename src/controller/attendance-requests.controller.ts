@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
+import jwt from "jsonwebtoken";
 
 import type { AuthenticatedRequest } from "./auth.controller";
 import {
@@ -13,6 +14,33 @@ import {
 } from "../services/attendance-requests.service";
 import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
 
+const RECEIPT_AUDIENCE = "penalyze-attendance-request-receipt";
+const RECEIPT_ISSUER = process.env.JWT_ISSUER || "penalyze-api";
+const RECEIPT_SECRET = process.env.JWT_SECRET!;
+const RECEIPT_EXPIRY = "90d";
+
+function getReceiptIds(receipts: unknown): string[] {
+  if (!Array.isArray(receipts) || receipts.length > 20 ||
+      receipts.some((receipt) => typeof receipt !== "string" || receipt.length > 1024)) {
+    return [];
+  }
+  const ids = new Set<string>();
+  for (const receipt of receipts) {
+    try {
+      const value = jwt.verify(receipt, RECEIPT_SECRET, {
+        algorithms: ["HS256"], issuer: RECEIPT_ISSUER, audience: RECEIPT_AUDIENCE,
+      });
+      if (typeof value === "object" && value.purpose === "student-status" &&
+          typeof value.requestId === "string" &&
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.requestId)) {
+        ids.add(value.requestId);
+      }
+    } catch { /* Invalid or expired receipts grant no access. */ }
+  }
+  return [...ids];
+}
+
+
 export async function createRequest(
   req: Request,
   res: Response,
@@ -21,12 +49,16 @@ export async function createRequest(
   try {
     const request = await createAttendanceRequest(req.body ?? {});
     res.locals.auditAttendanceRequestType = request.request_type;
+    const statusToken = jwt.sign(
+      { purpose: "student-status", requestId: request.id },
+      RECEIPT_SECRET,
+      { algorithm: "HS256", audience: RECEIPT_AUDIENCE, issuer: RECEIPT_ISSUER, expiresIn: RECEIPT_EXPIRY },
+    );
+    // Never echo full student profile or evidence links to anonymous submitters.
+    res.setHeader("Cache-Control", "no-store");
     res.status(201).json({
-      message:
-        request.request_type === "details_correction"
-          ? "Details correction request submitted."
-          : "Attendance review request submitted.",
-      data: request,
+      message: "Request submitted for review. Save the status access code; it is shown only once.",
+      data: { id: request.id, statusToken },
     });
   } catch (error) {
     next(error);
@@ -40,11 +72,9 @@ export async function publicStudentRequests(
   next: NextFunction,
 ) {
   try {
-    const rows = await listPublicAttendanceRequestsForStudent(
-      req.query.studentId ?? req.query.student_id,
-      req.query.lastName,
-      req.query.schoolYearId ?? req.query.school_year_id,
-    );
+    const ids = getReceiptIds(req.body?.receipts);
+    const rows = ids.length ? await listPublicAttendanceRequestsForStudent(ids) : [];
+    res.setHeader("Cache-Control", "no-store");
     res.json({ data: rows });
   } catch (error) {
     next(error);
@@ -142,10 +172,7 @@ export async function reviewRequestWithProgress(
       res.locals.auditOutcome = "failed";
       writeProgressStreamMessage(res, {
         type: "error",
-        message:
-          error instanceof Error
-            ? error.message
-            : "Unable to review attendance request.",
+        message: "Unable to review attendance request.",
       });
       res.end();
       return;
@@ -216,7 +243,7 @@ export async function reviewRequestGroupWithProgress(
       res.locals.auditOutcome = "failed";
       writeProgressStreamMessage(res, {
         type: "error",
-        message: error instanceof Error ? error.message : "Unable to review attendance request group.",
+        message: "Unable to review attendance request group.",
       });
       res.end();
       return;

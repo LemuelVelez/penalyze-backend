@@ -70,6 +70,9 @@ function getSeedUserCredentials() {
 }
 
 export async function seedUser(): Promise<SeedUserResult> {
+  if (process.env.NODE_ENV === "production" && process.env.ALLOW_PRODUCTION_SEED !== "true") {
+    throw new Error("Production user seeding requires explicit ALLOW_PRODUCTION_SEED=true.");
+  }
   const { email, password, name, role } = getSeedUserCredentials();
 
   const existingResult = await query<SeedUserRecord>(

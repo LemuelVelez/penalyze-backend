@@ -133,7 +133,11 @@ import { rateLimit, limits, clientIp } from "./services/rate-limit.service";
 
 const app = express();
 app.disable("x-powered-by");
-app.use(helmet({ contentSecurityPolicy: false }));
+app.use(helmet({
+  contentSecurityPolicy: { directives: {
+    defaultSrc: ["'none'"], baseUri: ["'none'"], frameAncestors: ["'none'"], formAction: ["'none'"],
+  } },
+}));
 // Trust forwarded client IPs only when a known number of reverse proxies are
 // enforced by the deployment. Never trust arbitrary X-Forwarded-For headers.
 const trustedProxyHops = Number(process.env.TRUST_PROXY_HOPS ?? 0);
@@ -149,7 +153,12 @@ function parseAllowedOrigins(): string[] {
   const fromEnv = (process.env.FRONTEND_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
   const list = process.env.NODE_ENV === "production" ? fromEnv : [...fromEnv, ...DEFAULT_FRONTEND_ORIGINS];
   for (const origin of list) {
-    try { if (new URL(origin).origin !== origin) throw new Error("Invalid origin"); }
+    try {
+      const parsed = new URL(origin);
+      if (parsed.origin !== origin || (process.env.NODE_ENV === "production" && parsed.protocol !== "https:")) {
+        throw new Error("Invalid origin");
+      }
+    }
     catch { throw new Error(`Invalid FRONTEND_ORIGINS entry: ${origin}`); }
   }
   if (process.env.NODE_ENV === "production" && !list.length) {
@@ -229,7 +238,6 @@ app.get(
 const publicStudentStatusRateLimit = limits(
   ["student-status:minute", 10, 60, clientIp],
   ["student-status:day", 50, 86400, clientIp],
-  ["student-status:id", 10, 3600, (req) => String(req.query.studentId ?? "").slice(0, 50)],
 );
 const publicRequestRateLimit = limits(
   ["requests:ip", 5, 3600, clientIp],
@@ -266,7 +274,7 @@ app.patch(
   "/api/school-years/:id/assign-current",
   requireAuth, requireAdmin, assignCurrentSchoolYearRecords,
 );
-app.get("/api/school-years/:id/delete-impact", requireAuth, schoolYearDeleteImpact);
+app.get("/api/school-years/:id/delete-impact", requireAuth, requireAdmin, schoolYearDeleteImpact);
 app.delete("/api/school-years/:id/records", requireAuth, requireAdmin, deleteSchoolYearRecords);
 app.patch("/api/school-years/:id/activate", requireAuth, requireAdmin, activateSchoolYear);
 app.patch("/api/school-years/:id", requireAuth, requireAdmin, updateSchoolYear);
@@ -274,18 +282,24 @@ app.put("/api/school-years/:id", requireAuth, requireAdmin, updateSchoolYear);
 app.delete("/api/school-years/:id", requireAuth, requireAdmin, deleteSchoolYear);
 
 
-app.post("/api/attendance/requests", publicRequestRateLimit, createAttendanceRequest);
-app.get("/api/attendance/requests/student-status", publicStudentStatusRateLimit, publicAttendanceStudentRequests);
-app.get("/api/attendance/requests", requireAuth, attendanceRequests);
-app.patch("/api/attendance/requests/group-review", requireAuth, reviewAttendanceRequestGroup);
-app.patch("/api/attendance/requests/group-review/progress", requireAuth, reviewAttendanceRequestGroupWithProgress);
+app.post("/api/attendance/requests", publicRequestRateLimit, (req: Request, res: Response, next: NextFunction) => {
+  if (process.env.NODE_ENV === "production" && process.env.ENABLE_UNVERIFIED_PUBLIC_REQUESTS !== "true") {
+    res.status(503).json({ message: "Public correction submissions require verified student identity and are temporarily unavailable." });
+    return;
+  }
+  next();
+}, createAttendanceRequest);
+app.post("/api/attendance/requests/student-status", publicStudentStatusRateLimit, publicAttendanceStudentRequests);
+app.get("/api/attendance/requests", requireAuth, requireAdmin, attendanceRequests);
+app.patch("/api/attendance/requests/group-review", requireAuth, requireAdmin, reviewAttendanceRequestGroup);
+app.patch("/api/attendance/requests/group-review/progress", requireAuth, requireAdmin, reviewAttendanceRequestGroupWithProgress);
 app.patch(
   "/api/attendance/requests/:id/review",
-  requireAuth, reviewAttendanceRequest,
+  requireAuth, requireAdmin, reviewAttendanceRequest,
 );
 app.patch(
   "/api/attendance/requests/:id/review/progress",
-  requireAuth, reviewAttendanceRequestWithProgress,
+  requireAuth, requireAdmin, reviewAttendanceRequestWithProgress,
 );
 app.delete(
   "/api/attendance/requests/:id/events/:eventId",
@@ -293,8 +307,8 @@ app.delete(
 );
 
 app.get("/api/attendance/colleges", requireAuth, attendanceColleges);
-app.get("/api/attendance/event-exemptions", requireAuth, attendanceEventExemptions);
-app.get("/api/attendance/event-college-checker", requireAuth, attendanceEventCollegeChecker);
+app.get("/api/attendance/event-exemptions", requireAuth, requireAdmin, attendanceEventExemptions);
+app.get("/api/attendance/event-college-checker", requireAuth, requireAdmin, attendanceEventCollegeChecker);
 app.post("/api/attendance/event-exemptions/impact", requireAuth, requireAdmin, attendanceEventExemptionImpact);
 app.post("/api/attendance/event-exemptions", requireAuth, requireAdmin, saveAttendanceEventExemptions);
 app.post(
@@ -308,7 +322,7 @@ app.post(
 );
 app.delete("/api/attendance/event-exemptions/:id", requireAuth, requireAdmin, removeAttendanceEventExemption);
 
-app.get("/api/attendance/event-year-level-exemptions", requireAuth, attendanceEventYearLevelExemptions);
+app.get("/api/attendance/event-year-level-exemptions", requireAuth, requireAdmin, attendanceEventYearLevelExemptions);
 app.post("/api/attendance/event-year-level-exemptions/impact", requireAuth, requireAdmin, attendanceEventYearLevelExemptionImpact);
 app.post("/api/attendance/event-year-level-exemptions", requireAuth, requireAdmin, saveAttendanceEventYearLevelExemptions);
 app.post(
@@ -321,7 +335,7 @@ app.delete("/api/attendance/event-year-level-exemptions/:id", requireAuth, requi
 app.get("/api/attendance/events", requireAuth, attendanceEvents);
 app.get(
   "/api/attendance/events/duplicates",
-  requireAuth, attendanceEventDuplicateGroups,
+  requireAuth, requireAdmin, attendanceEventDuplicateGroups,
 );
 app.post(
   "/api/attendance/events/merge-impact",
@@ -335,8 +349,8 @@ app.post("/api/attendance/events", requireAuth, requireAdmin, saveAttendanceEven
 app.put("/api/attendance/events/:eventId", requireAuth, requireAdmin, updateAttendanceEvent);
 app.patch("/api/attendance/events/:eventId", requireAuth, requireAdmin, updateAttendanceEvent);
 app.delete("/api/attendance/events/:eventId", requireAuth, requireAdmin, deleteAttendanceEvent);
-app.get("/api/attendance/dashboard-overview", requireAuth, attendanceDashboardOverview);
-app.get("/api/attendance/final-results", requireAuth, attendanceFinalResults);
+app.get("/api/attendance/dashboard-overview", requireAuth, requireAdmin, attendanceDashboardOverview);
+app.get("/api/attendance/final-results", requireAuth, requireAdmin, attendanceFinalResults);
 app.patch(
   "/api/attendance/final-results/:id/events/batch/progress",
   requireAuth, requireAdmin, updateStudentEventAttendancesWithProgress,
@@ -359,14 +373,14 @@ app.post(
   "/api/attendance/final-results/refresh",
   requireAuth, requireAdmin, refreshAttendanceFinalResults,
 );
-app.get("/api/attendance/calculation-results", requireAuth, attendanceCalculationResults);
+app.get("/api/attendance/calculation-results", requireAuth, requireAdmin, attendanceCalculationResults);
 app.get(
   "/api/attendance/calculation-results/pending-summary",
-  requireAuth, attendanceCalculationPendingSummary,
+  requireAuth, requireAdmin, attendanceCalculationPendingSummary,
 );
 app.post(
   "/api/attendance/calculation-results/status",
-  requireAuth, attendanceCalculationStatus,
+  requireAuth, requireAdmin, attendanceCalculationStatus,
 );
 app.delete(
   "/api/attendance/calculation-results",
@@ -384,18 +398,18 @@ app.post(
   "/api/attendance/calculation-results/repair-consistency",
   requireAuth, requireAdmin, repairAttendanceCalculationConsistency,
 );
-app.get("/api/attendance/manual-records", requireAuth, attendanceManualRecords);
+app.get("/api/attendance/manual-records", requireAuth, requireAdmin, attendanceManualRecords);
 app.delete("/api/attendance/manual-records", requireAuth, requireAdmin, deleteAttendanceManualRecords);
 app.delete("/api/attendance/manual-records/:id", requireAuth, requireAdmin, deleteAttendanceManualRecord);
-app.get("/api/attendance", requireAuth, attendanceIndex);
-app.get("/api/attendance/imports", requireAuth, attendanceImports);
+app.get("/api/attendance", requireAuth, requireAdmin, attendanceIndex);
+app.get("/api/attendance/imports", requireAuth, requireAdmin, attendanceImports);
 app.delete(
   "/api/attendance/imports",
   requireAuth, requireAdmin, deleteAttendanceImports,
 );
 app.get(
   "/api/attendance/imports/:importId/delete-impact",
-  requireAuth, attendanceImportDeleteImpact,
+  requireAuth, requireAdmin, attendanceImportDeleteImpact,
 );
 app.post(
   "/api/attendance/imports/:importId/restore",
@@ -405,7 +419,7 @@ app.delete(
   "/api/attendance/imports/:importId/purge",
   requireAuth, requireAdmin, purgeAttendanceImport,
 );
-app.get("/api/attendance/imports/:importId", requireAuth, showImport);
+app.get("/api/attendance/imports/:importId", requireAuth, requireAdmin, showImport);
 app.delete(
   "/api/attendance/imports/:importId",
   requireAuth, requireAdmin, deleteAttendanceImport,
@@ -413,17 +427,17 @@ app.delete(
 app.post("/api/attendance/manual", requireAuth, requireAdmin, manualSave);
 app.post(
   "/api/attendance/import/preview",
-  requireAuth, attendanceBatchUpload,
+  requireAuth, requireAdmin, rateLimit("attendance:preview", 3, 60, (req) => (req as typeof req & { user?: { sub: string } }).user?.sub || clientIp(req)), attendanceBatchUpload,
   previewImport,
 );
 app.post(
   "/api/attendance/import/save/progress",
-  requireAuth, requireAdmin, attendanceBatchUpload,
+  requireAuth, requireAdmin, rateLimit("attendance:save", 2, 60, (req) => (req as typeof req & { user?: { sub: string } }).user?.sub || clientIp(req)), attendanceBatchUpload,
   saveImportWithProgress,
 );
 app.post(
   "/api/attendance/import/save",
-  requireAuth, requireAdmin, attendanceBatchUpload,
+  requireAuth, requireAdmin, rateLimit("attendance:save", 2, 60, (req) => (req as typeof req & { user?: { sub: string } }).user?.sub || clientIp(req)), attendanceBatchUpload,
   saveImport,
 );
 app.put("/api/attendance/bulk", requireAuth, requireAdmin, updateAttendanceRecordsBulk);
@@ -432,11 +446,11 @@ app.put("/api/attendance/:id", requireAuth, requireAdmin, updateAttendanceRecord
 app.patch("/api/attendance/:id", requireAuth, requireAdmin, updateAttendanceRecord);
 app.delete("/api/attendance/:id", requireAuth, requireAdmin, deleteAttendanceRecord);
 
-app.get("/api/fines", requireAuth, fines);
-app.get("/api/fines/summary", requireAuth, summary);
-app.get("/api/fines/penalty-results/colleges", requireAuth, penaltyResultColleges);
-app.get("/api/fines/penalty-results/:id/absent-events", requireAuth, penaltyResultAbsentEvents);
-app.get("/api/fines/penalty-results", requireAuth, penaltyResults);
+app.get("/api/fines", requireAuth, requireAdmin, fines);
+app.get("/api/fines/summary", requireAuth, requireAdmin, summary);
+app.get("/api/fines/penalty-results/colleges", requireAuth, requireAdmin, penaltyResultColleges);
+app.get("/api/fines/penalty-results/:id/absent-events", requireAuth, requireAdmin, penaltyResultAbsentEvents);
+app.get("/api/fines/penalty-results", requireAuth, requireAdmin, penaltyResults);
 app.delete("/api/fines/penalty-results", requireAuth, requireAdmin, deletePenaltyResultRows);
 app.delete("/api/fines/penalty-results/:id", requireAuth, requireAdmin, deletePenaltyResultRow);
 app.post("/api/fines/penalty-results/refresh", requireAuth, requireAdmin, refreshPenaltyResultRows);
@@ -448,13 +462,25 @@ app.patch(
 );
 app.post("/api/fines/zero-attendance", requireAuth, requireAdmin, registerZeroAttendance);
 app.patch("/api/fines/:id/status", requireAuth, requireAdmin, updateStatus);
-app.get("/api/fines/penalties", requireAuth, penalties);
+app.get("/api/fines/penalties", requireAuth, requireAdmin, penalties);
 app.post("/api/fines/penalties", requireAuth, requireAdmin, savePenalty);
 app.post("/api/fines/penalties/seed", requireAuth, requireAdmin, seedPenalties);
-app.get("/api/fines/penalties/match/:noOfAbsences", requireAuth, matchPenalty);
+app.get("/api/fines/penalties/match/:noOfAbsences", requireAuth, requireAdmin, matchPenalty);
 app.put("/api/fines/penalties/:id", requireAuth, requireAdmin, updatePenalty);
 app.patch("/api/fines/penalties/:id", requireAuth, requireAdmin, updatePenalty);
 app.delete("/api/fines/penalties/:id", requireAuth, requireAdmin, deletePenalty);
+
+const auditRetentionDays = Number(process.env.AUDIT_LOG_RETENTION_DAYS ?? 365);
+if (Number.isInteger(auditRetentionDays) && auditRetentionDays >= 30 && auditRetentionDays <= 3650) {
+  const purgeOldAuditLogs = () => {
+    void query("DELETE FROM public.audit_logs WHERE created_at < NOW() - ($1::integer * INTERVAL '1 day')", [auditRetentionDays])
+      .catch((error) => console.error("Audit retention purge failed:", error));
+  };
+  const initialAuditPurge = setTimeout(purgeOldAuditLogs, 60_000);
+  initialAuditPurge.unref();
+  const auditPurgeInterval = setInterval(purgeOldAuditLogs, 24 * 60 * 60 * 1000);
+  auditPurgeInterval.unref();
+}
 
 const configuredAttendanceRetentionSweepMs = Number(
   process.env.ATTENDANCE_IMPORT_RETENTION_SWEEP_MS ?? 6 * 60 * 60 * 1000,
@@ -497,7 +523,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     requestId,
   };
   if (safeStatus < 500 && raw?.expose === true && !raw?.code) response.message = raw.message || response.message;
-  if (process.env.NODE_ENV === "development" && process.env.EXPOSE_ERRORS === "true" && !raw?.code && raw?.stack) response.stack = raw.stack;
+  // Internal stacks belong exclusively in server-side logs. Never send them to clients.
   res.status(safeStatus).json(response);
 });
 

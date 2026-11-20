@@ -24,7 +24,6 @@ function keysFor(ip: string, email: string) {
   return {
     ip: hashIdentifier(`ip:${ip}`),
     pair: hashIdentifier(`ip-email:${ip}:${email.trim().toLowerCase()}`),
-    account: hashIdentifier(`account:${email.trim().toLowerCase()}`),
   };
 }
 
@@ -37,7 +36,7 @@ function sendBlocked(res: Response, retryAfterSeconds: number) {
 export const limitLoginTraffic = rateLimit("login:ip", 20, 60);
 
 export async function getLoginBlockSeconds(req: Request, email: string): Promise<number> {
-  const { ip, pair, account } = keysFor(requestIp(req), email);
+  const { ip, pair } = keysFor(requestIp(req), email);
   const result = await query<{ seconds: number }>(
     `
       SELECT COALESCE(
@@ -46,21 +45,20 @@ export async function getLoginBlockSeconds(req: Request, email: string): Promise
       FROM public.auth_login_throttles
       WHERE key_hash = ANY($1::text[]) AND blocked_until > NOW()
     `,
-    [[ip, pair, account]],
+    [[ip, pair]],
   );
   return Math.max(0, Number(result.rows[0]?.seconds ?? 0));
 }
 
 /** Persist each failed attempt atomically, for known AND unknown email addresses. */
 export async function recordFailedLogin(req: Request, email: string): Promise<number> {
-  const { ip, pair, account } = keysFor(requestIp(req), email);
+  const { ip, pair } = keysFor(requestIp(req), email);
   const blockedSeconds = await withTransaction(async (client) => {
     let longestBlock = 0;
     // Always acquire the IP key first; concurrent requests cannot invert lock order.
     for (const [key, threshold] of [
       [ip, MAX_FAILURES_PER_IP],
       [pair, MAX_FAILURES_PER_IP_EMAIL],
-      [account, MAX_FAILURES_PER_IP_EMAIL],
     ] as const) {
       const result = await client.query<{ seconds: number }>(
         `
@@ -113,9 +111,9 @@ export async function recordFailedLogin(req: Request, email: string): Promise<nu
 }
 
 export async function clearSuccessfulLogin(req: Request, email: string): Promise<void> {
-  // Clear per-account and IP/account failures, but preserve the IP-wide limit.
-  const { pair, account } = keysFor(requestIp(req), email);
-  await query("DELETE FROM public.auth_login_throttles WHERE key_hash = ANY($1::text[])", [[pair, account]]);
+  // Clear this IP/email pair only. Never let one remote IP lock every legitimate user out.
+  const { pair } = keysFor(requestIp(req), email);
+  await query("DELETE FROM public.auth_login_throttles WHERE key_hash = $1", [pair]);
 }
 
 export function respondToBlockedLogin(res: Response, retryAfterSeconds: number) {

@@ -9,7 +9,8 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "migrate": "tsx src/database/script/migration.ts",
-    "seed": "tsx src/database/script/seed.ts"
+    "seed": "tsx src/database/script/seed.ts",
+    "security:purge-fixtures": "node scripts/purge-private-fixtures.mjs"
   },
   "keywords": [],
   "author": "",
@@ -32,7 +33,6 @@
     "@types/pg": "^8.20.0",
     "tsx": "^4.22.3",
     "typescript": "^6.0.3",
-    "@types/jsonwebtoken": "^9.0.10",
-    "@types/bcryptjs": "^2.4.6"
+    "@types/jsonwebtoken": "^9.0.10"
   }
 }

@@ -1001,13 +1001,63 @@ function decodeCsvBuffer(buffer: Buffer) {
   }
 }
 
+// Inspect ZIP central-directory metadata BEFORE passing XLSX bytes to SheetJS.
+// Parser-level row limits are not enough to prevent a tiny compressed ZIP bomb
+// from allocating excessive memory when decompressed.
+function validateXlsxContainer(buffer: Buffer): void {
+  const invalid = () => new Error("Invalid or oversized XLSX workbook archive.");
+  const minimumEnd = Math.max(0, buffer.length - 22 - 65535);
+  let eocd = -1;
+  for (let offset = buffer.length - 22; offset >= minimumEnd; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50 &&
+        offset + 22 + buffer.readUInt16LE(offset + 20) === buffer.length) {
+      eocd = offset;
+      break;
+    }
+  }
+  if (eocd < 0) throw invalid();
+  const fileCount = buffer.readUInt16LE(eocd + 10);
+  const directorySize = buffer.readUInt32LE(eocd + 12);
+  const directoryOffset = buffer.readUInt32LE(eocd + 16);
+  if (!fileCount || fileCount > 500 || directorySize === 0xffffffff ||
+      directoryOffset === 0xffffffff || directoryOffset + directorySize > eocd ||
+      buffer.readUInt16LE(eocd + 4) !== 0 || buffer.readUInt16LE(eocd + 6) !== 0 ||
+      buffer.readUInt16LE(eocd + 8) !== fileCount) throw invalid();
+  let offset = directoryOffset;
+  let totalUncompressed = 0;
+  for (let i = 0; i < fileCount; i += 1) {
+    if (offset + 46 > eocd || buffer.readUInt32LE(offset) !== 0x02014b50) throw invalid();
+    const flags = buffer.readUInt16LE(offset + 8);
+    const method = buffer.readUInt16LE(offset + 10);
+    const compressed = buffer.readUInt32LE(offset + 20);
+    const expanded = buffer.readUInt32LE(offset + 24);
+    const nameLength = buffer.readUInt16LE(offset + 28);
+    const extraLength = buffer.readUInt16LE(offset + 30);
+    const commentLength = buffer.readUInt16LE(offset + 32);
+    if ((flags & 1) || (method !== 0 && method !== 8) ||
+        compressed === 0xffffffff || expanded === 0xffffffff ||
+        expanded > 32 * 1024 * 1024 ||
+        (compressed > 0 && expanded / compressed > 1000) ||
+        offset + 46 + nameLength + extraLength + commentLength > eocd) throw invalid();
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLength);
+    if (!name || name.startsWith("/") || name.split("/").includes("..") || name.includes("\\")) throw invalid();
+    totalUncompressed += expanded;
+    if (totalUncompressed > 64 * 1024 * 1024) throw invalid();
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  if (offset !== directoryOffset + directorySize) throw invalid();
+}
+
 async function parseExcelFile(file: UploadedAttendanceFile) {
   const extension = getFileExtension(file.originalname);
   if (file.buffer.length > 5 * 1024 * 1024 || file.buffer.length === 0) {
     throw new Error("Uploaded files must be 5 MB or smaller.");
   }
-  if (extension === ".xlsx" && !file.buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) {
-    throw new Error("Invalid XLSX file signature.");
+  if (extension === ".xlsx") {
+    if (!file.buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) {
+      throw new Error("Invalid XLSX file signature.");
+    }
+    validateXlsxContainer(file.buffer);
   }
   if (extension === ".csv" && (file.buffer.includes(0) || file.buffer.some((byte) => byte < 0x09 || (byte > 0x0d && byte < 0x20)))) {
     throw new Error("Invalid CSV text data.");

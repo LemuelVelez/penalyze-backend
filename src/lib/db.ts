@@ -3,6 +3,9 @@ import { Pool, PoolClient, QueryResult, QueryResultRow } from "pg";
 
 const databaseUrlKey = (["PostgreDatabase", "POSTGRE_DATABASE", "DATABASE_URL"] as const)
   .find((key) => Boolean(process.env[key]?.trim()));
+if (process.env.NODE_ENV === "production" && !databaseUrlKey) {
+  throw new Error("Set PostgreDatabase or DATABASE_URL in production; no default credentials are permitted.");
+}
 const connectionString = databaseUrlKey
   ? process.env[databaseUrlKey]!.trim()
   : "postgresql://postgres:password@localhost:5432/penalyze";
@@ -38,16 +41,24 @@ const transactionRetryBaseDelayMs = Math.max(
 
 const transactionLockTimeoutMs = Math.max(
   0,
-  Number(process.env.DB_LOCK_TIMEOUT_MS ?? 0),
+  Number(process.env.DB_LOCK_TIMEOUT_MS ?? 5000),
 );
 
 const transactionStatementTimeoutMs = Math.max(
   0,
-  Number(process.env.DB_STATEMENT_TIMEOUT_MS ?? 0),
+  Number(process.env.DB_STATEMENT_TIMEOUT_MS ?? 30000),
 );
 
+const sslMode = (process.env.DB_SSL_MODE || (process.env.NODE_ENV === "production" ? "verify-full" : "disable")).toLowerCase();
+if (sslMode !== "verify-full" && sslMode !== "disable") {
+  throw new Error("DB_SSL_MODE must be verify-full or disable.");
+}
+// Explicit opt-out allows operator-managed private PostgreSQL networks that do
+// not support TLS. External database deployments should use verify-full.
 export const pool = new Pool({
   connectionString,
+  ssl: sslMode === "verify-full" ? { rejectUnauthorized: true } : false,
+  statement_timeout: Number(process.env.DB_QUERY_TIMEOUT_MS ?? 30000),
   max: Number(process.env.DB_POOL_MAX ?? 10),
   idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS ?? 30000),
   connectionTimeoutMillis: Number(process.env.DB_CONNECTION_TIMEOUT_MS ?? 10000),

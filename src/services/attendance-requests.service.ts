@@ -179,8 +179,10 @@ function normalizeEvidenceUrl(value: unknown) {
 
   try {
     const parsed = new URL(text);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      throw new Error("Unsupported protocol");
+    if (parsed.username || parsed.password ||
+        (process.env.NODE_ENV === "production" ? parsed.protocol !== "https:" :
+          parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
+      throw new Error("Unsafe evidence URL");
     }
   } catch {
     throw createHttpError(
@@ -951,24 +953,19 @@ export type PublicStudentAttendanceRequestStatus = {
 };
 
 export async function listPublicAttendanceRequestsForStudent(
-  studentIdValue: unknown,
-  lastNameValue: unknown,
-  schoolYearIdValue?: unknown,
+  verifiedRequestIds: string[],
 ): Promise<PublicStudentAttendanceRequestStatus[]> {
-  const studentId = cleanText(studentIdValue);
-  const schoolYearId = cleanText(schoolYearIdValue);
-  if (!await studentIdentityMatches(studentId, lastNameValue)) return [];
-  if (schoolYearId && !isUuid(schoolYearId)) return [];
+  if (!verifiedRequestIds.length || verifiedRequestIds.length > 20 ||
+      verifiedRequestIds.some((id) => !isUuid(id))) return [];
   const result = await query<PublicStudentAttendanceRequestStatus>(`
     SELECT ar.id, ar.school_year_id, sy.name AS school_year_name,
       sy.semester, ar.request_type, ar.status, ar.review_note,
       ar.reviewed_at, ar.created_at
     FROM attendance_requests ar
     JOIN school_years sy ON sy.id = ar.school_year_id
-    WHERE LOWER(TRIM(ar.student_id)) = LOWER(TRIM($1))
-      AND ($2::uuid IS NULL OR ar.school_year_id = $2::uuid)
+    WHERE ar.id = ANY($1::uuid[])
     ORDER BY ar.created_at DESC LIMIT 20
-  `, [studentId, schoolYearId || null]);
+  `, [verifiedRequestIds]);
   return result.rows;
 }
 

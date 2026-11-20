@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { promisify } from "util";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import { NextFunction, Request, Response } from "express";
@@ -29,8 +30,9 @@ if (JWT_SECRET.length < 32 || /^(change-this|secret-key|replace|example|your-|te
 }
 const ISSUER = process.env.JWT_ISSUER || "penalyze-api";
 const AUDIENCE = process.env.JWT_AUDIENCE || "penalyze-frontend";
-const TOKEN_TTL_SECONDS = 12 * 60 * 60;
-const REMEMBER_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
+// Bound cookie lifetime; token_version provides immediate logout/password revocation.
+const TOKEN_TTL_SECONDS = 4 * 60 * 60;
+const REMEMBER_TOKEN_TTL_SECONDS = 2 * 24 * 60 * 60;
 const COOKIE_NAME = "penalyze_session";
 const USER_ROLES: UserRole[] = ["admin", "officer"];
 const COOKIE_SECURE = process.env.NODE_ENV === "production";
@@ -83,22 +85,20 @@ function parseUserRole(value: unknown, fallback: UserRole = "admin") {
   return isUserRole(role) ? role : fallback;
 }
 
-function hashPassword(password: string) {
-  return bcrypt.hashSync(password, 12);
+const scryptAsync = promisify(crypto.scrypt);
+const DUMMY_PASSWORD_HASH = bcrypt.hash("nonexistent-user-placeholder", 12);
+
+function hashPassword(password: string): Promise<string> {
+  return bcrypt.hash(password, 12);
 }
 
-const DUMMY_PASSWORD_HASH = hashPassword("nonexistent-user-placeholder");
-
-function verifyPassword(password: string, storedHash: string) {
-  if (storedHash.startsWith("$2")) return bcrypt.compareSync(password, storedHash);
+async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
+  if (storedHash.startsWith("$2")) return bcrypt.compare(password, storedHash);
   const [salt, hash] = storedHash.split(":");
-  if (!salt || !hash) return false;
-
-  const computed = crypto.scryptSync(password, salt, 64);
+  if (!salt || !/^[a-f0-9]{128}$/i.test(hash)) return false;
+  const computed = await scryptAsync(password, salt, 64) as Buffer;
   const stored = Buffer.from(hash, "hex");
-  if (computed.length !== stored.length) return false;
-
-  return crypto.timingSafeEqual(computed, stored);
+  return computed.length === stored.length && crypto.timingSafeEqual(computed, stored);
 }
 
 async function verifyLegacyPostgresPassword(password: string, storedHash: string) {
@@ -159,7 +159,7 @@ export async function register(req: Request, res: Response, next: NextFunction) 
       return;
     }
     const role = parseUserRole(req.body?.role, "admin");
-    const passwordHash = hashPassword(password);
+    const passwordHash = await hashPassword(password);
 
     const result = await query<UserRecord>(
       `
@@ -213,7 +213,7 @@ export async function login(req: Request, res: Response, next: NextFunction) {
 
     // Equalize the local password-check cost for unknown emails to reduce
     // account enumeration via response timing.
-    const isCurrentPassword = verifyPassword(password, user?.password_hash ?? DUMMY_PASSWORD_HASH);
+    const isCurrentPassword = await verifyPassword(password, user?.password_hash ?? await DUMMY_PASSWORD_HASH);
     const isLegacyPassword = !user || isCurrentPassword
       ? false
       : await verifyLegacyPostgresPassword(password, user.password_hash);
@@ -226,7 +226,7 @@ export async function login(req: Request, res: Response, next: NextFunction) {
     }
 
     if (isLegacyPassword) {
-      const migratedPasswordHash = hashPassword(password);
+      const migratedPasswordHash = await hashPassword(password);
 
       await query(
         `
@@ -310,7 +310,7 @@ export async function changePassword(req: AuthenticatedRequest, res: Response, n
       return;
     }
 
-    const validPassword = verifyPassword(currentPassword, user.password_hash) ||
+    const validPassword = await verifyPassword(currentPassword, user.password_hash) ||
       await verifyLegacyPostgresPassword(currentPassword, user.password_hash);
     if (!validPassword) {
       res.status(401).json({ message: "Current password is incorrect." });
@@ -324,7 +324,7 @@ export async function changePassword(req: AuthenticatedRequest, res: Response, n
         WHERE id = $2 AND password_hash = $3
         RETURNING id
       `,
-      [hashPassword(newPassword), user.id, user.password_hash]
+      [await hashPassword(newPassword), user.id, user.password_hash]
     );
 
     if (!updated.rows.length) {
@@ -462,7 +462,7 @@ export async function updateUser(req: AuthenticatedRequest, res: Response, next:
     }
 
     if (password !== undefined && password.length > 0) {
-      params.push(hashPassword(password));
+      params.push(await hashPassword(password));
       fields.push(`password_hash = $${params.length}`);
     }
 

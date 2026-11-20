@@ -126,8 +126,11 @@ function getRouteParam(req: Request, key: string) {
 
 function parseRecordIds(value: unknown) {
   const values = Array.isArray(value) ? value : [value];
+  if (values.length > 1000) {
+    throw Object.assign(new Error("A bulk operation can include at most 1000 IDs."), { statusCode: 400, expose: true });
+  }
 
-  return Array.from(
+  const ids = Array.from(
     new Set(
       values
         .flatMap((item) => String(item ?? "").split(","))
@@ -135,6 +138,10 @@ function parseRecordIds(value: unknown) {
         .filter(Boolean),
     ),
   );
+  if (ids.length > 1000 || ids.some((id) => id.length > 128)) {
+    throw Object.assign(new Error("A bulk operation can include at most 1000 valid IDs."), { statusCode: 400, expose: true });
+  }
+  return ids;
 }
 
 function getBodyRecordIds(req: Request) {
@@ -166,7 +173,7 @@ function getAuthenticatedUserId(req: Request) {
 function parseImportIds(value: unknown) {
   const values = Array.isArray(value) ? value : [value];
 
-  return Array.from(
+  const ids = Array.from(
     new Set(
       values
         .flatMap((item) => String(item ?? "").split(","))
@@ -174,6 +181,10 @@ function parseImportIds(value: unknown) {
         .filter(Boolean),
     ),
   );
+  if (ids.length > 1000 || ids.some((id) => id.length > 128)) {
+    throw Object.assign(new Error("A bulk operation can include at most 1000 valid IDs."), { statusCode: 400, expose: true });
+  }
+  return ids;
 }
 
 type CalculationSourceType = "imported" | "manual" | "zero_attendance";
@@ -315,8 +326,10 @@ function getEventPayloadForFile(
   };
 }
 
-function getErrorMessage(error: unknown, fallback: string) {
-  return error instanceof Error ? error.message : fallback;
+function getErrorMessage(_error: unknown, fallback: string) {
+  // The stream has already started, so the central error handler cannot
+  // sanitize this response. Never echo database/exception messages here.
+  return fallback;
 }
 
 export async function colleges(req: Request, res: Response, next: NextFunction) {
