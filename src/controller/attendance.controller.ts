@@ -1,4 +1,5 @@
 import { NextFunction, Request, Response } from "express";
+import { randomUUID } from "node:crypto";
 import multer from "multer";
 
 import {
@@ -326,10 +327,18 @@ function getEventPayloadForFile(
   };
 }
 
-function getErrorMessage(_error: unknown, fallback: string) {
-  // The stream has already started, so the central error handler cannot
-  // sanitize this response. Never echo database/exception messages here.
-  return fallback;
+function getErrorMessage(error: unknown, fallback: string) {
+  // Streaming has already sent headers, so the central error handler cannot
+  // send its usual JSON error. Only our explicit validation errors are safe to
+  // surface; never return a database error, SQL statement or exception stack.
+  const raw = error as { statusCode?: number; message?: string; code?: string } | null;
+  if (raw && [400, 404, 409, 422].includes(raw.statusCode ?? 0) &&
+    typeof raw.message === "string" && raw.message.length <= 700 && !raw.code) {
+    return raw.message;
+  }
+  const requestId = randomUUID();
+  console.error(`[${requestId}] Attendance import stream failed:`, error);
+  return `${fallback} Reference: ${requestId}. Check the backend logs before retrying; the import may already be saved.`;
 }
 
 export async function colleges(req: Request, res: Response, next: NextFunction) {

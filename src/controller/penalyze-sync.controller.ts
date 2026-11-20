@@ -39,8 +39,17 @@ type SyncAction = "pending" | "uploaded" | "reset";
 type RepositoryUpload = {
   id: string;
   originalName: string;
+  updatedAt?: string;
   penalyzeStatus: "untracked" | "pending" | "uploaded" | "outdated";
 };
+
+function savedAttendanceFilenameKey(filename: string): string {
+  // Must stay in sync with attendanceUpload's Multer fileFilter: it replaces
+  // punctuation such as ':' before writing attendance_imports.file_name.
+  return filename.normalize("NFC").split(/[\\/]/).pop()!
+    .replace(/[^\p{L}\p{N}._() -]/gu, "_")
+    .trim().toLowerCase();
+}
 
 function getActor(req: AuthenticatedRequest): string {
   return String(req.user?.name || req.user?.email || req.user?.sub || "").trim().slice(0, 255);
@@ -199,12 +208,12 @@ export async function restoreRepositoryUploadedStatus(req: AuthenticatedRequest,
       return;
     }
 
-    const imports = await query<{ id: string }>(
-      `SELECT id FROM attendance_imports
+    const imports = await query<{ id: string; created_at: string }>(
+      `SELECT id, created_at FROM attendance_imports
        WHERE status = 'saved' AND deleted_at IS NULL
-         AND LOWER(BTRIM(file_name)) = LOWER(BTRIM($1))
+         AND LOWER(BTRIM(file_name)) = $1
        ORDER BY created_at DESC LIMIT 2`,
-      [workbook.originalName.normalize("NFC")],
+      [savedAttendanceFilenameKey(workbook.originalName)],
     );
     if (imports.rows.length === 0) {
       res.status(404).json({ message: "No saved Penalyze attendance import matches this workbook. Its status was not changed." });
@@ -213,6 +222,21 @@ export async function restoreRepositoryUploadedStatus(req: AuthenticatedRequest,
     if (imports.rows.length > 1) {
       res.status(409).json({ message: "Multiple saved imports have this filename. Restore the correct one manually using its Penalyze import UUID." });
       return;
+    }
+
+    // A workbook modified after the saved import must be reviewed again.
+    // Never mark a changed source as uploaded merely because its name matches.
+    if (workbook.updatedAt) {
+      const lastRepositoryChange = Date.parse(workbook.updatedAt);
+      const savedAt = Date.parse(imports.rows[0].created_at);
+      if (!Number.isFinite(lastRepositoryChange) || !Number.isFinite(savedAt)) {
+        res.status(409).json({ message: "Could not verify workbook timestamps; status has not changed." });
+        return;
+      }
+      if (lastRepositoryChange > savedAt + 60_000) {
+        res.status(409).json({ message: "This workbook changed after the matching attendance import. Its status was not restored. Review the changed file separately." });
+        return;
+      }
     }
 
     const penalyzeImportId = imports.rows[0].id;

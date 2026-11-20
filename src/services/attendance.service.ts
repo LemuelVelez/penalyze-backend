@@ -4027,6 +4027,12 @@ export async function saveAttendanceFiles(
     throw createValidationError("Please upload at least one attendance file.");
   }
 
+  // Report progress before the potentially slow or failing preview/validation
+  // work; the user should not see a 1% hang with no indication of the stage.
+  await emitAttendanceImportProgress(onProgress, {
+    stage: "preparing", percent: 2,
+    message: "Checking attendance workbook metadata...",
+  });
   const options = files.map((file, index) => {
     const matching = fileOptions.find(
       (option) =>
@@ -4036,11 +4042,21 @@ export async function saveAttendanceFiles(
     return matching ?? {};
   });
   const selectedColleges = options.map((option) => requireAttendanceUploadCollege(option.college).label);
+  await emitAttendanceImportProgress(onProgress, {
+    stage: "parsing", percent: 5,
+    message: "Parsing and checking workbook rows...",
+  });
   const previews = await previewAttendanceFiles(
     files,
     selectedColleges,
     options.map((option) => option.rowCollegeOverrides ?? {}),
   );
+  await emitAttendanceImportProgress(onProgress, {
+    stage: "validating", percent: 12,
+    message: "Checking college and event assignments...",
+    processedRows: previews.reduce((sum, preview) => sum + preview.rowsTotal, 0),
+    totalRows: previews.reduce((sum, preview) => sum + preview.rowsTotal, 0),
+  });
   previews.forEach(assertNoInvalidAttendanceColleges);
   previews.forEach((preview, index) => {
     applyReviewedRowEvents(preview, options[index]);
