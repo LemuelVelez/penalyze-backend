@@ -169,8 +169,9 @@ export function changeRepositorySync(action: SyncAction) {
   };
 }
 
-// Recover a workbook mistakenly moved to Pending without importing it again.
-// The saved import must be unambiguous: filename alone is not a unique link.
+// Recover an untracked or pending workbook after attendance was already saved.
+// This only updates Repository Sync metadata; it never imports rows.
+// Reject ambiguous filename matches and workbooks changed since an import.
 export async function restoreRepositoryUploadedStatus(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const uploadId = req.body?.uploadId;
   if (typeof uploadId !== "string" || !UUID.test(uploadId)) {
@@ -189,8 +190,8 @@ export async function restoreRepositoryUploadedStatus(req: AuthenticatedRequest,
       res.json({ data: { uploadId, penalyzeImportId: "" }, message: "Workbook is already marked uploaded." });
       return;
     }
-    if (workbook.penalyzeStatus !== "pending") {
-      res.status(409).json({ message: "Only pending workbooks can have their uploaded status restored." });
+    if (workbook.penalyzeStatus !== "pending" && workbook.penalyzeStatus !== "untracked") {
+      res.status(409).json({ message: "Only untracked or pending workbooks can be matched to a saved import. Outdated files must be reviewed separately." });
       return;
     }
     if (typeof workbook.originalName !== "string" || !workbook.originalName.trim()) {
