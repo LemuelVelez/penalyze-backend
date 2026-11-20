@@ -922,6 +922,13 @@ export async function saveImportWithProgress(
     }
 
     prepareProgressStream(res, 201);
+    // Keep the NDJSON connection open during long whole-year recalculations;
+    // blank lines are ignored by the stream parser, so they carry no student data.
+    const keepAlive = setInterval(() => {
+      if (!res.destroyed && !res.writableEnded) res.write("\n");
+    }, 15_000);
+    keepAlive.unref();
+    res.once("close", () => clearInterval(keepAlive));
 
     const isCancelled = () =>
       clientCancelled || res.destroyed || res.writableEnded;

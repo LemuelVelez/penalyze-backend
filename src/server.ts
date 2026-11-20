@@ -23,6 +23,7 @@ import {
   createRequest as createAttendanceRequest,
   requests as attendanceRequests,
   publicStudentRequests as publicAttendanceStudentRequests,
+  publicStudentLookup as publicAttendanceStudentLookup,
   removeRequestEvent as removeAttendanceRequestEvent,
   reviewRequest as reviewAttendanceRequest,
   reviewRequestWithProgress as reviewAttendanceRequestWithProgress,
@@ -290,6 +291,7 @@ app.post("/api/attendance/requests", publicRequestRateLimit, (req: Request, res:
   next();
 }, createAttendanceRequest);
 app.post("/api/attendance/requests/student-status", publicStudentStatusRateLimit, publicAttendanceStudentRequests);
+app.post("/api/attendance/requests/student-lookup", publicStudentStatusRateLimit, publicAttendanceStudentLookup);
 app.get("/api/attendance/requests", requireAuth, requireAdmin, attendanceRequests);
 app.patch("/api/attendance/requests/group-review", requireAuth, requireAdmin, reviewAttendanceRequestGroup);
 app.patch("/api/attendance/requests/group-review/progress", requireAuth, requireAdmin, reviewAttendanceRequestGroupWithProgress);

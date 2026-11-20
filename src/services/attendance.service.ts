@@ -106,6 +106,8 @@ type SaveRowsInput = {
   rows: RawImportRow[] | ParsedAttendanceRow[];
   onProgress?: AttendanceImportProgressCallback;
   isCancelled?: () => boolean;
+  /** Commit imported rows before performing expensive derived recalculations. */
+  deferDerivedRefresh?: boolean;
 };
 
 type AttendanceImportProgressCallback = (
@@ -3764,21 +3766,22 @@ async function saveAttendanceRowsWithClient(
     stageCounts: { ...stageCounts, saved: savedRecordIds.length },
   });
 
-  const synced = await syncAbsencesForAttendanceRecordIds(client, savedRecordIds);
+  const synced = input.deferDerivedRefresh
+    ? { fines: [] as FineRecord[] }
+    : await syncAbsencesForAttendanceRecordIds(client, savedRecordIds);
   const savedRecords = await listRecordsByIds(client, savedRecordIds);
   const schoolYearId = importRecord.school_year_id ?? undefined;
 
-  await refreshAttendanceFinalResultsWithClient(client, {
-    schoolYearId,
-    importId,
-  });
-  await refreshCalculationResultsWithClient(client, { schoolYearId });
-  await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
+  if (!input.deferDerivedRefresh) {
+    await refreshAttendanceFinalResultsWithClient(client, { schoolYearId, importId });
+    await refreshCalculationResultsWithClient(client, { schoolYearId });
+    await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
+  }
 
   const normalizedStudentIds = Array.from(
     new Set(rowsToSave.map((row) => cleanText(row.studentId).toLowerCase()).filter(Boolean)),
   );
-  const distinctFinalResults = normalizedStudentIds.length
+  const distinctFinalResults = !input.deferDerivedRefresh && normalizedStudentIds.length
     ? Number(
         (
           await client.query<{ count: string }>(
@@ -3831,6 +3834,71 @@ async function saveAttendanceRowsWithClient(
   };
 }
 
+/**
+ * Post-commit reconciliation. The uploaded source rows must not disappear if an
+ * expensive whole-year calculation times out. Reconciliation itself remains
+ * atomic, so a failed refresh cannot leave a half-updated fines snapshot.
+ */
+async function finalizeCommittedAttendanceImports(
+  imports: SavedAttendanceImportResult[],
+): Promise<string[]> {
+  if (!imports.length) return [];
+  try {
+    await withTransaction(async (client) => {
+      // Full-year recalculation can be significantly slower than row inserts.
+      // Scope this timeout to this transaction rather than relaxing global DB limits.
+      const timeout = Number(process.env.ATTENDANCE_IMPORT_REFRESH_TIMEOUT_MS ?? 180000);
+      const durationMs = Number.isFinite(timeout)
+        ? Math.min(600000, Math.max(60000, Math.round(timeout))) : 180000;
+      await client.query("SELECT set_config('statement_timeout', $1, true)", [`${durationMs}ms`]);
+      await lockAttendanceAbsenceSync(client);
+
+      const schoolYears = new Set<string | null>();
+      const importSchoolYears = new Map<string, string | null>();
+      for (const imported of imports) {
+        const result = await client.query<{ school_year_id: string | null }>(
+          "SELECT school_year_id FROM attendance_imports WHERE id = $1 AND deleted_at IS NULL",
+          [imported.importId],
+        );
+        const schoolYearId = result.rows[0]?.school_year_id ?? null;
+        schoolYears.add(schoolYearId);
+        importSchoolYears.set(imported.importId, schoolYearId);
+        const synced = await syncAbsencesForAttendanceRecordIds(
+          client, imported.savedRecords.map((record) => record.id),
+        );
+        imported.createdFines = synced.fines;
+      }
+
+      // Refresh each affected school year once, even with multiple files.
+      for (const schoolYearId of schoolYears) {
+        const scope = schoolYearId ?? undefined;
+        await refreshAttendanceFinalResultsWithClient(client, { schoolYearId: scope });
+        await refreshCalculationResultsWithClient(client, { schoolYearId: scope });
+        await refreshPenaltyResultsForSchoolYearWithClient(client, scope);
+      }
+
+      for (const imported of imports) {
+        const studentKeys = Array.from(new Set(imported.savedRecords
+          .map((record) => cleanText(record.student_id).toLowerCase()).filter(Boolean)));
+        if (!studentKeys.length) continue;
+        const counts = await client.query<{ count: string }>(`
+          SELECT COUNT(*)::TEXT AS count FROM attendance_final_results afr
+          WHERE afr.school_year_id IS NOT DISTINCT FROM $1::uuid
+            AND LOWER(TRIM(afr.student_id)) = ANY($2::text[])
+            AND ${getAttendanceFinalResultVisibilitySql("afr")}
+        `, [importSchoolYears.get(imported.importId) ?? null, studentKeys]);
+        imported.reconciliation.stageCounts.distinctFinalResults = Number(counts.rows[0]?.count ?? 0);
+      }
+    });
+    return [];
+  } catch (error) {
+    console.error("Attendance rows committed, but derived attendance refresh failed:", error);
+    // Do not misreport a committed file as failed; reuploading would duplicate it.
+    for (const imported of imports) imported.createdFines = [];
+    return ["Attendance files were saved, but final results and fines could not be refreshed. Use Refresh Final Results or contact an administrator. Do not upload the same files again."];
+  }
+}
+
 export async function saveAttendanceRows(
   input: SaveRowsInput,
 ): Promise<SavedAttendanceImportResult> {
@@ -3847,8 +3915,9 @@ export async function saveAttendanceRows(
 
   const prepared = prepareAttendanceRowsForSave(input);
   const result = await withTransaction((client) =>
-    saveAttendanceRowsWithClient(client, prepared.input, prepared.preview),
+    saveAttendanceRowsWithClient(client, { ...prepared.input, deferDerivedRefresh: true }, prepared.preview),
   );
+  const syncWarnings = await finalizeCommittedAttendanceImports([result]);
 
   await emitAttendanceImportProgress(input.onProgress, {
     stage: "completed",
@@ -3862,7 +3931,7 @@ export async function saveAttendanceRows(
     createdFines: result.createdFines.length,
     stageCounts: result.reconciliation.stageCounts,
   });
-  return result;
+  return { ...result, syncWarnings };
 }
 
 export type AttendanceFileSaveOption = Omit<
@@ -3884,6 +3953,7 @@ export type AttendanceBatchSaveResult = {
   filesFailed: number;
   recordsSaved: number;
   finesCreated: number;
+  syncWarnings?: string[];
 };
 
 function hasUnresolvedAttendanceMergeCandidate(
@@ -3985,7 +4055,7 @@ export async function saveAttendanceFiles(
     }
   });
 
-  return withTransaction(async (client) => {
+  const batch = await withTransaction(async (client) => {
     await lockAttendanceAbsenceSync(client);
     const savedEvents = new Map<number, AttendanceEventRecord>();
     const savedFiles: AttendanceBatchSaveResult["files"] = [];
@@ -4073,7 +4143,9 @@ export async function saveAttendanceFiles(
           : undefined,
       };
 
-      const result = await saveAttendanceRowsWithClient(client, input, preview);
+      const result = await saveAttendanceRowsWithClient(
+        client, { ...input, deferDerivedRefresh: true }, preview,
+      );
       if (result.event) savedEvents.set(index, result.event);
       savedFiles.push({
         fileName: file.originalname,
@@ -4097,6 +4169,14 @@ export async function saveAttendanceFiles(
       ),
     };
   });
+  const syncWarnings = await finalizeCommittedAttendanceImports(
+    batch.files.map((file) => file.result),
+  );
+  return {
+    ...batch,
+    finesCreated: batch.files.reduce((total, file) => total + file.result.createdFines.length, 0),
+    syncWarnings,
+  };
 }
 
 export async function saveAttendanceFile(

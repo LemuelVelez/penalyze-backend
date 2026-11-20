@@ -6,6 +6,7 @@ import {
   createAttendanceRequest,
   listAttendanceRequests,
   listPublicAttendanceRequestsForStudent,
+  lookupPublicStudentById,
   removeAttendanceRequestEvent,
   preflightAttendanceRequestReview,
   preflightAttendanceRequestGroupReview,
@@ -57,7 +58,7 @@ export async function createRequest(
     // Never echo full student profile or evidence links to anonymous submitters.
     res.setHeader("Cache-Control", "no-store");
     res.status(201).json({
-      message: "Request submitted for review. Save the status access code; it is shown only once.",
+      message: "Request submitted for review. Track its status with your Student ID.",
       data: { id: request.id, statusToken },
     });
   } catch (error) {
@@ -65,6 +66,19 @@ export async function createRequest(
   }
 }
 
+
+export async function publicStudentLookup(req: Request, res: Response, next: NextFunction) {
+  try {
+    const studentId = req.body?.studentId;
+    if (typeof studentId !== "string" || !/^[A-Za-z0-9-]{4,36}$/.test(studentId.trim())) {
+      res.status(400).json({ message: "Enter a valid Student ID." });
+      return;
+    }
+    const data = await lookupPublicStudentById(studentId);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ data });
+  } catch (error) { next(error); }
+}
 
 export async function publicStudentRequests(
   req: Request,

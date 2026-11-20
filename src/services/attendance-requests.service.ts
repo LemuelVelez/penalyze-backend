@@ -940,6 +940,59 @@ async function addApprovedManualAttendance(
 }
 
 
+/** Minimal public lookup: no names, evidence, request notes or reviewer details. */
+export type PublicStudentLookup = {
+  student_id: string;
+  course: string | null;
+  year_level: string | null;
+  college: string | null;
+  status: AttendanceRequestStatus | null;
+};
+
+export async function lookupPublicStudentById(studentId: string): Promise<PublicStudentLookup | null> {
+  const id = studentId.trim();
+  if (!/^[A-Za-z0-9-]{4,36}$/.test(id)) return null;
+
+  // Select only the four approved profile fields. Prefer the maintained student
+  // profile, but support older attendance records that predate student upserts.
+  const profile = await query<{
+    student_id: string;
+    course: string | null;
+    year_level: string | null;
+    college: string | null;
+  }>(`
+    SELECT student_id, course, year_level, college
+    FROM (
+      SELECT student_id, NULLIF(TRIM(program), '') AS course,
+        NULLIF(TRIM(year_level), '') AS year_level,
+        NULLIF(TRIM(college), '') AS college, 0 AS priority, updated_at
+      FROM students WHERE LOWER(TRIM(student_id)) = LOWER($1)
+      UNION ALL
+      SELECT student_id, NULLIF(TRIM(program), ''),
+        NULLIF(TRIM(year_level), ''), NULLIF(TRIM(college), ''), 1, updated_at
+      FROM attendance_records
+      WHERE LOWER(TRIM(student_id)) = LOWER($1) AND deleted_at IS NULL
+    ) profiles
+    ORDER BY priority, updated_at DESC
+    LIMIT 1
+  `, [id]);
+  const student = profile.rows[0];
+  if (!student) return null;
+
+  const latest = await query<{ status: AttendanceRequestStatus }>(`
+    SELECT status FROM attendance_requests
+    WHERE LOWER(TRIM(student_id)) = LOWER($1)
+    ORDER BY created_at DESC, id DESC LIMIT 1
+  `, [id]);
+  return {
+    student_id: student.student_id,
+    course: student.course,
+    year_level: student.year_level,
+    college: student.college,
+    status: latest.rows[0]?.status ?? null,
+  };
+}
+
 export type PublicStudentAttendanceRequestStatus = {
   id: string;
   school_year_id: string;
