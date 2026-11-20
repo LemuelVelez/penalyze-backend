@@ -19,6 +19,7 @@ import {
   updateUser,
 } from "./controller/auth.controller";
 import { listAuditLogCategories, listAuditLogs } from "./controller/audit-logs.controller";
+import { publicStudentRecords } from "./controller/public-student.controller";
 import {
   createRequest as createAttendanceRequest,
   requests as attendanceRequests,
@@ -283,13 +284,8 @@ app.put("/api/school-years/:id", requireAuth, requireAdmin, updateSchoolYear);
 app.delete("/api/school-years/:id", requireAuth, requireAdmin, deleteSchoolYear);
 
 
-app.post("/api/attendance/requests", publicRequestRateLimit, (req: Request, res: Response, next: NextFunction) => {
-  if (process.env.NODE_ENV === "production" && process.env.ENABLE_UNVERIFIED_PUBLIC_REQUESTS !== "true") {
-    res.status(503).json({ message: "Public correction submissions require verified student identity and are temporarily unavailable." });
-    return;
-  }
-  next();
-}, createAttendanceRequest);
+app.post("/api/attendance/requests", publicRequestRateLimit, createAttendanceRequest);
+app.post("/api/public/student-records", publicStudentStatusRateLimit, publicStudentRecords);
 app.post("/api/attendance/requests/student-status", publicStudentStatusRateLimit, publicAttendanceStudentRequests);
 app.post("/api/attendance/requests/student-lookup", publicStudentStatusRateLimit, publicAttendanceStudentLookup);
 app.get("/api/attendance/requests", requireAuth, requireAdmin, attendanceRequests);
