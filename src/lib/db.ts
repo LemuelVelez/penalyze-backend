@@ -49,14 +49,60 @@ const transactionStatementTimeoutMs = Math.max(
   Number(process.env.DB_STATEMENT_TIMEOUT_MS ?? 30000),
 );
 
-const sslMode = (process.env.DB_SSL_MODE || (process.env.NODE_ENV === "production" ? "verify-full" : "disable")).toLowerCase();
+// Coolify's internal PostgreSQL service typically has no TLS listener. Use
+// plaintext only for loopback/private-network hosts, unless the operator
+// explicitly specifies DB_SSL_MODE. Public database hosts still require TLS.
+function isPrivateDatabaseHost(connectionUrl: string): boolean {
+  let host: string;
+  try {
+    host = new URL(connectionUrl).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  } catch {
+    return false;
+  }
+
+  if (
+    host === "localhost" ||
+    host === "::1" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".local") ||
+    host.endsWith(".docker") ||
+    host.endsWith(".svc.cluster.local")
+  ) return true;
+
+  // Docker's private service discovery uses single-label hostnames.
+  if (/^[a-z0-9][a-z0-9-]*$/.test(host)) return true;
+
+  // RFC1918 and loopback IPv4 addresses are private endpoints.
+  const octets = host.split(".");
+  if (octets.length !== 4 || octets.some((octet) => !/^\d{1,3}$/.test(octet))) return false;
+  const [a, b, c, d] = octets.map(Number);
+  if ([a, b, c, d].some((octet) => octet > 255)) return false;
+  return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+const defaultSslMode = process.env.NODE_ENV === "production" && !isPrivateDatabaseHost(connectionString)
+  ? "verify-full"
+  : "disable";
+const sslMode = (process.env.DB_SSL_MODE?.trim() || defaultSslMode).toLowerCase();
 if (sslMode !== "verify-full" && sslMode !== "disable") {
   throw new Error("DB_SSL_MODE must be verify-full or disable.");
 }
-// Explicit opt-out allows operator-managed private PostgreSQL networks that do
-// not support TLS. External database deployments should use verify-full.
+
+// node-postgres gives SSL parameters in a connection URL precedence over the
+// Pool's ssl option. Remove those parameters when SSL is disabled so a stale
+// ?sslmode=require cannot silently override DB_SSL_MODE=disable.
+let poolConnectionString = connectionString;
+if (sslMode === "disable") {
+  const url = new URL(connectionString);
+  for (const key of ["sslmode", "sslcert", "sslkey", "sslrootcert", "sslnegotiation"]) {
+    url.searchParams.delete(key);
+  }
+  poolConnectionString = url.toString();
+}
+
 export const pool = new Pool({
-  connectionString,
+  connectionString: poolConnectionString,
   ssl: sslMode === "verify-full" ? { rejectUnauthorized: true } : false,
   statement_timeout: Number(process.env.DB_QUERY_TIMEOUT_MS ?? 30000),
   max: Number(process.env.DB_POOL_MAX ?? 10),
