@@ -460,6 +460,13 @@ export function auditMutation(req: AuthenticatedRequest, res: Response, next: Ne
         context.action = "Reviewed details correction request";
       }
     }
+    if (attendanceRequestType === "zero_attendance") {
+      if (req.method.toUpperCase() === "POST" && path === "/api/attendance/requests") {
+        context.action = "Submitted no-participation declaration";
+      } else if (req.method.toUpperCase() === "PATCH" && /^\/api\/attendance\/requests\/[^/]+\/review(\/progress)?$/.test(path)) {
+        context.action = "Reviewed no-participation declaration";
+      }
+    }
     const files = summarizeFiles(req);
     const responseActor =
       res.statusCode >= 200 &&

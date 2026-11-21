@@ -110,6 +110,7 @@ const REQUEST_STATUSES: AttendanceRequestStatus[] = [
 const REQUEST_TYPES: AttendanceRequestType[] = [
   "event_review",
   "details_correction",
+  "zero_attendance",
 ];
 
 const ZERO_ATTENDANCE_REMARK = "Zero attendance registration from landing page.";
@@ -185,7 +186,7 @@ function normalizeRequestType(value: unknown, defaultToEventReview = true) {
   const requestType = raw as AttendanceRequestType;
   if (!REQUEST_TYPES.includes(requestType)) {
     throw createHttpError(
-      "Attendance request type must be event_review or details_correction.",
+      "Attendance request type must be event_review, details_correction, or zero_attendance.",
     );
   }
   return requestType;
@@ -466,8 +467,9 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
   return withTransaction(async (client) => {
     await client.query("SELECT pg_advisory_xact_lock(hashtext(LOWER(TRIM($1))))", [studentId]);
     const identity = await getCurrentStudentDetails(client, studentId);
-    if (!identity.exists) {
-      throw createHttpError("Invalid student information.", 404);
+    // Students without a saved attendance record may submit a request; officers verify it before approval.
+    if (!identity.exists && requestType === "details_correction") {
+      throw createHttpError("Student record was not found.", 404);
     }
     const schoolYearId = inputSchoolYearId || (await getActiveSchoolYearId(client));
     if (!schoolYearId) {
@@ -499,13 +501,13 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
         );
       }
 
-      const requestedName = cleanText(input.name) || current.name;
+      // Names are no longer editable through details correction.
+      const requestedName = current.name;
       const requestedYearLevel = cleanText(input.yearLevel) || current.year_level || "";
       const requestedCollege = cleanText(input.college) || current.college || "";
       const requestedProgram = cleanText(input.program) || current.program || "";
 
       const hasChanges =
-        valuesDiffer(requestedName, current.name) ||
         valuesDiffer(requestedYearLevel, current.year_level) ||
         valuesDiffer(requestedCollege, current.college) ||
         valuesDiffer(requestedProgram, current.program);
@@ -575,7 +577,54 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       return (await getRequestViewById(requestResult.rows[0].id, client))!;
     }
 
-    let name = identity.name;
+    if (requestType === "zero_attendance") {
+      if (input.events != null || input.evidenceUrl != null) {
+        throw createHttpError("A no-participation declaration cannot include event evidence.");
+      }
+      const name = cleanText(input.name) || identity.name;
+      const yearLevel = cleanText(input.yearLevel) || identity.year_level || "";
+      const college = cleanText(input.college) || identity.college || "";
+      const program = cleanText(input.program) || identity.program || "";
+      if (!name || !yearLevel || !college || !program) {
+        throw createHttpError("Name, year level, college, and program are required.");
+      }
+      const attended = await client.query<{ id: string }>(`
+        SELECT id FROM attendance_records
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND school_year_id = $2
+          AND event_id IS NOT NULL AND deleted_at IS NULL
+        UNION ALL
+        SELECT id FROM manual_attendance_records
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND school_year_id = $2
+          AND event_id IS NOT NULL
+        LIMIT 1
+      `, [studentId, schoolYearId]);
+      if (attended.rows.length) {
+        throw createHttpError("An event attendance record already exists for this school year. Request an event review instead.", 409);
+      }
+      const pending = await client.query<{ id: string }>(`
+        SELECT id FROM attendance_requests
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+          AND school_year_id = $2 AND status = 'pending'
+          AND request_type IN ('zero_attendance', 'event_review') LIMIT 1
+      `, [studentId, schoolYearId]);
+      if (pending.rows.length) {
+        throw createHttpError("A pending attendance request already exists for this Student ID and school year.", 409);
+      }
+      const created = await client.query<AttendanceRequestRecord>(`
+        INSERT INTO attendance_requests (
+          request_type, school_year_id, student_id, name, year_level,
+          college, program, institution, request_note
+        ) VALUES ('zero_attendance', $1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING *
+      `, [
+        schoolYearId, studentId, name, yearLevel, college, program,
+        cleanText(input.institution) || identity.institution || DEFAULT_REQUEST_INSTITUTION,
+        cleanText(input.note),
+      ]);
+      return (await getRequestViewById(created.rows[0].id, client))!;
+    }
+
+    let name = identity.name || cleanText(input.name);
     // A verified student can enter an event name without needing the private event roster.
     const submittedEvents = Array.isArray(input.events) ? await Promise.all(input.events.map(async (raw) => {
       const submitted = raw as AttendanceRequestEventInput;
@@ -598,6 +647,16 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       throw createHttpError(
         "Name is required. Submit a Request Details Correction first, then try the attendance review again.",
       );
+    }
+
+    const pendingZero = await client.query<{ id: string }>(`
+      SELECT id FROM attendance_requests
+      WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        AND school_year_id = $2 AND status = 'pending'
+        AND request_type = 'zero_attendance' LIMIT 1
+    `, [studentId, schoolYearId]);
+    if (pendingZero.rows.length) {
+      throw createHttpError("A no-participation request is already pending for this school year.", 409);
     }
 
     const duplicates = await client.query<{ id: string }>(`
@@ -639,8 +698,8 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       }
     }
 
-    const requestCollege = identity.college ?? "";
-    const requestYearLevel = identity.year_level ?? "";
+    const requestCollege = identity.college || cleanText(input.college);
+    const requestYearLevel = identity.year_level || cleanText(input.yearLevel);
     const requestCollegeKey = normalizeCollegeKey(requestCollege);
     const requestYearLevelKey = normalizeYearLevelKey(requestYearLevel);
 
@@ -702,8 +761,8 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
         studentId,
         name,
         requestYearLevel,
-        cleanText(input.college),
-        cleanText(input.program),
+        requestCollege,
+        cleanText(input.program) || identity.program || "",
         identity.institution || cleanText(input.institution) || DEFAULT_REQUEST_INSTITUTION,
         cleanText(input.note),
       ],
@@ -1329,6 +1388,71 @@ async function applyApprovedDetailsCorrection(
   return updatedRowCount;
 }
 
+async function applyApprovedZeroAttendance(
+  client: PoolClient,
+  request: AttendanceRequestRecord,
+) {
+  const studentId = cleanText(request.student_id);
+  const attended = await client.query<{ id: string }>(`
+    SELECT id FROM attendance_records
+    WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND school_year_id = $2
+      AND event_id IS NOT NULL AND deleted_at IS NULL
+    UNION ALL
+    SELECT id FROM manual_attendance_records
+    WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND school_year_id = $2
+      AND event_id IS NOT NULL
+    LIMIT 1
+  `, [studentId, request.school_year_id]);
+  if (attended.rows.length) {
+    throw createHttpError("This student already has event attendance for the selected school year.", 409);
+  }
+
+  await client.query(`
+    INSERT INTO students (student_id, name, year_level, college, program, institution)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    ON CONFLICT ((LOWER(TRIM(student_id)))) DO UPDATE SET
+      name = EXCLUDED.name,
+      year_level = EXCLUDED.year_level,
+      college = EXCLUDED.college,
+      program = EXCLUDED.program,
+      institution = EXCLUDED.institution,
+      updated_at = NOW()
+  `, [
+    studentId, request.name, request.year_level, request.college,
+    request.program, request.institution || DEFAULT_REQUEST_INSTITUTION,
+  ]);
+
+  const saved = await client.query<{ id: string }>(`
+    SELECT id FROM attendance_records
+    WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND school_year_id = $2
+      AND event_id IS NULL AND deleted_at IS NULL AND remarks = $3
+    ORDER BY created_at DESC LIMIT 1
+    FOR UPDATE
+  `, [studentId, request.school_year_id, ZERO_ATTENDANCE_REMARK]);
+
+  if (saved.rows[0]) {
+    await client.query(`
+      UPDATE attendance_records SET name = $2, year_level = $3, college = $4,
+        program = $5, institution = $6, updated_at = NOW()
+      WHERE id = $1
+    `, [saved.rows[0].id, request.name, request.year_level, request.college,
+      request.program, request.institution || DEFAULT_REQUEST_INSTITUTION]);
+    return 0;
+  }
+  await client.query(`
+    INSERT INTO attendance_records (
+      school_year_id, import_id, event_id, student_id, name, year_level,
+      college, program, institution, no_of_absences, remarks, scanned_at
+    ) VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, 0, $8, NULL)
+  `, [
+    request.school_year_id, studentId, request.name, request.year_level,
+    request.college, request.program,
+    request.institution || DEFAULT_REQUEST_INSTITUTION,
+    ZERO_ATTENDANCE_REMARK,
+  ]);
+  return 1;
+}
+
 export async function preflightAttendanceRequestReview(
   requestIdValue: unknown,
   reviewerIdValue: unknown,
@@ -1430,6 +1554,33 @@ export async function reviewAttendanceRequest(
           schoolYearId: request.school_year_id,
           studentId: request.student_id,
         });
+      } else if (request.request_type === "zero_attendance") {
+        emit({
+          stage: "adding_attendance", percent: 24,
+          message: "Recording the verified no-participation declaration.",
+        });
+        createdAttendanceCount = await applyApprovedZeroAttendance(client, request);
+        emit({
+          stage: "syncing_absences", percent: 45,
+          message: "Calculating the student's missed events and fines.",
+        });
+        await lockAttendanceAbsenceSync(client);
+        await syncAbsencesForStudents(client, [request.student_id], request.school_year_id);
+        await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+          client, [request.school_year_id], (progress) => {
+            const stages = {
+              refreshing_final_results: 60,
+              refreshing_calculations: 75,
+              refreshing_penalties: 90,
+            } as const;
+            const labels = {
+              refreshing_final_results: "Refreshing final attendance results.",
+              refreshing_calculations: "Refreshing attendance calculations.",
+              refreshing_penalties: "Refreshing fines and penalties.",
+            } as const;
+            emit({ stage: progress.stage, percent: stages[progress.stage], message: labels[progress.stage] });
+          },
+        );
       } else {
         emit({
           stage: "resolving_events",
@@ -1668,6 +1819,7 @@ export async function reviewAttendanceRequestGroup(
     validateGroupReviewRequests(requestResult.rows, requestIds, studentId);
     const selected = requestResult.rows;
     const details = selected.filter((request) => request.request_type === "details_correction");
+    const zeroRequests = selected.filter((request) => request.request_type === "zero_attendance");
     const events = selected.filter((request) => request.request_type === "event_review");
     const total = selected.length;
     let approvedCount = 0;
@@ -1724,6 +1876,16 @@ export async function reviewAttendanceRequestGroup(
         });
         removedExemptedEventCount += exemptions.eventsRemoved;
         approvedIds.push(request.id);
+      }
+
+      for (const request of zeroRequests) {
+        emit({
+          stage: "adding_attendance", percent: 35,
+          message: "Registering verified no-participation declarations.",
+        });
+        createdAttendanceCount += await applyApprovedZeroAttendance(client, request);
+        approvedIds.push(request.id);
+        approvedEventSchoolYearIds.add(request.school_year_id);
       }
 
       // A correction can automatically close pending event reviews in the same group.

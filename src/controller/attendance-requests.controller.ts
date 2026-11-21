@@ -121,9 +121,13 @@ function getReviewSuccessMessage(result: Awaited<ReturnType<typeof reviewAttenda
     ? result.request.status === "approved"
       ? "Details correction request approved."
       : "Details correction request rejected."
-    : result.request?.status === "approved"
-      ? "Attendance request approved."
-      : "Attendance request rejected.";
+    : result.request?.request_type === "zero_attendance"
+      ? result.request.status === "approved"
+        ? "No-participation declaration approved."
+        : "No-participation declaration rejected."
+      : result.request?.status === "approved"
+        ? "Attendance request approved."
+        : "Attendance request rejected.";
 }
 
 export async function reviewRequest(
@@ -217,7 +221,9 @@ export async function reviewRequestGroup(
     const result = await reviewAttendanceRequestGroup(req.user?.sub, req.body ?? {});
     res.locals.auditAttendanceRequestType = result.requests.every(
       (request) => request.request_type === "details_correction",
-    ) ? "details_correction" : "event_review";
+    ) ? "details_correction" : result.requests.every(
+      (request) => request.request_type === "zero_attendance",
+    ) ? "zero_attendance" : "event_review";
     res.json({
       message: getGroupReviewSuccessMessage(result, String(req.body.studentId).trim(), result.rejectedCount ? "rejected" : "approved"),
       data: result,
@@ -239,7 +245,9 @@ export async function reviewRequestGroupWithProgress(
     );
     res.locals.auditAttendanceRequestType = preflight.every(
       (request) => request.request_type === "details_correction",
-    ) ? "details_correction" : "event_review";
+    ) ? "details_correction" : preflight.every(
+      (request) => request.request_type === "zero_attendance",
+    ) ? "zero_attendance" : "event_review";
     prepareProgressStream(res, 200);
     const result = await reviewAttendanceRequestGroup(
       req.user?.sub,

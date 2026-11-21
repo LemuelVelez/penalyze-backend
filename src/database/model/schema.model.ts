@@ -30,7 +30,7 @@ export type AttendanceImportProgressStage =
   | "cancelled";
 export type FineStatus = "unpaid" | "paid" | "waived";
 export type AttendanceRequestStatus = "pending" | "approved" | "rejected";
-export type AttendanceRequestType = "event_review" | "details_correction";
+export type AttendanceRequestType = "event_review" | "details_correction" | "zero_attendance";
 export type SchoolSemester = "first_semester" | "second_semester";
 
 export type SchoolYearRecord = {
