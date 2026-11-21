@@ -126,6 +126,62 @@ function dayKey(date: Date) {
   return date.toISOString().slice(0, 10);
 }
 
+// Month and day are removed from the *fuzzy name* key below. However, they
+// must still participate in event identity: September 2 and October 2 are
+// different events even when every other word in their titles is identical.
+// Only compare dates when both names provide an unambiguous month + day.
+const CALENDAR_MONTHS: Record<string, number> = {
+  jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3,
+  apr: 4, april: 4, may: 5, jun: 6, june: 6, jul: 7, july: 7,
+  aug: 8, august: 8, sep: 9, sept: 9, september: 9,
+  oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12,
+};
+
+type ExplicitEventDate = { month: number; day: number; year: number | null };
+
+function explicitEventDate(name: unknown): ExplicitEventDate | null {
+  const tokens = clean(name).split(" ").filter(Boolean);
+  for (let index = 0; index < tokens.length - 1; index += 1) {
+    const month = CALENDAR_MONTHS[tokens[index]];
+    if (!month) continue;
+    const dayText = tokens[index + 1];
+    if (!/^\d{1,2}$/.test(dayText)) continue;
+    const day = Number(dayText);
+    if (day < 1 || day > 31) continue;
+    const yearText = tokens[index + 2];
+    const year = /^20\d{2}$/.test(yearText ?? "") ? Number(yearText)
+      : /^\d{2}$/.test(yearText ?? "") ? 2000 + Number(yearText)
+        : null;
+    // Reject invalid month/day pairs instead of comparing impossible dates.
+    const checkYear = year ?? 2024; // Leap year accepts February 29 without an explicit year.
+    const valid = new Date(Date.UTC(checkYear, month - 1, day));
+    if (valid.getUTCMonth() !== month - 1 || valid.getUTCDate() !== day) continue;
+    return { month, day, year };
+  }
+  return null;
+}
+
+/** Prevent an automatic merge across differently dated occurrences. */
+export function haveConflictingAttendanceEventDates(
+  incoming: AttendanceEventIdentityInput,
+  existing: AttendanceEventIdentityInput,
+): boolean {
+  const incomingDate = explicitEventDate(incoming.name);
+  const existingDate = explicitEventDate(existing.name);
+  if (incomingDate && existingDate && (
+    incomingDate.month !== existingDate.month ||
+    incomingDate.day !== existingDate.day ||
+    (incomingDate.year !== null && existingDate.year !== null && incomingDate.year !== existingDate.year)
+  )) return true;
+
+  // A name without a date can still describe a recurring event. Use scheduled
+  // times only when both sides provide them; never guess a schedule.
+  const incomingSchedule = parseTime(incoming.startAt) ?? parseTime(incoming.endAt);
+  const existingSchedule = parseTime(existing.startAt) ?? parseTime(existing.endAt);
+  return Boolean(incomingSchedule && existingSchedule &&
+    Math.abs(incomingSchedule.getTime() - existingSchedule.getTime()) > 1.25 * 86_400_000);
+}
+
 function getScheduleScore(
   incoming: AttendanceEventIdentityInput,
   existing: AttendanceEventIdentityInput,
@@ -190,6 +246,10 @@ export function scoreAttendanceEventIdentity(
 
   if (!incomingName || !existingName) {
     return { score: 0, confidence: "low", reasons: ["missing event name"] };
+  }
+
+  if (haveConflictingAttendanceEventDates(incoming, existing)) {
+    return { score: 0, confidence: "low", reasons: ["event dates are different; do not auto-merge"] };
   }
 
   const incomingTokens = new Set(incomingName.split(" ").filter(Boolean));

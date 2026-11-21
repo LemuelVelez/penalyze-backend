@@ -24,6 +24,7 @@ import {
 } from "../database/model/schema.model";
 import { pool, query, withTransaction } from "../lib/db";
 import {
+  haveConflictingAttendanceEventDates,
   normalizeAttendanceEventIdentityName,
   scoreAttendanceEventIdentity,
 } from "./attendance-event-identity";
@@ -2055,8 +2056,15 @@ async function findOrCreateAttendanceEvent(
   const existingEvent = forceCreateEvent
     ? null
     : rankedExistingEvents.find(({ event, match }) =>
-        normalizeAttendanceEventIdentityName(event.name) === incomingIdentityName ||
-        match.score >= 0.94,
+        // Fuzzy names deliberately omit dates. Never allow an exact fuzzy-name
+        // match to bypass an explicit September-vs-October date conflict.
+        !haveConflictingAttendanceEventDates(
+          { name, startAt: eventInput.eventStartAt, endAt: eventInput.eventEndAt },
+          { name: event.name, startAt: event.event_start_at, endAt: event.event_end_at },
+        ) && (
+          normalizeAttendanceEventIdentityName(event.name) === incomingIdentityName ||
+          match.score >= 0.94
+        ),
       )?.event ?? null;
 
   if (existingEvent) return existingEvent;

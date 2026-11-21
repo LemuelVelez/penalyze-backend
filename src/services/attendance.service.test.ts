@@ -3,6 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import * as XLSX from "xlsx";
+import {
+  haveConflictingAttendanceEventDates,
+  scoreAttendanceEventIdentity,
+} from "./attendance-event-identity";
 
 import {
   attachExpectedEventConsistencyWarnings,
@@ -404,4 +408,35 @@ test("fallback final-result repair respects consolidated visibility and manual p
   assert.match(sql, /GREATEST\(\$3::INT - affected\.attended_events, 0\)/);
   assert.match(sql, /UPDATE attendance_final_results afr/);
   assert.match(sql, /RETURNING afr\.id/);
+});
+
+// Month/day tokens are removed from fuzzy names to match punctuation and
+// abbreviations, but they must still distinguish separate event occurrences.
+test("does not suggest October 2 for a September 2 repository workbook", () => {
+  const incoming = { name: "TEACHER_DAY_FUN-RUN_SEPTEMBER_2_2026" };
+  const existing = { name: "TEACHER DAY FUN-RUN OCTOBER 2, 2026" };
+  assert.equal(haveConflictingAttendanceEventDates(incoming, existing), true);
+  assert.equal(scoreAttendanceEventIdentity(incoming, existing).confidence, "low");
+  assert.equal(scoreAttendanceEventIdentity(incoming, existing).score, 0);
+});
+
+test("matches equivalent abbreviated event dates", () => {
+  const incoming = { name: "FRC Sept 21 2026" };
+  const existing = { name: "FRC September_21_2026" };
+  assert.equal(haveConflictingAttendanceEventDates(incoming, existing), false);
+  assert.ok(scoreAttendanceEventIdentity(incoming, existing).score > 0.8);
+});
+
+test("keeps events on different scheduled dates separate even with identical titles", () => {
+  const incoming = { name: "Flag Raising Ceremony", startAt: "2026-09-21T08:00:00+08:00" };
+  const existing = { name: "Flag Raising Ceremony", startAt: "2026-10-19T08:00:00+08:00" };
+  assert.equal(haveConflictingAttendanceEventDates(incoming, existing), true);
+  assert.equal(scoreAttendanceEventIdentity(incoming, existing).score, 0);
+});
+
+test("does not prevent a same-day event from being matched", () => {
+  const incoming = { name: "FRC September 21 2026", startAt: "2026-09-21T08:00:00+08:00" };
+  const existing = { name: "FRC Sep 21, 2026", startAt: "2026-09-21T08:10:00+08:00" };
+  assert.equal(haveConflictingAttendanceEventDates(incoming, existing), false);
+  assert.equal(scoreAttendanceEventIdentity(incoming, existing).confidence, "high");
 });
