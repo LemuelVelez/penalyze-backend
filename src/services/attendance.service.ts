@@ -1444,26 +1444,6 @@ function createValidationError(message: string, statusCode = 400) {
   return error;
 }
 
-/** An entirely exempt file has no attendance to import. It is a normal
- * per-file review outcome, not a reason to roll back other valid files. */
-class AllAttendanceRowsExemptError extends Error {
-  readonly statusCode = 409;
-  readonly expose = true;
-  readonly exemptedCount: number;
-
-  constructor(fileName: string, excluded: AttendanceImportReconciliation["rowsExempted"]) {
-    const reasons = Array.from(new Set(excluded.map((row) => `${row.eventName}: ${row.reason}`)));
-    const details = reasons.slice(0, 3).join("; ");
-    super(
-      `All ${excluded.length} attendee row(s) in "${fileName}" were excluded by event exemptions. ` +
-      `No attendance was saved. ${details}${reasons.length > 3 ? "; additional event exemptions apply" : ""}. ` +
-      `Review the selected event and its college/year-level exemptions before retrying.`,
-    );
-    this.name = "AllAttendanceRowsExemptError";
-    this.exemptedCount = excluded.length;
-  }
-}
-
 function parseAttendanceDateTime(text: string) {
   // ISO timestamps with Z/offsets and Unix epochs already represent an instant.
   // CSV, spreadsheet and datetime-local values without a timezone are Manila time.
@@ -3796,28 +3776,32 @@ async function saveAttendanceRowsWithClient(
     });
   }
 
-  if (!savedRecordIds.length && rowsExempted.length) {
-    throw new AllAttendanceRowsExemptError(preview.fileName, rowsExempted);
-  }
+  // A fully exempt workbook is still a successfully imported workbook. Keep its
+  // saved attendance_imports row (and import ID) for auditing and Repository Sync,
+  // but never create attendance or fine records for exempt students. The event's
+  // college/year-level exemptions are neither changed nor removed.
+  const fullyExempt = savedRecordIds.length === 0 && rowsExempted.length > 0;
 
   assertAttendanceImportNotCancelled(input);
   await emitAttendanceImportProgress(input.onProgress, {
     stage: "syncing",
     percent: 90,
-    message: "Syncing absences and fines...",
+    message: fullyExempt
+      ? `Workbook accepted: ${rowsExempted.length} exempt attendance row(s) excluded; no attendance created.`
+      : "Syncing absences and fines...",
     processedRows: rowsToSave.length,
     totalRows: rowsToSave.length,
     savedRecords: savedRecordIds.length,
     stageCounts: { ...stageCounts, saved: savedRecordIds.length },
   });
 
-  const synced = input.deferDerivedRefresh
+  const synced = input.deferDerivedRefresh || fullyExempt
     ? { fines: [] as FineRecord[] }
     : await syncAbsencesForAttendanceRecordIds(client, savedRecordIds);
   const savedRecords = await listRecordsByIds(client, savedRecordIds);
   const schoolYearId = importRecord.school_year_id ?? undefined;
 
-  if (!input.deferDerivedRefresh) {
+  if (!input.deferDerivedRefresh && !fullyExempt) {
     await refreshAttendanceFinalResultsWithClient(client, { schoolYearId, importId });
     await refreshCalculationResultsWithClient(client, { schoolYearId });
     await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
@@ -3861,7 +3845,9 @@ async function saveAttendanceRowsWithClient(
   await emitAttendanceImportProgress(input.onProgress, {
     stage: "syncing",
     percent: 96,
-    message: "Finalizing attendance import...",
+    message: fullyExempt
+      ? "Workbook imported with zero attendance records; event exemptions remain in effect."
+      : "Finalizing attendance import...",
     processedRows: rowsToSave.length,
     totalRows: rowsToSave.length,
     savedRecords: savedRecords.length,
@@ -3888,7 +3874,11 @@ async function finalizeCommittedAttendanceImports(
   imports: SavedAttendanceImportResult[],
   onProgress?: AttendanceImportProgressCallback,
 ): Promise<string[]> {
-  if (!imports.length) return [];
+  // A zero-record import is complete as soon as its import metadata commits.
+  // Rebuilding an entire school year for exempt-only workbooks is unnecessary
+  // and may keep Repository Sync waiting even though no attendance was changed.
+  const importsWithAttendance = imports.filter((item) => item.savedRecords.length > 0);
+  if (!importsWithAttendance.length) return [];
   // The imported rows have already committed. Report recalculation separately:
   // reaching the last file is not the same as completing the whole import.
   const savedRecords = imports.reduce((count, item) => count + item.savedRecords.length, 0);
@@ -3909,8 +3899,8 @@ async function finalizeCommittedAttendanceImports(
 
       const schoolYears = new Set<string | null>();
       const importSchoolYears = new Map<string, string | null>();
-      for (const [index, imported] of imports.entries()) {
-        await reportSync(94, `Synchronizing absences and fines (${index + 1} of ${imports.length} imports)...`);
+      for (const [index, imported] of importsWithAttendance.entries()) {
+        await reportSync(94, `Synchronizing absences and fines (${index + 1} of ${importsWithAttendance.length} imports)...`);
         const result = await client.query<{ school_year_id: string | null }>(
           "SELECT school_year_id FROM attendance_imports WHERE id = $1 AND deleted_at IS NULL",
           [imported.importId],
@@ -3936,7 +3926,7 @@ async function finalizeCommittedAttendanceImports(
       }
 
       await reportSync(98, "Verifying saved attendance and calculation results...");
-      for (const imported of imports) {
+      for (const imported of importsWithAttendance) {
         const studentKeys = Array.from(new Set(imported.savedRecords
           .map((record) => cleanText(record.student_id).toLowerCase()).filter(Boolean)));
         if (!studentKeys.length) continue;
@@ -4139,8 +4129,8 @@ export async function saveAttendanceFiles(
     const savedFiles: AttendanceBatchSaveResult["files"] = [];
 
     for (const [index, file] of files.entries()) {
-      // A skipped workbook must not leave behind an empty attendance_import or
-      // a newly created event; preserve earlier files in this batch.
+      // Keep a saved import ID for fully exempt workbooks, too. Savepoints only
+      // protect against genuine failures, never against valid event exemptions.
       const savepoint = `attendance_file_${index}`;
       await client.query(`SAVEPOINT ${savepoint}`);
       try {
@@ -4244,24 +4234,9 @@ export async function saveAttendanceFiles(
         });
         await client.query(`RELEASE SAVEPOINT ${savepoint}`);
       } catch (error) {
-        if (!(error instanceof AllAttendanceRowsExemptError)) throw error;
         await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
         await client.query(`RELEASE SAVEPOINT ${savepoint}`);
-        savedFiles.push({
-          fileName: file.originalname,
-          status: "skipped_exempt",
-          error: error.message,
-          result: null,
-          exemptedRows: error.exemptedCount,
-        });
-        await emitAttendanceImportProgress(onProgress, {
-          stage: "saving",
-          percent: Math.min(89, Math.round(12 + ((index + 1) / files.length) * 77)),
-          message: `${file.originalname}: skipped ${error.exemptedCount} event-exempted attendee row(s); no attendance saved for this file.`,
-          processedRows: error.exemptedCount,
-          totalRows: error.exemptedCount,
-          savedRecords: savedFiles.reduce((total, item) => total + (item.result?.savedRecords.length ?? 0), 0),
-        });
+        throw error;
       }
     }
 
