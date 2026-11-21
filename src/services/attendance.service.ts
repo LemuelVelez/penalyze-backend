@@ -1350,9 +1350,14 @@ function getAttendanceRowMergeKey(
   row: ParsedAttendanceRow,
   input: SaveRowsInput,
 ) {
+  // A consciously selected event wins over a name inferred from the Excel
+  // rows/filename. Per-row event assignments remain authoritative only when
+  // the user explicitly reviewed a multi-event workbook.
   const eventKey = [
-    cleanText(row.eventId) || cleanText(row.eventName) ||
-      cleanText(input.eventId) || cleanText(input.eventName) || "no-event",
+    input.rowEventsReviewed
+      ? cleanText(row.eventId) || cleanText(row.eventName) || "no-event"
+      : cleanText(input.eventId) || cleanText(input.eventName) ||
+          cleanText(row.eventId) || cleanText(row.eventName) || "no-event",
     input.rowEventsReviewed ? cleanText(row.eventStartAt) : "",
     input.rowEventsReviewed ? cleanText(row.eventEndAt) : "",
   ].join("::");

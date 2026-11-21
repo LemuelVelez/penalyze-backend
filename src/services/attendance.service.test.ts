@@ -23,6 +23,7 @@ import {
   normalizeYearLevelKey,
   normalizeOptionalTimestamp,
   previewAttendanceFileBase,
+  mergeAttendanceImportRowsByStudentAndEvent,
   type UploadedAttendanceFile,
 } from "./attendance.service";
 
@@ -439,4 +440,31 @@ test("does not prevent a same-day event from being matched", () => {
   const existing = { name: "FRC Sep 21, 2026", startAt: "2026-09-21T08:10:00+08:00" };
   assert.equal(haveConflictingAttendanceEventDates(incoming, existing), false);
   assert.equal(scoreAttendanceEventIdentity(incoming, existing).confidence, "high");
+});
+
+// Once an existing event is explicitly selected for a single-event workbook,
+// a filename or Excel row carrying an old event must not change the target.
+test("selected event overrides detected row events for single-event imports", () => {
+  const rows = [
+    { rowNumber: 2, studentId: "TC-001", name: "Juan", college: "College of Computing Studies", eventName: "TEACHER DAY FUN-RUN SEPTEMBER 2", errors: [] },
+    { rowNumber: 3, studentId: "TC-001", name: "Juan", college: "College of Computing Studies", eventName: "TEACHER DAY FUN-RUN OCTOBER 2", errors: [] },
+  ];
+  const assignedEventId = "00000000-0000-4000-8000-000000000099";
+  const selected = mergeAttendanceImportRowsByStudentAndEvent(rows as any, {
+    college: "College of Computing Studies",
+    eventId: assignedEventId,
+    eventName: "Selected event",
+    rows,
+  });
+  assert.equal(selected.rows.length, 1);
+  assert.equal(selected.mergedRows.length, 1);
+
+  // Intentionally reviewed multi-event imports must still keep the rows apart.
+  const reviewed = mergeAttendanceImportRowsByStudentAndEvent(rows as any, {
+    college: "College of Computing Studies",
+    eventId: assignedEventId,
+    rowEventsReviewed: true,
+    rows,
+  });
+  assert.equal(reviewed.rows.length, 2);
 });
