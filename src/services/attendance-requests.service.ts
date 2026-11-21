@@ -482,7 +482,8 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
   return withTransaction(async (client) => {
     await client.query("SELECT pg_advisory_xact_lock(hashtext(LOWER(TRIM($1))))", [studentId]);
     const identity = await getCurrentStudentDetails(client, studentId);
-    if (!identity.exists || !verifiedLastName(identity.name, input.lastName)) {
+    if (!identity.exists ||
+        (requestType === "details_correction" && !verifiedLastName(identity.name, input.lastName))) {
       throw createHttpError("Invalid student information.", 404);
     }
     const schoolYearId = inputSchoolYearId || (await getActiveSchoolYearId(client));
