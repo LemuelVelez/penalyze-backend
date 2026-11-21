@@ -168,7 +168,7 @@ export async function seedFrcAttendees(
     const batch = await saveAttendanceFiles(files, fileOptions);
     seededImports += batch.filesSaved;
     seededAttendanceRecords += batch.recordsSaved;
-    targetEventId = batch.files[0]?.result.event?.id ?? targetEventId;
+    targetEventId = batch.files.find((file) => file.result?.event?.id)?.result?.event?.id ?? targetEventId;
   }
 
   if (!targetEventId) {
