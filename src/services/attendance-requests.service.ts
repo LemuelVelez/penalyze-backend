@@ -114,6 +114,34 @@ const REQUEST_TYPES: AttendanceRequestType[] = [
 ];
 
 const ZERO_ATTENDANCE_REMARK = "Zero attendance registration from landing page.";
+const DEFAULT_REQUEST_INSTITUTION = "Jose Rizal Memorial State University - Tampilisan Campus";
+
+const REQUEST_INSTITUTION_SELECTION = `
+  COALESCE(
+    NULLIF(TRIM(ar.institution), ''),
+    (SELECT NULLIF(TRIM(s.institution), '') FROM students s
+     WHERE LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+       AND NULLIF(TRIM(s.institution), '') IS NOT NULL
+     ORDER BY s.updated_at DESC LIMIT 1),
+    (SELECT NULLIF(TRIM(a.institution), '') FROM attendance_records a
+     WHERE LOWER(TRIM(a.student_id)) = LOWER(TRIM(ar.student_id))
+       AND a.deleted_at IS NULL AND NULLIF(TRIM(a.institution), '') IS NOT NULL
+     ORDER BY a.updated_at DESC LIMIT 1),
+    (SELECT NULLIF(TRIM(m.institution), '') FROM manual_attendance_records m
+     WHERE LOWER(TRIM(m.student_id)) = LOWER(TRIM(ar.student_id))
+       AND NULLIF(TRIM(m.institution), '') IS NOT NULL
+     ORDER BY m.updated_at DESC LIMIT 1),
+    (SELECT NULLIF(TRIM(f.institution), '') FROM attendance_final_results f
+     WHERE LOWER(TRIM(f.student_id)) = LOWER(TRIM(ar.student_id))
+       AND NULLIF(TRIM(f.institution), '') IS NOT NULL
+     ORDER BY f.updated_at DESC LIMIT 1),
+    (SELECT NULLIF(TRIM(c.institution), '') FROM calculation_results c
+     WHERE LOWER(TRIM(c.student_id)) = LOWER(TRIM(ar.student_id))
+       AND NULLIF(TRIM(c.institution), '') IS NOT NULL
+     ORDER BY c.updated_at DESC LIMIT 1),
+    '${DEFAULT_REQUEST_INSTITUTION}'
+  ) AS institution
+`;
 
 function cleanText(value: unknown) {
   return String(value ?? "").trim();
@@ -370,6 +398,7 @@ async function getRequestViewById(
   const sql = `
       SELECT
         ar.*,
+        ${REQUEST_INSTITUTION_SELECTION},
         sy.name AS school_year_name,
         sy.semester,
         reviewer.name AS reviewed_by_name,
@@ -691,7 +720,7 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
         requestYearLevel,
         cleanText(input.college),
         cleanText(input.program),
-        cleanText(input.institution),
+        identity.institution || cleanText(input.institution) || DEFAULT_REQUEST_INSTITUTION,
         cleanText(input.note),
       ],
     );
@@ -733,6 +762,7 @@ export async function listAttendanceRequests(
     `
       SELECT
         ar.*,
+        ${REQUEST_INSTITUTION_SELECTION},
         sy.name AS school_year_name,
         sy.semester,
         reviewer.name AS reviewed_by_name,
