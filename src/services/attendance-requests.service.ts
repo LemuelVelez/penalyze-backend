@@ -27,7 +27,6 @@ type AttendanceRequestEventInput = {
 
 export type AttendanceRequestInput = {
   requestType?: unknown;
-  lastName?: unknown;
   honeypot?: unknown;
   formStartedAt?: unknown;
   schoolYearId?: unknown;
@@ -431,26 +430,11 @@ async function getRequestViewById(
   return result.rows[0] ?? null;
 }
 
-function verifiedLastName(name: string, input: unknown): boolean {
-  const expected = String(input ?? "").trim().toLocaleLowerCase().replace(/\s+/g, " ");
-  const normalizedName = name.trim().toLocaleLowerCase();
-  const actual = normalizedName.includes(",")
-    ? normalizedName.split(",")[0].trim()
-    : normalizedName.split(/\s+/).slice(-1)[0];
-  return expected.length >= 2 && expected.length <= 80 && actual === expected;
-}
-
 function cleanPublicField(value: unknown, max: number, label: string): string {
   if (value !== undefined && typeof value !== "string") throw createHttpError(`${label} is invalid.`);
   const text = String(value ?? "").replace(/<[^>]*>/g, "").trim();
   if (text.length > max) throw createHttpError(`${label} is too long.`);
   return text;
-}
-
-export async function studentIdentityMatches(studentId: string, lastName: unknown): Promise<boolean> {
-  if (!/^[A-Za-z0-9-]{4,36}$/.test(studentId)) return false;
-  const details = await withTransaction((client) => getCurrentStudentDetails(client, studentId));
-  return details.exists && verifiedLastName(details.name, lastName);
 }
 
 export async function createAttendanceRequest(input: AttendanceRequestInput) {
@@ -482,8 +466,7 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
   return withTransaction(async (client) => {
     await client.query("SELECT pg_advisory_xact_lock(hashtext(LOWER(TRIM($1))))", [studentId]);
     const identity = await getCurrentStudentDetails(client, studentId);
-    if (!identity.exists ||
-        (requestType === "details_correction" && !verifiedLastName(identity.name, input.lastName))) {
+    if (!identity.exists) {
       throw createHttpError("Invalid student information.", 404);
     }
     const schoolYearId = inputSchoolYearId || (await getActiveSchoolYearId(client));
