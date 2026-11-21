@@ -3873,8 +3873,17 @@ async function saveAttendanceRowsWithClient(
  */
 async function finalizeCommittedAttendanceImports(
   imports: SavedAttendanceImportResult[],
+  onProgress?: AttendanceImportProgressCallback,
 ): Promise<string[]> {
   if (!imports.length) return [];
+  // The imported rows have already committed. Report recalculation separately:
+  // reaching the last file is not the same as completing the whole import.
+  const savedRecords = imports.reduce((count, item) => count + item.savedRecords.length, 0);
+  const reportSync = (percent: number, message: string) => emitAttendanceImportProgress(onProgress, {
+    stage: "syncing", percent, message,
+    processedRows: savedRecords, totalRows: savedRecords, savedRecords,
+    createdFines: imports.reduce((count, item) => count + item.createdFines.length, 0),
+  });
   try {
     await withTransaction(async (client) => {
       // Full-year recalculation can be significantly slower than row inserts.
@@ -3887,7 +3896,8 @@ async function finalizeCommittedAttendanceImports(
 
       const schoolYears = new Set<string | null>();
       const importSchoolYears = new Map<string, string | null>();
-      for (const imported of imports) {
+      for (const [index, imported] of imports.entries()) {
+        await reportSync(94, `Synchronizing absences and fines (${index + 1} of ${imports.length} imports)...`);
         const result = await client.query<{ school_year_id: string | null }>(
           "SELECT school_year_id FROM attendance_imports WHERE id = $1 AND deleted_at IS NULL",
           [imported.importId],
@@ -3904,11 +3914,15 @@ async function finalizeCommittedAttendanceImports(
       // Refresh each affected school year once, even with multiple files.
       for (const schoolYearId of schoolYears) {
         const scope = schoolYearId ?? undefined;
+        await reportSync(95, "Rebuilding final attendance results for the affected school year...");
         await refreshAttendanceFinalResultsWithClient(client, { schoolYearId: scope });
+        await reportSync(96, "Updating attendance calculations...");
         await refreshCalculationResultsWithClient(client, { schoolYearId: scope });
+        await reportSync(97, "Updating penalty and fine results...");
         await refreshPenaltyResultsForSchoolYearWithClient(client, scope);
       }
 
+      await reportSync(98, "Verifying saved attendance and calculation results...");
       for (const imported of imports) {
         const studentKeys = Array.from(new Set(imported.savedRecords
           .map((record) => cleanText(record.student_id).toLowerCase()).filter(Boolean)));
@@ -3922,6 +3936,7 @@ async function finalizeCommittedAttendanceImports(
         imported.reconciliation.stageCounts.distinctFinalResults = Number(counts.rows[0]?.count ?? 0);
       }
     });
+    await reportSync(99, "Attendance and final results synchronized. Finishing import...");
     return [];
   } catch (error) {
     console.error("Attendance rows committed, but derived attendance refresh failed:", error);
@@ -3949,7 +3964,7 @@ export async function saveAttendanceRows(
   const result = await withTransaction((client) =>
     saveAttendanceRowsWithClient(client, { ...prepared.input, deferDerivedRefresh: true }, prepared.preview),
   );
-  const syncWarnings = await finalizeCommittedAttendanceImports([result]);
+  const syncWarnings = await finalizeCommittedAttendanceImports([result], input.onProgress);
 
   await emitAttendanceImportProgress(input.onProgress, {
     stage: "completed",
@@ -4186,12 +4201,17 @@ export async function saveAttendanceFiles(
           isCancelled: option.isCancelled,
           onProgress: onProgress
             ? async (progress) => {
-                const percent = Math.round(
-                  ((index + progress.percent / 100) / files.length) * 100,
-                );
+                // Each file may finish its rows before the transaction commits
+                // and before the expensive final-results rebuild begins.
+                // Reserve 90-100% for commit, derived sync and confirmation.
+                const percent = Math.min(89, Math.round(
+                  12 + ((index + progress.percent / 100) / files.length) * 77,
+                ));
                 await onProgress({
                   ...progress,
+                  stage: "saving",
                   percent,
+                  savedRecords: savedFiles.reduce((total, item) => total + (item.result?.savedRecords.length ?? 0), 0) + progress.savedRecords,
                   message: `${file.originalname}: ${progress.message}`,
                 });
               }
@@ -4223,7 +4243,7 @@ export async function saveAttendanceFiles(
         });
         await emitAttendanceImportProgress(onProgress, {
           stage: "saving",
-          percent: Math.round(((index + 1) / files.length) * 100),
+          percent: Math.min(89, Math.round(12 + ((index + 1) / files.length) * 77)),
           message: `${file.originalname}: skipped ${error.exemptedCount} event-exempted attendee row(s); no attendance saved for this file.`,
           processedRows: error.exemptedCount,
           totalRows: error.exemptedCount,
@@ -4232,6 +4252,11 @@ export async function saveAttendanceFiles(
       }
     }
 
+    await emitAttendanceImportProgress(onProgress, {
+      stage: "saving", percent: 90,
+      message: "All workbooks processed. Committing saved attendance records...",
+      savedRecords: savedFiles.reduce((total, item) => total + (item.result?.savedRecords.length ?? 0), 0),
+    });
     return {
       files: savedFiles,
       filesSaved: savedFiles.filter((item) => item.status === "saved").length,
@@ -4247,9 +4272,24 @@ export async function saveAttendanceFiles(
       ),
     };
   });
+  await emitAttendanceImportProgress(onProgress, {
+    stage: "syncing", percent: 92,
+    message: "Attendance records committed. Updating final results and fines...",
+    savedRecords: batch.recordsSaved,
+  });
   const syncWarnings = await finalizeCommittedAttendanceImports(
-    batch.files.flatMap((file) => file.result ? [file.result] : []),
+    batch.files.flatMap((file) => file.result ? [file.result] : []), onProgress,
   );
+  await emitAttendanceImportProgress(onProgress, {
+    stage: "completed", percent: 100,
+    message: syncWarnings.length
+      ? "Attendance saved, but final results require a manual refresh."
+      : "Attendance files, final results and fines saved successfully.",
+    processedRows: batch.recordsSaved,
+    totalRows: batch.recordsSaved,
+    savedRecords: batch.recordsSaved,
+    createdFines: batch.files.reduce((total, file) => total + (file.result?.createdFines.length ?? 0), 0),
+  });
   return {
     ...batch,
     finesCreated: batch.files.reduce((total, file) => total + (file.result?.createdFines.length ?? 0), 0),
