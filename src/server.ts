@@ -182,6 +182,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   if (allowed) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Expose-Headers", "Retry-After");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-Penalyze-Request");
@@ -237,9 +238,19 @@ app.get(
 );
 
 
+// Student record lookups are often performed from shared school networks. Keep
+// a generous network-wide ceiling while limiting repeated checks of one ID.
+const publicStudentRecordIdentity = (req: Request) =>
+  `${clientIp(req)}:${String(req.body?.studentId ?? "").trim().toLowerCase()}`;
+const publicStudentRecordsRateLimit = limits(
+  ["student-records:ip-student:minute", 6, 60, publicStudentRecordIdentity],
+  ["student-records:ip-student:day", 100, 86400, publicStudentRecordIdentity],
+  ["student-records:ip:minute", 60, 60, clientIp],
+  ["student-records:ip:day", 3000, 86400, clientIp],
+);
 const publicStudentStatusRateLimit = limits(
-  ["student-status:minute", 10, 60, clientIp],
-  ["student-status:day", 50, 86400, clientIp],
+  ["student-status:minute", 30, 60, clientIp],
+  ["student-status:day", 600, 86400, clientIp],
 );
 const publicRequestRateLimit = limits(
   ["requests:ip", 5, 3600, clientIp],
@@ -285,7 +296,7 @@ app.delete("/api/school-years/:id", requireAuth, requireAdmin, deleteSchoolYear)
 
 
 app.post("/api/attendance/requests", publicRequestRateLimit, createAttendanceRequest);
-app.post("/api/public/student-records", publicStudentStatusRateLimit, publicStudentRecords);
+app.post("/api/public/student-records", publicStudentRecordsRateLimit, publicStudentRecords);
 app.post("/api/attendance/requests/student-status", publicStudentStatusRateLimit, publicAttendanceStudentRequests);
 app.post("/api/attendance/requests/student-lookup", publicStudentStatusRateLimit, publicAttendanceStudentLookup);
 app.get("/api/attendance/requests", requireAuth, requireAdmin, attendanceRequests);
