@@ -111,6 +111,7 @@ export const attendanceUpload = multer({
       statusCode?: number;
     };
     error.statusCode = 400;
+    (error as Error & { expose?: boolean }).expose = true;
     callback(error);
   },
 });
@@ -829,8 +830,8 @@ export async function previewImport(
       return;
     }
 
-    const previews = await previewAttendanceFiles(files, getEventPayload(req).college);
-    res.json({ message: "Files read successfully.", data: previews });
+    const previews = await previewAttendanceFiles(files, getEventPayload(req).college, undefined, true);
+    res.json({ message: "Attendance preview completed.", data: previews });
   } catch (error) {
     next(error);
   }

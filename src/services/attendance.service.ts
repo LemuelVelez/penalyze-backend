@@ -1434,6 +1434,7 @@ export function mergeAttendanceImportRowsByStudentAndEvent(
 function createValidationError(message: string, statusCode = 400) {
   const error = new Error(message);
   (error as any).statusCode = statusCode;
+  (error as any).expose = true;
   return error;
 }
 
@@ -3138,7 +3139,7 @@ export async function previewAttendanceFileBase(
 
   if (!preview.rowsValid) {
     throw createValidationError(
-      "No parseable attendance rows were found in the uploaded attendance file.",
+      `No valid attendance rows found in "${file.originalname}". Check that the workbook has student IDs and attendance columns.`,
     );
   }
 
@@ -3372,26 +3373,40 @@ export async function previewAttendanceFiles(
   files: UploadedAttendanceFile[],
   college?: string | (string | undefined)[],
   rowCollegeOverrides?: Record<string, string>[],
+  tolerateInvalidFiles = false,
 ): Promise<AttendancePreviewResult[]> {
   const selectedColleges = Array.isArray(college) ? college : files.map(() => college);
-  const previews = (await Promise.all(files.map(previewAttendanceFileBase))).map(
-    (preview, index) => scopeAttendancePreviewToCollege(
-      preview, selectedColleges[index], rowCollegeOverrides?.[index] ?? {},
-    ),
-  );
+  const previews = await Promise.all(files.map(async (file, index) => {
+    try {
+      const preview = await previewAttendanceFileBase(file);
+      return scopeAttendancePreviewToCollege(
+        preview, selectedColleges[index], rowCollegeOverrides?.[index] ?? {},
+      );
+    } catch (error) {
+      // The review screen must show which workbook is unusable while keeping
+      // valid previews visible. Saving still uses strict, fail-fast validation.
+      if (!tolerateInvalidFiles || !(error instanceof Error) ||
+          (error as Error & { statusCode?: number }).statusCode !== 400) throw error;
+      return {
+        ...buildPreview(file.originalname, file.originalname.split('.').pop() || 'unknown', []),
+        previewError: error.message,
+      };
+    }
+  }));
   const schoolYearIds = await Promise.all(
-    previews.map(findSchoolYearIdForAttendancePreview),
+    previews.map((preview) => preview.previewError ? Promise.resolve("") : findSchoolYearIdForAttendancePreview(preview)),
   );
 
   await Promise.all(
     previews.map(async (preview, index) => {
+      if (preview.previewError) return;
       const existingCandidates = await rankAttendanceEventCandidates({
         metadata: preview.detectedEvent,
         schoolYearId: schoolYearIds[index] || undefined,
       });
       const batchCandidates = previews
         .map((candidatePreview, candidateIndex) => {
-          if (candidateIndex === index) return null;
+          if (candidateIndex === index || candidatePreview.previewError) return null;
           const currentSchoolYearId = schoolYearIds[index];
           const candidateSchoolYearId = schoolYearIds[candidateIndex];
           if (

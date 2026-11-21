@@ -398,6 +398,7 @@ export type AttendanceDetectedEventMetadata = {
 };
 
 export type AttendancePreviewResult = {
+  previewError?: string;
   fileName: string;
   fileType: string;
   rowsTotal: number;

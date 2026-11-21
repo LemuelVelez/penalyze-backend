@@ -531,7 +531,15 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     message: safeStatus === 400 ? "Invalid request." : safeStatus === 404 ? "Resource not found." : "Request failed.",
     requestId,
   };
-  if (safeStatus < 500 && raw?.expose === true && !raw?.code) response.message = raw.message || response.message;
+  if (error instanceof multer.MulterError) {
+    response.message = error.code === "LIMIT_FILE_SIZE"
+      ? "Attendance file exceeds the 5 MB upload limit."
+      : error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE"
+        ? "Select at most 10 attendance files in one import."
+        : "Invalid attendance upload.";
+  } else if (safeStatus < 500 && raw?.expose === true && !raw?.code) {
+    response.message = raw.message || response.message;
+  }
   // Internal stacks belong exclusively in server-side logs. Never send them to clients.
   res.status(safeStatus).json(response);
 });
