@@ -1438,6 +1438,26 @@ function createValidationError(message: string, statusCode = 400) {
   return error;
 }
 
+/** An entirely exempt file has no attendance to import. It is a normal
+ * per-file review outcome, not a reason to roll back other valid files. */
+class AllAttendanceRowsExemptError extends Error {
+  readonly statusCode = 409;
+  readonly expose = true;
+  readonly exemptedCount: number;
+
+  constructor(fileName: string, excluded: AttendanceImportReconciliation["rowsExempted"]) {
+    const reasons = Array.from(new Set(excluded.map((row) => `${row.eventName}: ${row.reason}`)));
+    const details = reasons.slice(0, 3).join("; ");
+    super(
+      `All ${excluded.length} attendee row(s) in "${fileName}" were excluded by event exemptions. ` +
+      `No attendance was saved. ${details}${reasons.length > 3 ? "; additional event exemptions apply" : ""}. ` +
+      `Review the selected event and its college/year-level exemptions before retrying.`,
+    );
+    this.name = "AllAttendanceRowsExemptError";
+    this.exemptedCount = excluded.length;
+  }
+}
+
 function parseAttendanceDateTime(text: string) {
   // ISO timestamps with Z/offsets and Unix epochs already represent an instant.
   // CSV, spreadsheet and datetime-local values without a timezone are Manila time.
@@ -3764,10 +3784,7 @@ async function saveAttendanceRowsWithClient(
   }
 
   if (!savedRecordIds.length && rowsExempted.length) {
-    throw createValidationError(
-      `No eligible attendance records remain in "${preview.fileName}" after excluding ${rowsExempted.length} event-exempted attendee row(s). No attendance was saved.`,
-      400,
-    );
+    throw new AllAttendanceRowsExemptError(preview.fileName, rowsExempted);
   }
 
   assertAttendanceImportNotCancelled(input);
@@ -3960,11 +3977,13 @@ export type AttendanceFileSaveOption = Omit<
 export type AttendanceBatchSaveResult = {
   files: Array<{
     fileName: string;
-    status: "saved";
-    error: null;
-    result: SavedAttendanceImportResult;
+    status: "saved" | "skipped_exempt";
+    error: string | null;
+    result: SavedAttendanceImportResult | null;
+    exemptedRows: number;
   }>;
   filesSaved: number;
+  filesSkipped: number;
   filesFailed: number;
   recordsSaved: number;
   finesCreated: number;
@@ -4092,120 +4111,148 @@ export async function saveAttendanceFiles(
     const savedFiles: AttendanceBatchSaveResult["files"] = [];
 
     for (const [index, file] of files.entries()) {
-      const preview = previews[index];
-      const option = options[index];
-      const detectedSchoolYearId =
-        cleanText(option.schoolYearId) ||
-        (await findSchoolYearIdForAttendancePreview(preview));
-      const earlierBatchEvent = Number.isInteger(option.mergeIntoBatchIndex)
-        ? savedEvents.get(Number(option.mergeIntoBatchIndex)) ?? null
-        : null;
+      // A skipped workbook must not leave behind an empty attendance_import or
+      // a newly created event; preserve earlier files in this batch.
+      const savepoint = `attendance_file_${index}`;
+      await client.query(`SAVEPOINT ${savepoint}`);
+      try {
+        const preview = previews[index];
+        const option = options[index];
+        const detectedSchoolYearId =
+          cleanText(option.schoolYearId) ||
+          (await findSchoolYearIdForAttendancePreview(preview));
+        const earlierBatchEvent = Number.isInteger(option.mergeIntoBatchIndex)
+          ? savedEvents.get(Number(option.mergeIntoBatchIndex)) ?? null
+          : null;
 
-      if (Number.isInteger(option.mergeIntoBatchIndex) && !earlierBatchEvent) {
-        throw createValidationError(
-          `The merge target for "${file.originalname}" must be an earlier file in the same batch.`,
-        );
-      }
-
-      let selectedEvent: AttendanceEventRecord | null = null;
-      if (option.rowEventsReviewed) {
-        // Each row has an explicit, reviewed event assignment instead.
-      } else if (cleanText(option.mergeIntoEventId)) {
-        selectedEvent = await getAttendanceEventById(
-          client,
-          cleanText(option.mergeIntoEventId),
-        );
-        if (!selectedEvent) {
-          throw createValidationError("Selected merge event was not found.", 404);
+        if (Number.isInteger(option.mergeIntoBatchIndex) && !earlierBatchEvent) {
+          throw createValidationError(
+            `The merge target for "${file.originalname}" must be an earlier file in the same batch.`,
+          );
         }
-      } else if (earlierBatchEvent) {
-        selectedEvent = earlierBatchEvent;
-      } else if (cleanText(option.eventId)) {
-        selectedEvent = await getAttendanceEventById(client, cleanText(option.eventId));
-        if (!selectedEvent) {
-          throw createValidationError("Selected attendance event was not found.", 404);
+
+        let selectedEvent: AttendanceEventRecord | null = null;
+        if (option.rowEventsReviewed) {
+          // Each row has an explicit, reviewed event assignment instead.
+        } else if (cleanText(option.mergeIntoEventId)) {
+          selectedEvent = await getAttendanceEventById(
+            client,
+            cleanText(option.mergeIntoEventId),
+          );
+          if (!selectedEvent) {
+            throw createValidationError("Selected merge event was not found.", 404);
+          }
+        } else if (earlierBatchEvent) {
+          selectedEvent = earlierBatchEvent;
+        } else if (cleanText(option.eventId)) {
+          selectedEvent = await getAttendanceEventById(client, cleanText(option.eventId));
+          if (!selectedEvent) {
+            throw createValidationError("Selected attendance event was not found.", 404);
+          }
         }
-      }
 
-      if (selectedEvent) {
-        selectedEvent = await applyAttendanceMergeMetadataChoice(
-          client,
-          selectedEvent,
-          preview,
-          option,
+        if (selectedEvent) {
+          selectedEvent = await applyAttendanceMergeMetadataChoice(
+            client,
+            selectedEvent,
+            preview,
+            option,
+          );
+        }
+
+        const input: SaveRowsInput = {
+          ...option,
+          uploadedBy: option.uploadedBy,
+          schoolYearId:
+            (selectedEvent?.school_year_id ?? detectedSchoolYearId) || undefined,
+          eventId: option.rowEventsReviewed ? undefined : selectedEvent?.id || undefined,
+          eventName: option.rowEventsReviewed ? undefined :
+            selectedEvent?.name ||
+            cleanText(option.eventName) ||
+            cleanText(preview.detectedEvent.eventName) ||
+            getFileNameWithoutExtension(file.originalname),
+          eventStartAt:
+            selectedEvent?.event_start_at
+              ? cleanText(selectedEvent.event_start_at)
+              : option.eventStartAt || preview.detectedEvent.eventStartAt || undefined,
+          eventEndAt:
+            selectedEvent?.event_end_at
+              ? cleanText(selectedEvent.event_end_at)
+              : option.eventEndAt || preview.detectedEvent.eventEndAt || undefined,
+          forceCreateEvent: Boolean(option.forceCreateEvent && !selectedEvent && !option.rowEventsReviewed),
+          fileName: preview.fileName,
+          fileType: preview.fileType,
+          rows: preview.rows,
+          isCancelled: option.isCancelled,
+          onProgress: onProgress
+            ? async (progress) => {
+                const percent = Math.round(
+                  ((index + progress.percent / 100) / files.length) * 100,
+                );
+                await onProgress({
+                  ...progress,
+                  percent,
+                  message: `${file.originalname}: ${progress.message}`,
+                });
+              }
+            : undefined,
+        };
+
+        const result = await saveAttendanceRowsWithClient(
+          client, { ...input, deferDerivedRefresh: true }, preview,
         );
+        if (result.event) savedEvents.set(index, result.event);
+        savedFiles.push({
+          fileName: file.originalname,
+          status: "saved",
+          error: null,
+          result,
+          exemptedRows: result.reconciliation.rowsExempted.length,
+        });
+        await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      } catch (error) {
+        if (!(error instanceof AllAttendanceRowsExemptError)) throw error;
+        await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+        savedFiles.push({
+          fileName: file.originalname,
+          status: "skipped_exempt",
+          error: error.message,
+          result: null,
+          exemptedRows: error.exemptedCount,
+        });
+        await emitAttendanceImportProgress(onProgress, {
+          stage: "saving",
+          percent: Math.round(((index + 1) / files.length) * 100),
+          message: `${file.originalname}: skipped ${error.exemptedCount} event-exempted attendee row(s); no attendance saved for this file.`,
+          processedRows: error.exemptedCount,
+          totalRows: error.exemptedCount,
+          savedRecords: savedFiles.reduce((total, item) => total + (item.result?.savedRecords.length ?? 0), 0),
+        });
       }
-
-      const input: SaveRowsInput = {
-        ...option,
-        uploadedBy: option.uploadedBy,
-        schoolYearId:
-          (selectedEvent?.school_year_id ?? detectedSchoolYearId) || undefined,
-        eventId: option.rowEventsReviewed ? undefined : selectedEvent?.id || undefined,
-        eventName: option.rowEventsReviewed ? undefined :
-          selectedEvent?.name ||
-          cleanText(option.eventName) ||
-          cleanText(preview.detectedEvent.eventName) ||
-          getFileNameWithoutExtension(file.originalname),
-        eventStartAt:
-          selectedEvent?.event_start_at
-            ? cleanText(selectedEvent.event_start_at)
-            : option.eventStartAt || preview.detectedEvent.eventStartAt || undefined,
-        eventEndAt:
-          selectedEvent?.event_end_at
-            ? cleanText(selectedEvent.event_end_at)
-            : option.eventEndAt || preview.detectedEvent.eventEndAt || undefined,
-        forceCreateEvent: Boolean(option.forceCreateEvent && !selectedEvent && !option.rowEventsReviewed),
-        fileName: preview.fileName,
-        fileType: preview.fileType,
-        rows: preview.rows,
-        isCancelled: option.isCancelled,
-        onProgress: onProgress
-          ? async (progress) => {
-              const percent = Math.round(
-                ((index + progress.percent / 100) / files.length) * 100,
-              );
-              await onProgress({
-                ...progress,
-                percent,
-                message: `${file.originalname}: ${progress.message}`,
-              });
-            }
-          : undefined,
-      };
-
-      const result = await saveAttendanceRowsWithClient(
-        client, { ...input, deferDerivedRefresh: true }, preview,
-      );
-      if (result.event) savedEvents.set(index, result.event);
-      savedFiles.push({
-        fileName: file.originalname,
-        status: "saved",
-        error: null,
-        result,
-      });
     }
 
     return {
       files: savedFiles,
-      filesSaved: savedFiles.length,
+      filesSaved: savedFiles.filter((item) => item.status === "saved").length,
+      filesSkipped: savedFiles.filter((item) => item.status === "skipped_exempt").length,
       filesFailed: 0,
       recordsSaved: savedFiles.reduce(
-        (total, item) => total + item.result.savedRecords.length,
+        (total, item) => total + (item.result?.savedRecords.length ?? 0),
         0,
       ),
       finesCreated: savedFiles.reduce(
-        (total, item) => total + item.result.createdFines.length,
+        (total, item) => total + (item.result?.createdFines.length ?? 0),
         0,
       ),
     };
   });
   const syncWarnings = await finalizeCommittedAttendanceImports(
-    batch.files.map((file) => file.result),
+    batch.files.flatMap((file) => file.result ? [file.result] : []),
   );
   return {
     ...batch,
-    finesCreated: batch.files.reduce((total, file) => total + file.result.createdFines.length, 0),
+    finesCreated: batch.files.reduce((total, file) => total + (file.result?.createdFines.length ?? 0), 0),
     syncWarnings,
   };
 }
@@ -4220,7 +4267,11 @@ export async function saveAttendanceFile(
     [{ ...options, index: 0, fileName: file.originalname }],
     onProgress ?? options.onProgress,
   );
-  return batch.files[0].result;
+  const first = batch.files[0];
+  if (first.status !== "saved" || !first.result) {
+    throw createValidationError(first.error || "No attendance records were imported.", 409);
+  }
+  return first.result;
 }
 
 function getManualAttendanceType(input: RawImportRow) {
