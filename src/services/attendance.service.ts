@@ -8291,6 +8291,17 @@ function getCalculationScopeIncludesSourceSql(
   )`;
 }
 
+function getManualCalculationRecordEligibilitySql(alias: string) {
+  return `(
+    ${alias}.event_id IS NULL
+    OR ${getEventStudentExemptionFilterSql(
+      `${alias}.event_id`,
+      getResolvedStudentYearLevelKeySql(`${alias}.student_id`, `${alias}.school_year_id`),
+      getCanonicalCollegeKeySql(alias),
+    )}
+  )`;
+}
+
 function getCalculationScopeCoversAllImportsSql(alias: string) {
   return `(
     ${alias}.calculation_scope_key = 'school_year'
@@ -8355,6 +8366,7 @@ export async function getCalculationPendingSummary(
                   WHERE mar.school_year_id IS NOT DISTINCT FROM cic.school_year_id
                     AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
                     AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($2::text)
+                    AND ${getManualCalculationRecordEligibilitySql("mar")}
                 )
                 OR EXISTS (
                   SELECT 1
@@ -8456,6 +8468,7 @@ export async function getCalculationPendingSummary(
             WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
               AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
               AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($2::text)
+              AND ${getManualCalculationRecordEligibilitySql("mar")}
           ) manual_year
           WHERE NOT EXISTS (
             SELECT 1
@@ -8520,7 +8533,13 @@ export async function getCalculationPendingSummary(
             SELECT 1
             FROM calculation_results cr
             WHERE cr.school_year_id IS NOT DISTINCT FROM ai.school_year_id
-              AND ai.id = ANY(cr.import_ids)
+              AND (
+                ai.id = ANY(cr.import_ids)
+                OR (
+                  ${getCalculationScopeIncludesSourceSql("cr", "imported")}
+                  AND ${getCalculationScopeCoversAllImportsSql("cr")}
+                )
+              )
           )
         )
       ORDER BY ai.created_at, ai.id
@@ -8689,7 +8708,14 @@ export async function getCalculationStatus(
     latest_dependency_change_at: Date | string | null;
   }>(
     `
-      WITH selected_imported_records AS (
+      WITH canonical_students AS (
+        SELECT DISTINCT ON (LOWER(TRIM(student_id)))
+          id, student_id, name, year_level, college, program, institution,
+          created_at, updated_at
+        FROM students
+        WHERE NULLIF(TRIM(student_id), '') IS NOT NULL
+        ORDER BY LOWER(TRIM(student_id)), updated_at DESC, created_at DESC, id DESC
+      ), ${getYearLevelResolutionCtesSql()}, selected_imported_records AS (
         SELECT
           ar.school_year_id,
           ar.id,
@@ -8716,12 +8742,25 @@ export async function getCalculationStatus(
           LOWER(TRIM(mar.student_id)) AS normalized_student_id,
           mar.updated_at
         FROM manual_attendance_records mar
+        LEFT JOIN canonical_students selected_manual_student
+          ON LOWER(TRIM(selected_manual_student.student_id)) = LOWER(TRIM(mar.student_id))
+        LEFT JOIN calculation_resolved_year_levels selected_manual_year_level
+          ON selected_manual_year_level.school_year_id IS NOT DISTINCT FROM mar.school_year_id
+         AND selected_manual_year_level.normalized_student_id = LOWER(TRIM(mar.student_id))
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
           AND (
             (
               $6::BOOLEAN
               AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
               AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($4::TEXT)
+              AND (
+                mar.event_id IS NULL
+                OR ${getEventStudentExemptionFilterSql(
+                  "mar.event_id",
+                  "selected_manual_year_level.year_level_key",
+                  getCanonicalCollegeKeySql("mar", "selected_manual_student"),
+                )}
+              )
             )
             OR (
               $7::BOOLEAN
