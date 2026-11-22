@@ -8277,52 +8277,78 @@ function getCalculationScopeCoversAllImportsSql(alias: string) {
   )`;
 }
 
-function getCalculationChangeCoveredByResultSql(
-  changeAlias: string,
-  resultAlias: string,
-  requireFullDependencyScope = true,
+function getCalculationImportCoveredByScopeSql(
+  importIdSql: string,
+  schoolYearIdSql: string,
+  scopeAlias: string,
 ) {
-  const importedScope = getCalculationScopeIncludesSourceSql(resultAlias, "imported");
-  const allImports = getCalculationScopeCoversAllImportsSql(resultAlias);
+  const scopeKey = `${scopeAlias}.calculation_scope_key`;
+  const importSelection = `split_part(${scopeKey}, '|', 2)`;
+
+  return `(
+    ${getCalculationScopeIncludesSourceSql(scopeAlias, "imported")}
+    AND (
+      ${getCalculationScopeCoversAllImportsSql(scopeAlias)}
+      OR ${importIdSql}::TEXT = ANY(
+        string_to_array(split_part(${importSelection}, ':', 2), ',')
+      )
+      OR (
+        ${importSelection} LIKE 'imports:sha256:%'
+        AND EXISTS (
+          SELECT 1
+          FROM calculation_results scope_import
+          WHERE scope_import.school_year_id IS NOT DISTINCT FROM ${schoolYearIdSql}
+            AND scope_import.calculation_scope_key = ${scopeKey}
+            AND ${importIdSql} = ANY(scope_import.import_ids)
+        )
+      )
+    )
+  )`;
+}
+
+function getCalculationChangeCoveredByScopeSql(
+  changeAlias: string,
+  scopeAlias: string,
+) {
+  const allImports = getCalculationScopeCoversAllImportsSql(scopeAlias);
   const allSources = CALCULATION_SOURCE_TYPE_ORDER.map((sourceType) =>
-    getCalculationScopeIncludesSourceSql(resultAlias, sourceType),
+    getCalculationScopeIncludesSourceSql(scopeAlias, sourceType),
   ).join(" AND ");
 
   return `(
     (
       ${changeAlias}.source_kind = 'imported'
-      AND ${importedScope}
       AND (
-        (${changeAlias}.source_id IS NULL AND ${allImports})
+        (
+          ${changeAlias}.source_id IS NULL
+          AND ${getCalculationScopeIncludesSourceSql(scopeAlias, "imported")}
+          AND ${allImports}
+        )
         OR (
           ${changeAlias}.source_id IS NOT NULL
-          AND (
-            ${changeAlias}.source_id = ANY(${resultAlias}.import_ids)
-            OR ${changeAlias}.source_id::TEXT = ANY(
-              string_to_array(
-                split_part(split_part(${resultAlias}.calculation_scope_key, '|', 2), ':', 2),
-                ','
-              )
-            )
-            OR ${allImports}
-          )
+          AND ${getCalculationImportCoveredByScopeSql(
+            `${changeAlias}.source_id`,
+            `${changeAlias}.school_year_id`,
+            scopeAlias,
+          )}
         )
       )
     )
     OR (
       ${changeAlias}.source_kind = 'manual'
-      AND ${getCalculationScopeIncludesSourceSql(resultAlias, "manual")}
+      AND ${getCalculationScopeIncludesSourceSql(scopeAlias, "manual")}
     )
     OR (
       ${changeAlias}.source_kind = 'zero_attendance'
-      AND ${getCalculationScopeIncludesSourceSql(resultAlias, "zero_attendance")}
+      AND ${getCalculationScopeIncludesSourceSql(scopeAlias, "zero_attendance")}
     )
     OR (
       ${changeAlias}.source_kind IN (
         'events', 'college_exemptions', 'year_level_exemptions',
         'penalties', 'students'
       )
-      ${requireFullDependencyScope ? `AND ${allSources} AND ${allImports}` : ""}
+      AND ${allSources}
+      AND ${allImports}
     )
   )`;
 }
@@ -8344,7 +8370,17 @@ export async function getCalculationPendingSummary(
     zero_missing_scope: boolean;
   }>(
     `
-      WITH relevant_changes AS (
+      WITH saved_scopes AS MATERIALIZED (
+        -- One timestamp per saved scope avoids rechecking every student's
+        -- calculation_results row for every tracked input change.
+        SELECT
+          cr.school_year_id,
+          cr.calculation_scope_key,
+          MAX(cr.calculated_at) AS calculated_at
+        FROM calculation_results cr
+        WHERE ($1::uuid IS NULL OR cr.school_year_id = $1::uuid)
+        GROUP BY cr.school_year_id, cr.calculation_scope_key
+      ), relevant_changes AS (
         SELECT cic.*
         FROM calculation_input_changes cic
         WHERE ($1::uuid IS NULL OR cic.school_year_id = $1::uuid)
@@ -8353,10 +8389,11 @@ export async function getCalculationPendingSummary(
         FROM relevant_changes cic
         WHERE cic.changed_at > COALESCE(cic.acknowledged_at, '-infinity'::timestamptz)
           AND NOT EXISTS (
-            SELECT 1 FROM calculation_results cr
-            WHERE cr.school_year_id IS NOT DISTINCT FROM cic.school_year_id
-              AND cr.calculated_at >= cic.changed_at
-              AND ${getCalculationChangeCoveredByResultSql("cic", "cr")}
+            SELECT 1
+            FROM saved_scopes saved_scope
+            WHERE saved_scope.school_year_id IS NOT DISTINCT FROM cic.school_year_id
+              AND saved_scope.calculated_at >= cic.changed_at
+              AND ${getCalculationChangeCoveredByScopeSql("cic", "saved_scope")}
           )
           AND (
             (
@@ -8534,6 +8571,15 @@ export async function getCalculationPendingSummary(
     file_name: string;
   }>(
     `
+      WITH saved_scopes AS MATERIALIZED (
+        SELECT
+          cr.school_year_id,
+          cr.calculation_scope_key,
+          MAX(cr.calculated_at) AS calculated_at
+        FROM calculation_results cr
+        WHERE ($1::uuid IS NULL OR cr.school_year_id = $1::uuid)
+        GROUP BY cr.school_year_id, cr.calculation_scope_key
+      )
       SELECT ai.id, ai.file_name
       FROM attendance_imports ai
       WHERE ai.deleted_at IS NULL
@@ -8553,27 +8599,22 @@ export async function getCalculationPendingSummary(
               AND cic.source_id = ai.id
               AND cic.changed_at > COALESCE(cic.acknowledged_at, '-infinity'::timestamptz)
               AND NOT EXISTS (
-                SELECT 1 FROM calculation_results cr
-                WHERE cr.school_year_id IS NOT DISTINCT FROM cic.school_year_id
-                  AND cr.calculated_at >= cic.changed_at
-                  AND ${getCalculationChangeCoveredByResultSql("cic", "cr")}
+                SELECT 1
+                FROM saved_scopes saved_scope
+                WHERE saved_scope.school_year_id IS NOT DISTINCT FROM cic.school_year_id
+                  AND saved_scope.calculated_at >= cic.changed_at
+                  AND ${getCalculationChangeCoveredByScopeSql("cic", "saved_scope")}
               )
           )
           OR NOT EXISTS (
             SELECT 1
-            FROM calculation_results cr
-            WHERE cr.school_year_id IS NOT DISTINCT FROM ai.school_year_id
-              AND ${getCalculationScopeIncludesSourceSql("cr", "imported")}
-              AND (
-                ai.id = ANY(cr.import_ids)
-                OR ai.id::TEXT = ANY(
-                  string_to_array(
-                    split_part(split_part(cr.calculation_scope_key, '|', 2), ':', 2),
-                    ','
-                  )
-                )
-                OR ${getCalculationScopeCoversAllImportsSql("cr")}
-              )
+            FROM saved_scopes saved_scope
+            WHERE saved_scope.school_year_id IS NOT DISTINCT FROM ai.school_year_id
+              AND ${getCalculationImportCoveredByScopeSql(
+                "ai.id",
+                "ai.school_year_id",
+                "saved_scope",
+              )}
           )
         )
       ORDER BY ai.created_at, ai.id
@@ -8851,26 +8892,14 @@ export async function getCalculationStatus(
                 OR (cic.source_kind = 'manual' AND $6::BOOLEAN)
                 OR (cic.source_kind = 'zero_attendance' AND $7::BOOLEAN)
               )
-              AND NOT EXISTS (
-                SELECT 1 FROM calculation_results covered_cr
-                WHERE covered_cr.school_year_id IS NOT DISTINCT FROM cic.school_year_id
-                  AND covered_cr.calculation_scope_key = $3::TEXT
-                  AND covered_cr.calculated_at >= cic.changed_at
-                  AND ${getCalculationChangeCoveredByResultSql("cic", "covered_cr", false)}
-              )
+              AND cic.changed_at > COALESCE(cic.acknowledged_at, '-infinity'::timestamptz)
           ) AS latest_tracked_source_change_at,
           MAX(cic.changed_at) FILTER (
             WHERE cic.source_kind IN (
               'events', 'college_exemptions', 'year_level_exemptions',
               'penalties', 'students'
             )
-              AND NOT EXISTS (
-                SELECT 1 FROM calculation_results covered_cr
-                WHERE covered_cr.school_year_id IS NOT DISTINCT FROM cic.school_year_id
-                  AND covered_cr.calculation_scope_key = $3::TEXT
-                  AND covered_cr.calculated_at >= cic.changed_at
-                  AND ${getCalculationChangeCoveredByResultSql("cic", "covered_cr", false)}
-              )
+              AND cic.changed_at > COALESCE(cic.acknowledged_at, '-infinity'::timestamptz)
           ) AS latest_dependency_change_at
         FROM calculation_input_changes cic
         WHERE ($1::uuid IS NULL OR cic.school_year_id = $1::uuid)
@@ -8888,10 +8917,18 @@ export async function getCalculationStatus(
           (
             tracked_changes.latest_tracked_source_change_at IS NOT NULL
             AND (current_stats.source_record_count > 0 OR saved_stats.saved_result_count > 0)
+            AND (
+              saved_stats.last_calculated_at IS NULL
+              OR tracked_changes.latest_tracked_source_change_at > saved_stats.last_calculated_at
+            )
           )
           OR (
             tracked_changes.latest_dependency_change_at IS NOT NULL
             AND (current_stats.source_record_count > 0 OR saved_stats.saved_result_count > 0)
+            AND (
+              saved_stats.last_calculated_at IS NULL
+              OR tracked_changes.latest_dependency_change_at > saved_stats.last_calculated_at
+            )
           )
           OR (
             saved_stats.saved_result_count = 0
