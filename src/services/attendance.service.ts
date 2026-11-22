@@ -8105,6 +8105,9 @@ async function refreshCalculationResultsWithClient(
         NULLIF(source_updated_at, '-infinity'::timestamptz),
         NOW()
       FROM deduped_matched
+      -- Disambiguate INSERT ... SELECT ... ON CONFLICT in PostgreSQL.
+      -- Without a WHERE clause, ON may be parsed as part of SELECT.
+      WHERE TRUE
       ON CONFLICT (school_year_id, calculation_scope_key, (LOWER(TRIM(student_id))))
       DO UPDATE SET
         import_ids = EXCLUDED.import_ids,
@@ -8972,17 +8975,9 @@ async function prepareCalculationPreviewTable(client: PoolClient) {
   // application during a deployment. The unique index is required by the
   // engine's ON CONFLICT target.
   await client.query(`
-    CREATE TEMP TABLE calculation_results ON COMMIT DROP AS
-    SELECT *
-    FROM public.calculation_results
-    WITH NO DATA
-  `);
-
-  await client.query(`
-    ALTER TABLE calculation_results
-      ALTER COLUMN id SET DEFAULT gen_random_uuid(),
-      ALTER COLUMN created_at SET DEFAULT NOW(),
-      ALTER COLUMN updated_at SET DEFAULT NOW()
+    CREATE TEMP TABLE calculation_results (
+      LIKE public.calculation_results INCLUDING DEFAULTS
+    ) ON COMMIT DROP
   `);
 
   await client.query(`
