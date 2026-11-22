@@ -7668,7 +7668,10 @@ export function selectExpectedEventGroupRepairTargets(
 
 async function refreshCalculationResultsWithClient(
   client: PoolClient,
-  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> & { logConsistencyViolation?: boolean } = {},
+  options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> & {
+    logConsistencyViolation?: boolean;
+    resolveUnattachedEvents?: boolean;
+  } = {},
 ) {
   const schoolYearId = cleanText(options.schoolYearId) || null;
   const importIds = normalizeImportIds(options.importIds ?? []);
@@ -7676,7 +7679,9 @@ async function refreshCalculationResultsWithClient(
   const sourceFlags = getCalculationSourceFlags(sourceTypes);
   const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
 
-  await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
+  if (options.resolveUnattachedEvents !== false) {
+    await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
+  }
 
   await client.query(
     `
@@ -8272,6 +8277,56 @@ function getCalculationScopeCoversAllImportsSql(alias: string) {
   )`;
 }
 
+function getCalculationChangeCoveredByResultSql(
+  changeAlias: string,
+  resultAlias: string,
+  requireFullDependencyScope = true,
+) {
+  const importedScope = getCalculationScopeIncludesSourceSql(resultAlias, "imported");
+  const allImports = getCalculationScopeCoversAllImportsSql(resultAlias);
+  const allSources = CALCULATION_SOURCE_TYPE_ORDER.map((sourceType) =>
+    getCalculationScopeIncludesSourceSql(resultAlias, sourceType),
+  ).join(" AND ");
+
+  return `(
+    (
+      ${changeAlias}.source_kind = 'imported'
+      AND ${importedScope}
+      AND (
+        (${changeAlias}.source_id IS NULL AND ${allImports})
+        OR (
+          ${changeAlias}.source_id IS NOT NULL
+          AND (
+            ${changeAlias}.source_id = ANY(${resultAlias}.import_ids)
+            OR ${changeAlias}.source_id::TEXT = ANY(
+              string_to_array(
+                split_part(split_part(${resultAlias}.calculation_scope_key, '|', 2), ':', 2),
+                ','
+              )
+            )
+            OR ${allImports}
+          )
+        )
+      )
+    )
+    OR (
+      ${changeAlias}.source_kind = 'manual'
+      AND ${getCalculationScopeIncludesSourceSql(resultAlias, "manual")}
+    )
+    OR (
+      ${changeAlias}.source_kind = 'zero_attendance'
+      AND ${getCalculationScopeIncludesSourceSql(resultAlias, "zero_attendance")}
+    )
+    OR (
+      ${changeAlias}.source_kind IN (
+        'events', 'college_exemptions', 'year_level_exemptions',
+        'penalties', 'students'
+      )
+      ${requireFullDependencyScope ? `AND ${allSources} AND ${allImports}` : ""}
+    )
+  )`;
+}
+
 export async function getCalculationPendingSummary(
   schoolYearIdInput?: string,
 ): Promise<CalculationPendingSummary> {
@@ -8297,6 +8352,12 @@ export async function getCalculationPendingSummary(
         SELECT cic.*
         FROM relevant_changes cic
         WHERE cic.changed_at > COALESCE(cic.acknowledged_at, '-infinity'::timestamptz)
+          AND NOT EXISTS (
+            SELECT 1 FROM calculation_results cr
+            WHERE cr.school_year_id IS NOT DISTINCT FROM cic.school_year_id
+              AND cr.calculated_at >= cic.changed_at
+              AND ${getCalculationChangeCoveredByResultSql("cic", "cr")}
+          )
           AND (
             (
               cic.source_kind = 'imported'
@@ -8491,17 +8552,27 @@ export async function getCalculationPendingSummary(
               AND cic.source_kind = 'imported'
               AND cic.source_id = ai.id
               AND cic.changed_at > COALESCE(cic.acknowledged_at, '-infinity'::timestamptz)
+              AND NOT EXISTS (
+                SELECT 1 FROM calculation_results cr
+                WHERE cr.school_year_id IS NOT DISTINCT FROM cic.school_year_id
+                  AND cr.calculated_at >= cic.changed_at
+                  AND ${getCalculationChangeCoveredByResultSql("cic", "cr")}
+              )
           )
           OR NOT EXISTS (
             SELECT 1
             FROM calculation_results cr
             WHERE cr.school_year_id IS NOT DISTINCT FROM ai.school_year_id
+              AND ${getCalculationScopeIncludesSourceSql("cr", "imported")}
               AND (
                 ai.id = ANY(cr.import_ids)
-                OR (
-                  ${getCalculationScopeIncludesSourceSql("cr", "imported")}
-                  AND ${getCalculationScopeCoversAllImportsSql("cr")}
+                OR ai.id::TEXT = ANY(
+                  string_to_array(
+                    split_part(split_part(cr.calculation_scope_key, '|', 2), ':', 2),
+                    ','
+                  )
                 )
+                OR ${getCalculationScopeCoversAllImportsSql("cr")}
               )
           )
         )
@@ -8669,6 +8740,7 @@ export async function getCalculationStatus(
     last_calculated_at: Date | string | null;
     latest_tracked_source_change_at: Date | string | null;
     latest_dependency_change_at: Date | string | null;
+    pending: boolean;
   }>(
     `
       WITH canonical_students AS (
@@ -8766,42 +8838,38 @@ export async function getCalculationStatus(
       ), tracked_changes AS (
         SELECT
           MAX(cic.changed_at) FILTER (
-            WHERE cic.changed_at > COALESCE(cic.acknowledged_at, '-infinity'::timestamptz)
+            WHERE cic.source_kind IN ('imported', 'manual', 'zero_attendance')
               AND (
                 (
                   cic.source_kind = 'imported'
                   AND $5::BOOLEAN
                   AND (
-                    cic.source_id IS NULL
-                    OR CARDINALITY($2::uuid[]) = 0
-                    OR cic.source_id = ANY($2::uuid[])
-                    OR NOT EXISTS (
-                      SELECT 1
-                      FROM attendance_imports active_import
-                      WHERE active_import.deleted_at IS NULL
-                        AND ($1::uuid IS NULL OR active_import.school_year_id = $1::uuid)
-                        AND EXISTS (
-                          SELECT 1
-                          FROM attendance_records active_record
-                          WHERE ${getAttendanceRecordVisibilitySql("active_record")}
-                            AND active_record.import_id = active_import.id
-                        )
-                        AND NOT (active_import.id = ANY($2::uuid[]))
-                    )
+                    CARDINALITY($2::uuid[]) = 0
+                    OR (cic.source_id IS NOT NULL AND cic.source_id = ANY($2::uuid[]))
                   )
                 )
                 OR (cic.source_kind = 'manual' AND $6::BOOLEAN)
                 OR (cic.source_kind = 'zero_attendance' AND $7::BOOLEAN)
               )
+              AND NOT EXISTS (
+                SELECT 1 FROM calculation_results covered_cr
+                WHERE covered_cr.school_year_id IS NOT DISTINCT FROM cic.school_year_id
+                  AND covered_cr.calculation_scope_key = $3::TEXT
+                  AND covered_cr.calculated_at >= cic.changed_at
+                  AND ${getCalculationChangeCoveredByResultSql("cic", "covered_cr", false)}
+              )
           ) AS latest_tracked_source_change_at,
           MAX(cic.changed_at) FILTER (
-            WHERE cic.changed_at > COALESCE(cic.acknowledged_at, '-infinity'::timestamptz)
-              AND cic.source_kind IN (
-                'events',
-                'college_exemptions',
-                'year_level_exemptions',
-                'penalties',
-                'students'
+            WHERE cic.source_kind IN (
+              'events', 'college_exemptions', 'year_level_exemptions',
+              'penalties', 'students'
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM calculation_results covered_cr
+                WHERE covered_cr.school_year_id IS NOT DISTINCT FROM cic.school_year_id
+                  AND covered_cr.calculation_scope_key = $3::TEXT
+                  AND covered_cr.calculated_at >= cic.changed_at
+                  AND ${getCalculationChangeCoveredByResultSql("cic", "covered_cr", false)}
               )
           ) AS latest_dependency_change_at
         FROM calculation_input_changes cic
@@ -8815,7 +8883,29 @@ export async function getCalculationStatus(
         saved_stats.saved_source_record_count,
         saved_stats.last_calculated_at,
         tracked_changes.latest_tracked_source_change_at,
-        tracked_changes.latest_dependency_change_at
+        tracked_changes.latest_dependency_change_at,
+        (
+          (
+            tracked_changes.latest_tracked_source_change_at IS NOT NULL
+            AND (current_stats.source_record_count > 0 OR saved_stats.saved_result_count > 0)
+          )
+          OR (
+            tracked_changes.latest_dependency_change_at IS NOT NULL
+            AND (current_stats.source_record_count > 0 OR saved_stats.saved_result_count > 0)
+          )
+          OR (
+            saved_stats.saved_result_count = 0
+            AND current_stats.source_record_count > 0
+          )
+          OR (
+            saved_stats.saved_result_count > 0
+            AND (
+              current_stats.source_record_count <> saved_stats.saved_source_record_count
+              OR current_stats.source_student_count <> saved_stats.saved_result_count
+              OR current_stats.latest_source_updated_at > saved_stats.last_calculated_at
+            )
+          )
+        ) AS pending
       FROM current_stats
       CROSS JOIN saved_stats
       CROSS JOIN tracked_changes
@@ -8844,28 +8934,10 @@ export async function getCalculationStatus(
   const hasSourceData = sourceRecordCount > 0;
   const hasSavedResults = savedResultCount > 0;
 
-  const toTimestamp = (value: Date | string | null) =>
-    value ? new Date(value).getTime() : 0;
-  const lastCalculatedTime = toTimestamp(lastCalculatedAt);
-  const sourceShapeChanged =
-    sourceRecordCount !== savedSourceRecordCount ||
-    sourceStudentCount !== savedResultCount;
-  // Input changes may be left globally unacknowledged when this save covers
-  // only a subset of sources/imports. A change already included in this
-  // scope's saved calculation must not make the same scope pending again.
-  const hasTrackedSourceChange = Boolean(latestTrackedSourceChangeAt) &&
-    (!hasSavedResults || toTimestamp(latestTrackedSourceChangeAt) > lastCalculatedTime);
-  const hasDependencyChange =
-    Boolean(latestDependencyChangeAt) && (hasSourceData || hasSavedResults) &&
-    (!hasSavedResults || toTimestamp(latestDependencyChangeAt) > lastCalculatedTime);
-  const sourceUpdatedAfterSaved =
-    toTimestamp(latestSourceUpdatedAt) > lastCalculatedTime;
-  const pending =
-    hasTrackedSourceChange ||
-    hasDependencyChange ||
-    (hasSavedResults
-      ? sourceShapeChanged || sourceUpdatedAfterSaved
-      : hasSourceData);
+  // PostgreSQL evaluates source, dependency and saved-result timestamps at
+  // timestamptz precision. JavaScript millisecond truncation must not affect
+  // pending calculations or the matching save-time 409 guard.
+  const pending = Boolean(row?.pending);
 
   const summary = await getCalculationPendingSummary(schoolYearId ?? undefined);
   const selectedImportIdSet = new Set(importIds);
@@ -8958,6 +9030,13 @@ async function prepareCalculationPreviewTable(client: PoolClient) {
 export async function previewCalculationResults(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
 ) {
+  await withTransaction(async (client) => {
+    await resolveUnattachedAttendanceEventIdsWithClient(
+      client,
+      cleanText(options.schoolYearId) || null,
+    );
+  });
+
   const status = await getCalculationStatus(options);
 
   if (!status.pending) {
@@ -8992,6 +9071,7 @@ export async function previewCalculationResults(
       importIds,
       sourceTypes,
       logConsistencyViolation: false,
+      resolveUnattachedEvents: false,
     });
 
     await client.query("ROLLBACK");
@@ -9029,6 +9109,13 @@ export async function previewCalculationResults(
 export async function refreshCalculationResults(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
 ) {
+  await withTransaction(async (client) => {
+    await resolveUnattachedAttendanceEventIdsWithClient(
+      client,
+      cleanText(options.schoolYearId) || null,
+    );
+  });
+
   const status = await getCalculationStatus(options);
 
   if (!status.pending) {
@@ -9045,9 +9132,11 @@ export async function refreshCalculationResults(
       schoolYearId: options.schoolYearId,
       importIds,
       sourceTypes,
+      resolveUnattachedEvents: false,
     });
     await refreshAttendanceFinalResultsWithClient(client, {
       schoolYearId: options.schoolYearId,
+      resolveUnattachedEvents: false,
     });
     await refreshPenaltyResultsForSchoolYearWithClient(
       client,
@@ -9132,17 +9221,14 @@ export function getSavedCalculationGroupRepairQuery() {
 
 /** Apply the same approved total to consolidated final rows when their
  * independently rebuilt roster still has a conflict. The final-results table
- * has no manual_absences column, so preserve its existing manual component
- * (or recover it from manual records when it was using imported fallback).
+ * has no manual_absences column, so reconstruct the same eligible manual
+ * absences used by the calculation engine before correcting the roster total.
  */
 export function getSavedFinalGroupRepairQuery() {
   return `
     WITH affected AS (
       SELECT afr.id, afr.college_key, afr.attended_events, afr.total_absences,
-        CASE WHEN afr.absence_calculation_source = 'roster'
-          THEN GREATEST(afr.total_absences -
-            GREATEST(afr.expected_events - afr.attended_events, 0), 0)
-          ELSE manual.manual_absences END::INT AS manual_absences
+        manual.manual_absences
       FROM attendance_final_results afr
       LEFT JOIN LATERAL (
         SELECT COALESCE(SUM(CASE
@@ -9155,6 +9241,11 @@ export function getSavedFinalGroupRepairQuery() {
         FROM manual_attendance_records mar
         WHERE mar.school_year_id = afr.school_year_id
           AND LOWER(TRIM(mar.student_id)) = LOWER(TRIM(afr.student_id))
+          AND (
+            mar.attendance_type = 'zero_attendance'
+            OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($5::TEXT)
+            OR ${getManualCalculationRecordEligibilitySql("mar")}
+          )
       ) manual ON TRUE
       WHERE afr.school_year_id = $1::UUID
         AND afr.import_id IS NULL
@@ -9557,11 +9648,16 @@ type AttendanceFinalResultsFilter = {
 
 async function refreshAttendanceFinalResultsWithClient(
   client: PoolClient,
-  options: Pick<AttendanceFinalResultsFilter, "schoolYearId" | "importId"> & { logConsistencyViolation?: boolean } = {},
+  options: Pick<AttendanceFinalResultsFilter, "schoolYearId" | "importId"> & {
+    logConsistencyViolation?: boolean;
+    resolveUnattachedEvents?: boolean;
+  } = {},
 ) {
   const schoolYearId = cleanText(options.schoolYearId) || null;
 
-  await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
+  if (options.resolveUnattachedEvents !== false) {
+    await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
+  }
 
   await client.query(
     `
@@ -9656,6 +9752,7 @@ async function refreshAttendanceFinalResultsWithClient(
         WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
           AND (
             mar.attendance_type = 'zero_attendance'
+            OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($2::TEXT)
             OR mar.event_id IS NULL
             OR ${getEventStudentExemptionFilterSql(
               "mar.event_id",
@@ -9996,6 +10093,7 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
         FROM attendance_final_results afr
         WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
           AND afr.total_absences > 0
+          AND afr.college_key IS NOT NULL
           AND ${visibleFinalResultSql}
         ORDER BY
           afr.school_year_id,
@@ -10023,7 +10121,7 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
           WHERE no_of_absences <= afr.total_absences
           ORDER BY no_of_absences DESC, id DESC
           LIMIT 1
-        ) penalty ON afr.total_absences > 0
+        ) penalty ON afr.total_absences > 0 AND afr.college_key IS NOT NULL
       )
       INSERT INTO penalty_results (
         school_year_id,
@@ -10087,6 +10185,7 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
         WHERE afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
           AND LOWER(TRIM(afr.student_id)) = LOWER(TRIM(pr.student_id))
           AND afr.total_absences > 0
+          AND afr.college_key IS NOT NULL
           AND ${visibleFinalResultSql}
       )
     `,
@@ -10111,6 +10210,7 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
         WHERE afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
           AND LOWER(TRIM(afr.student_id)) = LOWER(TRIM(pr.student_id))
           AND afr.total_absences > 0
+          AND afr.college_key IS NOT NULL
           AND ${visibleFinalResultSql}
       )
       ORDER BY pr.updated_at DESC, pr.id
