@@ -8131,49 +8131,8 @@ async function refreshCalculationResultsWithClient(
         source_updated_at = EXCLUDED.source_updated_at,
         calculated_at = NOW(),
         updated_at = NOW()
-      WHERE (
-        existing.student_id,
-        existing.import_ids,
-        existing.name,
-        existing.year_level,
-        existing.college,
-        existing.program,
-        existing.institution,
-        existing.college_key,
-        existing.attended_events,
-        existing.expected_events,
-        existing.imported_absences,
-        existing.manual_absences,
-        existing.total_absences,
-        existing.absence_calculation_source,
-        existing.attendance_status,
-        existing.penalty_id,
-        existing.prescribed_penalty,
-        existing.source_record_count,
-        existing.latest_scanned_at,
-        existing.source_updated_at
-      ) IS DISTINCT FROM (
-        EXCLUDED.student_id,
-        EXCLUDED.import_ids,
-        EXCLUDED.name,
-        EXCLUDED.year_level,
-        EXCLUDED.college,
-        EXCLUDED.program,
-        EXCLUDED.institution,
-        EXCLUDED.college_key,
-        EXCLUDED.attended_events,
-        EXCLUDED.expected_events,
-        EXCLUDED.imported_absences,
-        EXCLUDED.manual_absences,
-        EXCLUDED.total_absences,
-        EXCLUDED.absence_calculation_source,
-        EXCLUDED.attendance_status,
-        EXCLUDED.penalty_id,
-        EXCLUDED.prescribed_penalty,
-        EXCLUDED.source_record_count,
-        EXCLUDED.latest_scanned_at,
-        EXCLUDED.source_updated_at
-      )
+      -- A successful save is a completed calculation even if the results have
+      -- the same values. Refresh calculated_at for unchanged rows, too.
       RETURNING *
     `,
     [
@@ -8198,7 +8157,7 @@ async function refreshCalculationResultsWithClient(
             AND EXISTS (
               SELECT 1
               FROM attendance_records ar
-              WHERE ar.deleted_at IS NULL
+              WHERE ${getAttendanceRecordVisibilitySql("ar")}
                 AND ar.school_year_id IS NOT DISTINCT FROM cr.school_year_id
                 AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM(cr.student_id))
                 AND ar.import_id IS NOT NULL
@@ -8210,7 +8169,7 @@ async function refreshCalculationResultsWithClient(
             AND EXISTS (
               SELECT 1
               FROM attendance_records ar
-              WHERE ar.deleted_at IS NULL
+              WHERE ${getAttendanceRecordVisibilitySql("ar")}
                 AND ar.school_year_id IS NOT DISTINCT FROM cr.school_year_id
                 AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM(cr.student_id))
                 AND LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($4::TEXT)
@@ -8225,6 +8184,7 @@ async function refreshCalculationResultsWithClient(
                 AND LOWER(TRIM(mar.student_id)) = LOWER(TRIM(cr.student_id))
                 AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
                 AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($4::TEXT)
+                AND ${getManualCalculationRecordEligibilitySql("mar")}
             )
           )
           OR (
@@ -8890,9 +8850,14 @@ export async function getCalculationStatus(
   const sourceShapeChanged =
     sourceRecordCount !== savedSourceRecordCount ||
     sourceStudentCount !== savedResultCount;
-  const hasTrackedSourceChange = Boolean(latestTrackedSourceChangeAt);
+  // Input changes may be left globally unacknowledged when this save covers
+  // only a subset of sources/imports. A change already included in this
+  // scope's saved calculation must not make the same scope pending again.
+  const hasTrackedSourceChange = Boolean(latestTrackedSourceChangeAt) &&
+    (!hasSavedResults || toTimestamp(latestTrackedSourceChangeAt) > lastCalculatedTime);
   const hasDependencyChange =
-    Boolean(latestDependencyChangeAt) && (hasSourceData || hasSavedResults);
+    Boolean(latestDependencyChangeAt) && (hasSourceData || hasSavedResults) &&
+    (!hasSavedResults || toTimestamp(latestDependencyChangeAt) > lastCalculatedTime);
   const sourceUpdatedAfterSaved =
     toTimestamp(latestSourceUpdatedAt) > lastCalculatedTime;
   const pending =
