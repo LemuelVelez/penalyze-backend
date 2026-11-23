@@ -9,6 +9,7 @@ import type {
 } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
 import {
+  ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL,
   applyExemptionsToPendingAttendanceRequests,
   getEventCollegeExemptionFilterSql,
   getEventYearLevelExemptionFilterSql,
@@ -18,6 +19,7 @@ import {
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
   syncAbsencesForStudents,
 } from "./attendance.service";
+import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
 
 type AttendanceRequestEventInput = {
   eventId?: unknown;
@@ -244,6 +246,54 @@ function normalizeRequestEvents(value: unknown) {
       evidenceUrl: normalizeEvidenceUrl(input.evidenceUrl),
     };
   });
+}
+
+async function getRequestableEventIds(
+  client: PoolClient,
+  schoolYearId: string,
+  studentId: string,
+  collegeKey: string,
+  eventIds: string[],
+): Promise<Set<string>> {
+  const result = await client.query<{ id: string }>(
+    `WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}
+     SELECT DISTINCT roster.event_id::text AS id
+     FROM event_roster_scope roster
+     LEFT JOIN attendance_student_event_overrides correction
+       ON correction.school_year_id IS NOT DISTINCT FROM roster.school_year_id
+      AND correction.student_key = LOWER(TRIM($2))
+      AND correction.event_id = roster.event_id
+     WHERE roster.school_year_id = $1::uuid
+       AND roster.college_key = $3::text
+       AND roster.event_id = ANY($4::uuid[])
+       AND (
+         (correction.id IS NOT NULL AND correction.attended = FALSE)
+         OR (
+           correction.id IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM attendance_records attended_record
+             LEFT JOIN attendance_imports attended_import
+               ON attended_import.id = attended_record.import_id
+              AND attended_import.deleted_at IS NULL
+             WHERE ${getAttendanceRecordVisibilitySql("attended_record")}
+               AND attended_record.school_year_id = $1::uuid
+               AND LOWER(TRIM(attended_record.student_id)) = LOWER(TRIM($2))
+               AND COALESCE(attended_record.event_id, attended_import.event_id) = roster.event_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM manual_attendance_records attended_manual
+             WHERE attended_manual.school_year_id = $1::uuid
+               AND LOWER(TRIM(attended_manual.student_id)) = LOWER(TRIM($2))
+               AND attended_manual.event_id = roster.event_id
+               AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
+               AND LOWER(TRIM(COALESCE(attended_manual.remarks, ''))) <> LOWER($5::text)
+           )
+         )
+       )`,
+    [schoolYearId, studentId, collegeKey, eventIds, ZERO_ATTENDANCE_REMARK],
+  );
+
+  return new Set(result.rows.map((row) => row.id));
 }
 
 type CurrentStudentDetails = {
@@ -718,6 +768,27 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
     if (!eventIds.length) {
       throw createHttpError(
         "All selected events are exempted for your college/year level, so no attendance request is needed.",
+      );
+    }
+
+    if (!requestCollegeKey) {
+      throw createHttpError(
+        "Your college is missing. Submit a Request Details Correction first, then try the attendance review again.",
+      );
+    }
+
+    const requestableIds = await getRequestableEventIds(
+      client,
+      schoolYearId,
+      studentId,
+      requestCollegeKey,
+      eventIds,
+    );
+    events = events.filter((event) => requestableIds.has(event.eventId));
+    eventIds = events.map((event) => event.eventId);
+    if (!eventIds.length) {
+      throw createHttpError(
+        "None of the selected events are counted as missed for your college, so no attendance request is needed.",
       );
     }
 
@@ -1204,6 +1275,29 @@ async function resolveRequestEventsForApproval(
     WHERE are.request_id = $1
     ORDER BY are.created_at, are.event_name
   `, [request.id]);
+
+  const collegeKey = normalizeCollegeKey(request.college);
+  if (collegeKey) {
+    const ids = remaining.rows
+      .map((event) => event.event_id)
+      .filter((eventId): eventId is string => eventId !== null);
+    const requestableIds = await getRequestableEventIds(
+      client,
+      request.school_year_id,
+      request.student_id,
+      collegeKey,
+      ids,
+    );
+    const invalidEvents = remaining.rows.filter(
+      (event) => !event.event_id || !requestableIds.has(event.event_id),
+    );
+    if (invalidEvents.length) {
+      throw createHttpError(
+        `These events are not counted as missed for this student's college and cannot be approved: ${invalidEvents.map((event) => event.event_name).join(", ")}. Remove them from the request, then approve again.`,
+        409,
+      );
+    }
+  }
 
   return {
     events: remaining.rows,
