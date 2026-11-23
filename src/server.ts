@@ -107,8 +107,6 @@ import {
   summary,
   updatePenalty,
   updatePenaltyResultRow,
-  updatePenaltyResultRowStatus,
-  updateStatus,
 } from "./controller/fines.controller";
 import {
   activate as activateSchoolYear,
@@ -465,12 +463,7 @@ app.delete("/api/fines/penalty-results/:id", requireAuth, requireAdmin, deletePe
 app.post("/api/fines/penalty-results/refresh", requireAuth, requireAdmin, refreshPenaltyResultRows);
 app.put("/api/fines/penalty-results/:id", requireAuth, requireAdmin, updatePenaltyResultRow);
 app.patch("/api/fines/penalty-results/:id", requireAuth, requireAdmin, updatePenaltyResultRow);
-app.patch(
-  "/api/fines/penalty-results/:id/status",
-  requireAuth, requireAdmin, updatePenaltyResultRowStatus,
-);
 app.post("/api/fines/zero-attendance", requireAuth, requireAdmin, registerZeroAttendance);
-app.patch("/api/fines/:id/status", requireAuth, requireAdmin, updateStatus);
 app.get("/api/fines/penalties", requireAuth, requireAdmin, penalties);
 app.post("/api/fines/penalties", requireAuth, requireAdmin, savePenalty);
 app.post("/api/fines/penalties/seed", requireAuth, requireAdmin, seedPenalties);

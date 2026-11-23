@@ -273,11 +273,9 @@ function getAuditContext(method: string, path: string): AuditContext {
     { matches: (m, p) => ["PATCH", "PUT"].includes(m) && /^\/api\/fines\/penalties\//.test(p), action: "Updated penalty", resourceType: "penalty", category: "Penalties & Fines", describe: describePenalty },
     { matches: (m, p) => m === "DELETE" && /^\/api\/fines\/penalties\//.test(p), action: "Deleted penalty", resourceType: "penalty", category: "Penalties & Fines", describe: describePenalty },
     { matches: (m, p) => m === "POST" && p.endsWith("/penalty-results/refresh"), action: "Refreshed penalty results", resourceType: "penalty result", category: "Penalties & Fines", describe: describePenalty },
-    { matches: (m, p) => m === "PATCH" && /^\/api\/fines\/penalty-results\/[^/]+\/status$/.test(p), action: "Updated penalty result payment status", resourceType: "penalty result", category: "Penalties & Fines", describe: describeStatus },
     { matches: (m, p) => ["PATCH", "PUT"].includes(m) && p.includes("/penalty-results/"), action: "Updated penalty result", resourceType: "penalty result", category: "Penalties & Fines", describe: describeDetails },
     { matches: (m, p) => m === "DELETE" && p.startsWith("/api/fines/penalty-results"), action: "Deleted penalty result", resourceType: "penalty result", category: "Penalties & Fines", describe: describePenalty },
     { matches: (m, p) => m === "POST" && p === "/api/fines/zero-attendance", action: "Registered zero attendance", resourceType: "fine", category: "Penalties & Fines", describe: describeName },
-    { matches: (m, p) => m === "PATCH" && /^\/api\/fines\/[^/]+\/status$/.test(p), action: "Updated fine status", resourceType: "fine", category: "Penalties & Fines", describe: describeStatus },
   ];
 
   const match = rules.find((rule) => rule.matches(normalizedMethod, path));

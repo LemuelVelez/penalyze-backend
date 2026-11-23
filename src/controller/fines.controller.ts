@@ -1,6 +1,5 @@
 import { NextFunction, Request, Response } from "express";
 
-import { FineStatus } from "../database/model/schema.model";
 import {
   deletePenalty as deletePenaltyRecord,
   deletePenaltyResultsByIds,
@@ -15,19 +14,10 @@ import {
   refreshPenaltyResults,
   registerZeroAttendanceFine as registerZeroAttendanceFineRecord,
   seedDefaultPenalties,
-  updateFineStatus,
   updatePenalty as updatePenaltyRecord,
   updatePenaltyResult,
-  updatePenaltyResultStatus,
   upsertPenalty
 } from "../services/fines.service";
-
-const fineStatuses: FineStatus[] = ["unpaid", "paid", "waived"];
-
-function parseFineStatus(value: unknown) {
-  const status = String(value ?? "").trim() as FineStatus;
-  return fineStatuses.includes(status) ? status : undefined;
-}
 
 function toPositiveInt(value: unknown, fallback: number) {
   const parsed = Number(value);
@@ -92,7 +82,6 @@ function getPenaltyResultPayload(req: Request) {
     name: String(req.body?.name ?? "").trim(),
     noOfAbsences: Number(req.body?.noOfAbsences ?? req.body?.no_of_absences ?? 0),
     prescribedPenalty: String(req.body?.prescribedPenalty ?? req.body?.prescribed_penalty ?? "").trim(),
-    status: parseFineStatus(req.body?.status),
   };
 }
 
@@ -206,19 +195,12 @@ export async function registerZeroAttendance(req: Request, res: Response, next: 
 
 export async function fines(req: Request, res: Response, next: NextFunction) {
   try {
-    const status = req.query.status ? (String(req.query.status) as FineStatus) : undefined;
-
-    if (status && !fineStatuses.includes(status)) {
-      res.status(400).json({ message: "Invalid fine status." });
-      return;
-    }
-
     const schoolYearId = req.query.schoolYearId ? String(req.query.schoolYearId) : undefined;
     const studentId = req.query.studentId ? String(req.query.studentId) : undefined;
     const limit = toPositiveInt(req.query.limit, 100);
     const offset = toPositiveInt(req.query.offset, 0);
 
-    const rows = await listFines({ schoolYearId, status, studentId, limit, offset });
+    const rows = await listFines({ schoolYearId, studentId, limit, offset });
     res.json({ data: rows });
   } catch (error) {
     next(error);
@@ -229,7 +211,6 @@ export async function penaltyResults(req: Request, res: Response, next: NextFunc
   try {
     const rows = await listPenaltyResults({
       schoolYearId: req.query.schoolYearId ? String(req.query.schoolYearId).trim() : undefined,
-      status: parseFineStatus(req.query.status),
       studentId: req.query.studentId ? String(req.query.studentId).trim() : undefined,
       limit: toPositiveInt(req.query.limit, 5000),
       offset: toPositiveInt(req.query.offset, 0),
@@ -284,28 +265,6 @@ export async function refreshPenaltyResultRows(req: Request, res: Response, next
   }
 }
 
-
-export async function updatePenaltyResultRowStatus(req: Request, res: Response, next: NextFunction) {
-  try {
-    const id = getRouteParam(req, "id");
-    const status = parseFineStatus(req.body?.status);
-
-    if (!id) {
-      res.status(400).json({ message: "Penalty result ID is required." });
-      return;
-    }
-
-    if (!status) {
-      res.status(400).json({ message: "Valid status is required." });
-      return;
-    }
-
-    const row = await updatePenaltyResultStatus(id, status);
-    res.json({ message: "Penalty result status updated.", data: row });
-  } catch (error) {
-    next(error);
-  }
-}
 
 export async function updatePenaltyResultRow(req: Request, res: Response, next: NextFunction) {
   try {
@@ -378,20 +337,3 @@ export async function summary(req: Request, res: Response, next: NextFunction) {
   }
 }
 
-export async function updateStatus(req: Request, res: Response, next: NextFunction) {
-  try {
-    const id = getRouteParam(req, "id");
-
-    if (!id) {
-      res.status(400).json({ message: "Fine ID is required." });
-      return;
-    }
-
-    const status = req.body?.status as FineStatus;
-    const fine = await updateFineStatus(id, status);
-
-    res.json({ message: "Fine status updated successfully.", data: fine });
-  } catch (error) {
-    next(error);
-  }
-}

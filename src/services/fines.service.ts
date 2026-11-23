@@ -1,7 +1,6 @@
 import {
   AttendanceRecord,
   FineRecord,
-  FineStatus,
   PenaltyRecord,
   PenaltyResultRecord,
   SchoolYearRecord,
@@ -378,7 +377,6 @@ export async function seedDefaultPenalties() {
 export async function listFines(
   options: {
     schoolYearId?: string;
-    status?: FineStatus;
     studentId?: string;
     limit?: number;
     offset?: number;
@@ -392,11 +390,6 @@ export async function listFines(
   if (options.schoolYearId) {
     params.push(options.schoolYearId);
     clauses.push(`f.school_year_id = $${params.length}`);
-  }
-
-  if (options.status) {
-    params.push(options.status);
-    clauses.push(`f.status = $${params.length}`);
   }
 
   if (options.studentId) {
@@ -718,56 +711,10 @@ export async function registerZeroAttendanceFine(
   };
 }
 
-export async function updateFineStatus(id: string, status: FineStatus) {
-  if (!["unpaid", "paid", "waived"].includes(status)) {
-    throw new Error("Invalid fine status.");
-  }
-
-  const result = await query<FineRecord>(
-    `
-      WITH updated AS (
-        UPDATE fines
-        SET status = $2,
-            updated_at = NOW()
-        WHERE id = $1
-          AND (
-            attendance_record_id IS NULL
-            OR EXISTS (
-              SELECT 1
-              FROM attendance_records active_record
-              WHERE active_record.id = fines.attendance_record_id
-                AND ${getAttendanceRecordVisibilitySql("active_record")}
-            )
-          )
-        RETURNING *
-      )
-      SELECT
-        ${getFineTableColumnsSql("updated")},
-        COALESCE(ar.no_of_absences, 0)::INT AS no_of_absences,
-        ar.event_id AS attendance_event_id,
-        ar.remarks AS attendance_remarks
-      FROM updated
-      LEFT JOIN attendance_records ar
-        ON ar.id = updated.attendance_record_id
-        AND ${getAttendanceRecordVisibilitySql("ar")}
-    `,
-    [id, status],
-  );
-
-  if (!result.rows[0]) {
-    throw new Error("Fine not found.");
-  }
-
-  return result.rows[0];
-}
-
 export async function getFineSummary(schoolYearId?: string) {
-  const result = await query<{
-    status: FineStatus;
-    count: string;
-  }>(
+  const result = await query<{ count: string }>(
     `
-      SELECT f.status, COUNT(*)::TEXT AS count
+      SELECT COUNT(*)::TEXT AS count
       FROM fines f
       WHERE (
         f.attendance_record_id IS NULL
@@ -779,27 +726,15 @@ export async function getFineSummary(schoolYearId?: string) {
         )
       )
       ${schoolYearId ? "AND f.school_year_id = $1" : ""}
-      GROUP BY f.status
-      ORDER BY status ASC
     `,
     schoolYearId ? [schoolYearId] : [],
   );
 
-  return result.rows.reduce<Record<FineStatus, number>>(
-    (
-      summary: Record<FineStatus, number>,
-      row: { status: FineStatus; count: string },
-    ) => {
-      summary[row.status] = Number(row.count);
-      return summary;
-    },
-    { unpaid: 0, paid: 0, waived: 0 },
-  );
+  return { total: Number(result.rows[0]?.count ?? 0) };
 }
 
 type ListPenaltyResultsOptions = {
   schoolYearId?: string;
-  status?: FineStatus;
   studentId?: string;
   limit?: number;
   offset?: number;
@@ -853,11 +788,6 @@ export async function listPenaltyResults(
   if (options.schoolYearId) {
     params.push(options.schoolYearId);
     clauses.push(`pr.school_year_id = $${params.length}`);
-  }
-
-  if (options.status) {
-    params.push(options.status);
-    clauses.push(`pr.status = $${params.length}`);
   }
 
   if (options.studentId) {
@@ -1178,32 +1108,6 @@ export async function refreshPenaltyResults(
   );
 }
 
-export async function updatePenaltyResultStatus(
-  id: string,
-  status: FineStatus,
-) {
-  if (!["unpaid", "paid", "waived"].includes(status)) {
-    throw new Error("Invalid penalty result status.");
-  }
-
-  const result = await query<PenaltyResultRecord>(
-    `
-      UPDATE penalty_results
-      SET status = $2,
-          updated_at = NOW()
-      WHERE id = $1
-      RETURNING *
-    `,
-    [id, status],
-  );
-
-  if (!result.rows[0]) {
-    throw new Error("Penalty result not found.");
-  }
-
-  return result.rows[0];
-}
-
 export async function updatePenaltyResult(
   id: string,
   input: {
@@ -1211,21 +1115,15 @@ export async function updatePenaltyResult(
     name?: string;
     noOfAbsences?: number;
     prescribedPenalty?: string;
-    status?: FineStatus;
   },
 ) {
   const studentId = cleanOptionalText(input.studentId);
   const name = cleanOptionalText(input.name);
   const noOfAbsences = Number(input.noOfAbsences ?? 0);
   const prescribedPenalty = cleanOptionalText(input.prescribedPenalty);
-  const status = input.status;
 
   if (!Number.isInteger(noOfAbsences) || noOfAbsences < 0) {
     throw new Error("No. of absences must be a whole number.");
-  }
-
-  if (status && !["unpaid", "paid", "waived"].includes(status)) {
-    throw new Error("Invalid penalty result status.");
   }
 
   if (!prescribedPenalty && noOfAbsences > 0) {
@@ -1243,7 +1141,6 @@ export async function updatePenaltyResult(
           no_of_absences = $4,
           penalty_id = $5,
           prescribed_penalty = COALESCE($6, prescribed_penalty),
-          status = COALESCE($7, status),
           updated_at = NOW()
       WHERE id = $1
       RETURNING *
@@ -1255,7 +1152,6 @@ export async function updatePenaltyResult(
       noOfAbsences,
       matchedPenalty?.id ?? null,
       prescribedPenalty ?? matchedPenalty?.prescribed_penalty ?? null,
-      status ?? null,
     ],
   );
 
