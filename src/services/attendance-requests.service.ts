@@ -1207,13 +1207,13 @@ export async function listPublicAttendanceRequestsForStudent(
     verifiedRequestIds.every((id) => isUuid(id)) ? verifiedRequestIds : [];
   if (!cleanStudentId && !receiptIds.length) return [];
 
-  // Student ID lookups expose status metadata only. Reviewer notes require a
-  // verified receipt for that specific request, and evidence stays private.
+  // Student ID lookups expose request status and reviewer notes.
+  // Evidence and other request details stay private.
   const result = await query<PublicStudentAttendanceRequestStatus>(`
     SELECT ar.id, ar.school_year_id, sy.name AS school_year_name,
       sy.semester, ar.request_type, ar.status,
-      CASE WHEN ar.id = ANY($1::uuid[]) THEN ar.review_note ELSE NULL END AS review_note,
-      (ar.id = ANY($1::uuid[])) AS review_note_access,
+      ar.review_note,
+      TRUE AS review_note_access,
       ar.reviewed_at, ar.created_at
     FROM attendance_requests ar
     JOIN school_years sy ON sy.id = ar.school_year_id
