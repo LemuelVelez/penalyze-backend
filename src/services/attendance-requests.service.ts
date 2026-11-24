@@ -1190,24 +1190,40 @@ export type PublicStudentAttendanceRequestStatus = {
   request_type: AttendanceRequestType;
   status: AttendanceRequestStatus;
   review_note: string | null;
+  review_note_access: boolean;
   reviewed_at: string | null;
   created_at: string;
 };
 
 export async function listPublicAttendanceRequestsForStudent(
   verifiedRequestIds: string[],
+  studentId?: string,
 ): Promise<PublicStudentAttendanceRequestStatus[]> {
-  if (!verifiedRequestIds.length || verifiedRequestIds.length > 20 ||
-      verifiedRequestIds.some((id) => !isUuid(id))) return [];
+  const cleanStudentId = studentId?.trim() || null;
+  if (cleanStudentId && !/^[A-Za-z0-9-]{4,36}$/.test(cleanStudentId)) {
+    throw createHttpError("Enter a valid Student ID.", 400);
+  }
+  const receiptIds = verifiedRequestIds.length <= 20 &&
+    verifiedRequestIds.every((id) => isUuid(id)) ? verifiedRequestIds : [];
+  if (!cleanStudentId && !receiptIds.length) return [];
+
+  // Student ID lookups expose status metadata only. Reviewer notes require a
+  // verified receipt for that specific request, and evidence stays private.
   const result = await query<PublicStudentAttendanceRequestStatus>(`
     SELECT ar.id, ar.school_year_id, sy.name AS school_year_name,
-      sy.semester, ar.request_type, ar.status, ar.review_note,
+      sy.semester, ar.request_type, ar.status,
+      CASE WHEN ar.id = ANY($1::uuid[]) THEN ar.review_note ELSE NULL END AS review_note,
+      (ar.id = ANY($1::uuid[])) AS review_note_access,
       ar.reviewed_at, ar.created_at
     FROM attendance_requests ar
     JOIN school_years sy ON sy.id = ar.school_year_id
-    WHERE ar.id = ANY($1::uuid[])
-    ORDER BY ar.created_at DESC LIMIT 20
-  `, [verifiedRequestIds]);
+    WHERE (
+      $2::text IS NOT NULL AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM($2::text))
+    ) OR (
+      $2::text IS NULL AND ar.id = ANY($1::uuid[])
+    )
+    ORDER BY ar.created_at DESC, ar.id DESC
+  `, [receiptIds, cleanStudentId]);
   return result.rows;
 }
 

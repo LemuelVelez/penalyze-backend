@@ -87,9 +87,18 @@ export async function publicStudentRequests(
   next: NextFunction,
 ) {
   try {
-    const ids = getReceiptIds(req.body?.receipts);
-    const rows = ids.length ? await listPublicAttendanceRequestsForStudent(ids) : [];
     res.setHeader("Cache-Control", "no-store");
+    const rawStudentId = req.body?.studentId;
+    if (rawStudentId !== undefined && (
+      typeof rawStudentId !== "string" ||
+      !/^[A-Za-z0-9-]{4,36}$/.test(rawStudentId.trim())
+    )) {
+      res.status(400).json({ message: "Enter a valid Student ID." });
+      return;
+    }
+    const studentId = typeof rawStudentId === "string" ? rawStudentId.trim() : undefined;
+    const ids = getReceiptIds(req.body?.receipts);
+    const rows = await listPublicAttendanceRequestsForStudent(ids, studentId);
     res.json({ data: rows });
   } catch (error) {
     next(error);
