@@ -488,6 +488,61 @@ function cleanPublicField(value: unknown, max: number, label: string): string {
   return text;
 }
 
+async function findCountedEventParticipationForStudent(
+  client: PoolClient,
+  studentId: string,
+  schoolYearId: string,
+): Promise<boolean> {
+  const result = await client.query<{ exists: boolean }>(
+    `
+      SELECT EXISTS (
+        SELECT 1
+        FROM attendance_records ar
+        LEFT JOIN attendance_imports ai
+          ON ai.id = ar.import_id
+         AND ai.deleted_at IS NULL
+        WHERE ${getAttendanceRecordVisibilitySql("ar")}
+          AND ar.school_year_id = $2::uuid
+          AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM($1))
+          AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
+          AND LOWER(TRIM(COALESCE(ar.remarks, ''))) <> LOWER($3::text)
+          AND NOT EXISTS (
+            SELECT 1
+            FROM attendance_student_event_overrides correction
+            WHERE correction.school_year_id = ar.school_year_id
+              AND correction.student_key = LOWER(TRIM(ar.student_id))
+              AND correction.event_id = COALESCE(ar.event_id, ai.event_id)
+              AND correction.attended = FALSE
+          )
+        UNION ALL
+        SELECT 1
+        FROM manual_attendance_records mar
+        WHERE mar.school_year_id = $2::uuid
+          AND LOWER(TRIM(mar.student_id)) = LOWER(TRIM($1))
+          AND mar.event_id IS NOT NULL
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+          AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($3::text)
+          AND NOT EXISTS (
+            SELECT 1
+            FROM attendance_student_event_overrides correction
+            WHERE correction.school_year_id = mar.school_year_id
+              AND correction.student_key = LOWER(TRIM(mar.student_id))
+              AND correction.event_id = mar.event_id
+              AND correction.attended = FALSE
+          )
+        UNION ALL
+        SELECT 1
+        FROM attendance_student_event_overrides correction
+        WHERE correction.school_year_id = $2::uuid
+          AND correction.student_key = LOWER(TRIM($1))
+          AND correction.attended = TRUE
+      ) AS exists
+    `,
+    [studentId, schoolYearId, ZERO_ATTENDANCE_REMARK],
+  );
+  return result.rows[0]?.exists ?? false;
+}
+
 export async function createAttendanceRequest(input: AttendanceRequestInput) {
   const requestType = normalizeRequestType(input.requestType);
   const inputSchoolYearId = cleanText(input.schoolYearId);
@@ -638,17 +693,7 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
       if (!name || !yearLevel || !college || !program) {
         throw createHttpError("Name, year level, college, and program are required.");
       }
-      const attended = await client.query<{ id: string }>(`
-        SELECT id FROM attendance_records
-        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND school_year_id = $2
-          AND event_id IS NOT NULL AND deleted_at IS NULL
-        UNION ALL
-        SELECT id FROM manual_attendance_records
-        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND school_year_id = $2
-          AND event_id IS NOT NULL
-        LIMIT 1
-      `, [studentId, schoolYearId]);
-      if (attended.rows.length) {
+      if (await findCountedEventParticipationForStudent(client, studentId, schoolYearId)) {
         throw createHttpError("An event attendance record already exists for this school year. Request an event review instead.", 409);
       }
       const pending = await client.query<{ id: string }>(`
@@ -1487,34 +1532,62 @@ async function applyApprovedZeroAttendance(
   request: AttendanceRequestRecord,
 ) {
   const studentId = cleanText(request.student_id);
-  const attended = await client.query<{ id: string }>(`
-    SELECT id FROM attendance_records
-    WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND school_year_id = $2
-      AND event_id IS NOT NULL AND deleted_at IS NULL
-    UNION ALL
-    SELECT id FROM manual_attendance_records
-    WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1)) AND school_year_id = $2
-      AND event_id IS NOT NULL
-    LIMIT 1
-  `, [studentId, request.school_year_id]);
-  if (attended.rows.length) {
-    throw createHttpError("This student already has event attendance for the selected school year.", 409);
+  if (await findCountedEventParticipationForStudent(client, studentId, request.school_year_id)) {
+    throw createHttpError("This student already has recorded event attendance for this school year / semester, so the no-participation declaration cannot be approved. Reject it and ask the student to submit an event review instead.", 409);
   }
 
-  await client.query(`
-    INSERT INTO students (student_id, name, year_level, college, program, institution)
-    VALUES ($1, $2, $3, $4, $5, $6)
-    ON CONFLICT ((LOWER(TRIM(student_id)))) DO UPDATE SET
-      name = EXCLUDED.name,
-      year_level = EXCLUDED.year_level,
-      college = EXCLUDED.college,
-      program = EXCLUDED.program,
-      institution = EXCLUDED.institution,
-      updated_at = NOW()
-  `, [
-    studentId, request.name, request.year_level, request.college,
-    request.program, request.institution || DEFAULT_REQUEST_INSTITUTION,
-  ]);
+  const studentValues = [
+    studentId,
+    request.name,
+    request.year_level ?? "",
+    request.college ?? "",
+    request.program ?? "",
+    request.institution || DEFAULT_REQUEST_INSTITUTION,
+  ];
+  const updatedStudent = await client.query(
+    `
+      UPDATE students
+      SET name = $2,
+          year_level = COALESCE(NULLIF($3, ''), year_level),
+          college = COALESCE(NULLIF($4, ''), college),
+          program = COALESCE(NULLIF($5, ''), program),
+          institution = COALESCE(NULLIF($6, ''), institution),
+          updated_at = NOW()
+      WHERE id = (
+        SELECT id
+        FROM students
+        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT 1
+      )
+    `,
+    studentValues,
+  );
+
+  if (!updatedStudent.rowCount) {
+    await client.query(
+      `
+        INSERT INTO students (
+          student_id,
+          name,
+          year_level,
+          college,
+          program,
+          institution
+        )
+        VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''))
+        ON CONFLICT ((LOWER(TRIM(student_id))))
+        DO UPDATE SET
+          name = EXCLUDED.name,
+          year_level = COALESCE(EXCLUDED.year_level, students.year_level),
+          college = COALESCE(EXCLUDED.college, students.college),
+          program = COALESCE(EXCLUDED.program, students.program),
+          institution = COALESCE(EXCLUDED.institution, students.institution),
+          updated_at = NOW()
+      `,
+      studentValues,
+    );
+  }
 
   const saved = await client.query<{ id: string }>(`
     SELECT id FROM attendance_records
@@ -1526,8 +1599,8 @@ async function applyApprovedZeroAttendance(
 
   if (saved.rows[0]) {
     await client.query(`
-      UPDATE attendance_records SET name = $2, year_level = $3, college = $4,
-        program = $5, institution = $6, updated_at = NOW()
+      UPDATE attendance_records SET name = $2, year_level = NULLIF($3, ''), college = NULLIF($4, ''),
+        program = NULLIF($5, ''), institution = $6, updated_at = NOW()
       WHERE id = $1
     `, [saved.rows[0].id, request.name, request.year_level, request.college,
       request.program, request.institution || DEFAULT_REQUEST_INSTITUTION]);
@@ -1537,7 +1610,7 @@ async function applyApprovedZeroAttendance(
     INSERT INTO attendance_records (
       school_year_id, import_id, event_id, student_id, name, year_level,
       college, program, institution, no_of_absences, remarks, scanned_at
-    ) VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, 0, $8, NULL)
+    ) VALUES ($1, NULL, NULL, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7, 0, $8, NULL)
   `, [
     request.school_year_id, studentId, request.name, request.year_level,
     request.college, request.program,

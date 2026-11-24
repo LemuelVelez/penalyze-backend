@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import type { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 
@@ -113,6 +114,17 @@ export async function requests(
   }
 }
 
+function getStreamErrorMessage(error: unknown, fallback: string) {
+  const raw = error as { statusCode?: number; message?: string; code?: string } | null;
+  if (raw && [400, 401, 403, 404, 409, 422].includes(raw.statusCode ?? 0) &&
+      typeof raw.message === "string" && raw.message.length <= 700 && !raw.code) {
+    return raw.message;
+  }
+  const requestId = randomUUID();
+  console.error(`[${requestId}] Attendance request review stream failed:`, error);
+  return `${fallback} Reference: ${requestId}.`;
+}
+
 function getReviewSuccessMessage(result: Awaited<ReturnType<typeof reviewAttendanceRequest>>) {
   if ("autoClosedByExemption" in result && result.autoClosedByExemption) {
     return "Attendance request closed automatically: all events are exempted.";
@@ -190,7 +202,7 @@ export async function reviewRequestWithProgress(
       res.locals.auditOutcome = "failed";
       writeProgressStreamMessage(res, {
         type: "error",
-        message: "Unable to review attendance request.",
+        message: getStreamErrorMessage(error, "Unable to review attendance request."),
       });
       res.end();
       return;
@@ -265,7 +277,7 @@ export async function reviewRequestGroupWithProgress(
       res.locals.auditOutcome = "failed";
       writeProgressStreamMessage(res, {
         type: "error",
-        message: "Unable to review attendance request group.",
+        message: getStreamErrorMessage(error, "Unable to review attendance request group."),
       });
       res.end();
       return;
