@@ -3,7 +3,7 @@ import type { PoolClient } from "pg";
 import * as XLSX from "xlsx";
 import type { MasterlistStatus, SchoolYearRecord, StudentMasterlistRecord, StudentMasterlistImportRecord, ParsedAttendanceRow } from "../database/model/schema.model";
 import { pool, withTransaction } from "../lib/db";
-import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelKey, normalizeCollegeKey, lockAttendanceAbsenceSync, refreshDerivedAttendanceResultsForSchoolYearsWithClient, listAttendanceFinalResults, listFinalAttendanceEventRoster, syncAbsencesForStudents, ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL } from "./attendance.service";
+import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelKey, normalizeCollegeKey, lockAttendanceAbsenceSync, refreshDerivedAttendanceResultsForSchoolYearsWithClient, listAttendanceFinalResults, listFinalAttendanceEventRoster, syncAbsencesForStudents, attendanceEventRosterScopeCteSql } from "./attendance.service";
 import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
 import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram, parseStudentNumberParts, isPlaceholderStudentNumber, nameTokens, nameTokensAgree, nameKeysAgree, sharedNameTokenCount, nameTokenSignatures } from "./masterlist-normalize";
 
@@ -576,12 +576,13 @@ export async function listMasterlist(f:MasterlistFilters) {
 
 type EventColumn = { id:string; name:string; event_order:number|null; event_start_at:string|null };
 type FinalRow = { student_number:string; name:string; last_name:string|null; given_name:string|null; middle_initial:string|null; program:string|null; year_level:string|null; college:string|null; attended_events:number; expected_events:number|null; total_absences:number|null; attendance_status:string; event_details:Record<string,"P"|"A"|"E"> };
-async function withFinalAttendanceSnapshot<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
+async function withFinalAttendanceSnapshot<T>(work: (client: PoolClient) => Promise<T>, exportAll = false): Promise<T> {
   const client = await pool.connect();
   let releaseError: Error | undefined;
   try {
     await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-    await client.query("SET LOCAL statement_timeout = '120000ms'");
+    await client.query(exportAll ? "SET LOCAL statement_timeout = '120000ms'" : "SET LOCAL statement_timeout = '30000ms'");
+    await client.query("SET LOCAL lock_timeout = '5000ms'");
     const result = await work(client);
     await client.query("COMMIT");
     return result;
@@ -614,11 +615,16 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
     const pageMaster=exportAll ? filteredMaster : filteredMaster.slice(start,end);
     const pageFinals=exportAll ? filteredFinals : filteredFinals.slice(start,end);
     const studentKeys=[...new Set(hasMasterlist ? pageMaster.map(r=>r.student_number_key) : pageFinals.map(r=>normalizeStudentNumberKey(r.student_id)))];
+    // Calculate the event/college roster once for the selected semester, and
+    // reuse it for every page student (and every batch when exporting).
+    const eventRosterScope=hasMasterlist || studentKeys.length
+      ? (await client.query<{college_key:string;event_id:string}>(`WITH ${attendanceEventRosterScopeCteSql("$1")} SELECT college_key,event_id FROM event_roster_scope`,[schoolYear.id])).rows
+      : [];
     const finals: Awaited<ReturnType<typeof listAttendanceFinalResults>> = [];
     const joined: {student_number_key:string;final_id:string|null}[] = [];
     for(let i=0;i<studentKeys.length;i+=200) {
       const keys=studentKeys.slice(i,i+200);
-      finals.push(...await listAttendanceFinalResults({schoolYearId:schoolYear.id,consolidatedOnly:true,includeEventDetails:true,studentKeys:keys,limit:2147483647,offset:0},client));
+      finals.push(...await listAttendanceFinalResults({schoolYearId:schoolYear.id,consolidatedOnly:true,includeEventDetails:true,eventRosterScope,studentKeys:keys,limit:2147483647,offset:0},client));
       if(hasMasterlist) joined.push(...(await client.query<{student_number_key:string;final_id:string|null}>(`SELECT DISTINCT ON (m.student_number_key) m.student_number_key,f.id AS final_id FROM student_masterlist m LEFT JOIN attendance_final_results f ON f.school_year_id=m.school_year_id AND f.import_id IS NULL AND public.masterlist_student_number_key(f.student_id)=m.student_number_key WHERE m.school_year_id=$1 AND m.student_number_key = ANY($2::text[]) ORDER BY m.student_number_key,f.updated_at DESC NULLS LAST`,[schoolYear.id,keys])).rows);
     }
     const finalByUuid=new Map(finals.map(r=>[r.id,r]));
@@ -626,8 +632,7 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
     const exemptions=(await client.query<{event_id:string;college_key:string|null;year_level_key:string|null}>(`SELECT x.event_id,x.college_key,NULL::text AS year_level_key FROM attendance_event_college_exemptions x JOIN attendance_events e ON e.id=x.event_id WHERE e.school_year_id=$1 UNION ALL SELECT x.event_id,x.college_key,x.year_level_key FROM attendance_event_year_level_exemptions x JOIN attendance_events e ON e.id=x.event_id WHERE e.school_year_id=$1`,[schoolYear.id])).rows;
     const roster = new Set<string>();
     if (hasMasterlist) {
-      const scope = await client.query<{ college_key: string; event_id: string }>(`WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL} SELECT college_key,event_id FROM event_roster_scope WHERE school_year_id=$1`, [schoolYear.id]);
-      for (const r of scope.rows) roster.add(`${r.college_key}|${r.event_id}`);
+      for (const r of eventRosterScope) roster.add(`${r.college_key}|${r.event_id}`);
     } else if (pageFinals.length && exemptions.some(x=>x.college_key===null)) {
       // Without a masterlist the whole-year roster only affects globally exempt cells.
       for (const row of await listFinalAttendanceEventRoster(client,schoolYear.id)) roster.add(`${normalizeCollegeKey(row.college)}|${row.event_id}`);
@@ -651,7 +656,7 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
     const unmatched=includeUnmatched ? await loadUnmatched(client,schoolYear.id,index,f) : [];
     const programRows=hasMasterlist ? index.rows : baseFinals;
     return {rows,total:hasMasterlist ? filteredMaster.length : filteredFinals.length,schoolYear,events,unmatched,unmatchedCount:includeUnmatched ? unmatched.length : null,hasMasterlist,programs:[...new Set(programRows.filter(r=>!f.college || normalizeCollegeKey(r.college)===normalizeCollegeKey(f.college)).map(r=>r.program).filter((p):p is string=>!!p))].sort()};
-  });
+  }, exportAll);
 }
 async function loadUnmatched(client: PoolClient, schoolYearId: string, index: MasterIndex, f: MasterlistFilters) {
     const unmatched:Array<{student_id:string;name:string;college:string|null;program:string|null;year_level:string|null;reason:string}>=[];

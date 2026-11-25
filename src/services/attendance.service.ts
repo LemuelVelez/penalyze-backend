@@ -9948,6 +9948,7 @@ type AttendanceFinalResultsFilter = {
   college?: string;
   includeMissedEvents?: boolean;
   includeEventDetails?: boolean;
+  eventRosterScope?: { college_key: string; event_id: string }[];
   consolidatedOnly?: boolean;
   limit?: number;
   offset?: number;
@@ -11427,9 +11428,11 @@ export async function listAttendanceFinalResults(
 ) {
   const clauses: string[] = [getAttendanceFinalResultVisibilitySql("afr")];
   const params: unknown[] = [];
+  let schoolYearParam: string | undefined;
 
   if (options.schoolYearId) {
     params.push(options.schoolYearId);
+    schoolYearParam = `$${params.length}`;
     clauses.push(`afr.school_year_id = $${params.length}`);
   }
 
@@ -11469,6 +11472,14 @@ export async function listAttendanceFinalResults(
     clauses.push(
       `LOWER(TRIM(COALESCE(afr.college, ''))) = LOWER(TRIM($${params.length}))`,
     );
+  }
+
+  // Reuse the semester roster across all requested students instead of scanning
+  // the attendance records once per student in the event-details lateral join.
+  let eventRosterParam: string | undefined;
+  if (options.includeEventDetails && schoolYearParam && options.eventRosterScope !== undefined) {
+    params.push(JSON.stringify(options.eventRosterScope));
+    eventRosterParam = `$${params.length}`;
   }
 
   params.push(options.limit ?? 100);
@@ -11565,7 +11576,11 @@ export async function listAttendanceFinalResults(
                    COALESCE(expected_event.event_start_at, expected_event.event_end_at) ASC NULLS LAST,
                    expected_event.name ASC
         ) AS event_details
-        FROM (
+        FROM ${eventRosterParam
+          ? `(SELECT event_id FROM jsonb_to_recordset(${eventRosterParam}::jsonb)
+               AS scope(college_key text, event_id uuid)
+             WHERE scope.college_key = afr.college_key)`
+          : `(
           SELECT DISTINCT
             COALESCE(detail_record.event_id, detail_import.event_id) AS event_id
           FROM attendance_records detail_record
@@ -11601,7 +11616,7 @@ export async function listAttendanceFinalResults(
               getResolvedStudentYearLevelKeySql("detail_manual.student_id", "detail_manual.school_year_id"),
               getCanonicalCollegeKeySql("detail_manual", "detail_manual_student"),
             )}
-        ) roster
+        )`} roster
         JOIN attendance_events expected_event ON expected_event.id = roster.event_id
           AND ${getEventYearLevelExemptionFilterSql(
             "roster.event_id",
@@ -11609,7 +11624,7 @@ export async function listAttendanceFinalResults(
             "afr.college_key",
           )}
         LEFT JOIN attendance_student_event_overrides correction
-          ON correction.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+          ON correction.school_year_id ${eventRosterParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
          AND correction.student_key = LOWER(TRIM(afr.student_id))
          AND correction.event_id = roster.event_id
         LEFT JOIN LATERAL (
@@ -11628,7 +11643,7 @@ export async function listAttendanceFinalResults(
               ON attended_import.id = attended_record.import_id
              AND attended_import.deleted_at IS NULL
             WHERE ${getAttendanceRecordVisibilitySql("attended_record")}
-              AND attended_record.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+              AND attended_record.school_year_id ${eventRosterParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
               AND LOWER(TRIM(attended_record.student_id)) = LOWER(TRIM(afr.student_id))
               AND COALESCE(attended_record.event_id, attended_import.event_id) = roster.event_id
 
@@ -11640,7 +11655,7 @@ export async function listAttendanceFinalResults(
               COALESCE(attended_manual.scanned_at, attended_manual.created_at) AS scanned_at,
               attended_manual.remarks
             FROM manual_attendance_records attended_manual
-            WHERE attended_manual.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+            WHERE attended_manual.school_year_id ${eventRosterParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
               AND LOWER(TRIM(attended_manual.student_id)) = LOWER(TRIM(afr.student_id))
               AND attended_manual.event_id = roster.event_id
               AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
