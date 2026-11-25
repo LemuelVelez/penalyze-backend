@@ -18,7 +18,7 @@ export function collegeForProgram(value: unknown): string | null {
   if (["BUSINESS ADMINISTRATION-FINANCIAL MANAGEMENT", "AGRIBUSINESS", "AGRIBUSINESS MANAGEMENT", "HOSPITALITY MANAGEMENT"].some(x => p === bs + x)) return "College of Business Administration";
   if (["BACHELOR OF ELEMENTARY EDUCATION", "BACHELOR OF PHYSICAL EDUCATION", ...["ENGLISH", "FILIPINO", "MATHEMATICS", "SOCIAL STUDIES"].map(x => `BACHELOR OF SECONDARY EDUCATION-${x}`)].includes(p)) return "College of Teacher Education";
   if (["COMPUTER SCIENCE", "INFORMATION SYSTEMS"].some(x => p === bs + x)) return "College of Computing Studies";
-  if (p === bs + "AGRICULTURE" || p.startsWith(bs + "AGRICULTURE-") || p === bs + "FORESTRY") return "College of Agriculture and Forestry";
+  if (p.startsWith(bs + "AGRICULTURE") || p === bs + "FORESTRY") return "College of Agriculture and Forestry";
   if (p === "BACHELOR OF ARTS IN ENGLISH LANGUAGE STUDIES") return "College of Liberal Arts, Mathematics and Sciences";
   if (p === bs + "CRIMINOLOGY") return "School of Criminal Justice Education";
   return null;
