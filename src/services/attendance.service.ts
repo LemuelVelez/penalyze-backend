@@ -4993,13 +4993,23 @@ async function insertManualAttendanceRecord(client: PoolClient, input: RawImport
   };
 }
 
-async function saveManualAttendanceInputs(inputs: RawImportRow[]) {
+export type ManualAttendanceProgress = (stage: string, percent: number, message: string) => void;
+async function saveManualAttendanceInputs(inputs: RawImportRow[], onProgress?: ManualAttendanceProgress) {
   return withTransaction(async client => {
+    onProgress?.("waiting_for_lock", 0, "Waiting for lock");
     await lockManualAttendanceTransaction(client);
     const cache: MasterlistCache = new Map();
     const results: Awaited<ReturnType<typeof insertManualAttendanceRecord>>[] = [];
-    for (const input of inputs) results.push(await insertManualAttendanceRecord(client, input, cache));
-    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, results.map(result => result.manualRecord.school_year_id));
+    for (const [index, input] of inputs.entries()) {
+      onProgress?.("saving_events", 5 + 65 * index / inputs.length, `Saving event ${index + 1} of ${inputs.length}`);
+      results.push(await insertManualAttendanceRecord(client, input, cache));
+    }
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, results.map(result => result.manualRecord.school_year_id), progress => {
+      const stages = { refreshing_final_results: ["Refreshing final results", 0], refreshing_calculations: ["Refreshing calculations", 1], refreshing_penalties: ["Refreshing penalties", 2] } as const;
+      const [message, index] = stages[progress.stage];
+      onProgress?.(progress.stage, 70 + 27 * ((progress.scopeIndex - 1) * 3 + index) / (progress.scopeTotal * 3), message);
+    });
+    onProgress?.("committing", 98, "Committing");
     return results;
   });
 }
@@ -5009,7 +5019,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
   return result;
 }
 
-export async function saveManualAttendanceRecords(input: RawImportRow) {
+export async function saveManualAttendanceRecords(input: RawImportRow, onProgress?: ManualAttendanceProgress) {
   const eventIds = input.eventIds;
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!Array.isArray(eventIds) || eventIds.length > 10000 || eventIds.some(id => typeof id !== "string" || !uuid.test(id))) {
@@ -5019,7 +5029,7 @@ export async function saveManualAttendanceRecords(input: RawImportRow) {
   // An empty selection retains the existing zero-attendance registration behaviour.
   const inputs = ids.length ? ids.map(eventId => ({ ...input, attendanceType: "manual", eventId })) :
     [{ ...input, attendanceType: "zero_attendance", eventId: undefined, event_id: undefined }];
-  return saveManualAttendanceInputs(inputs);
+  return saveManualAttendanceInputs(inputs, onProgress);
 }
 
 export async function updateAttendanceRecords(
@@ -7725,6 +7735,11 @@ function getYearLevelResolutionCtesSql() {
         FROM (
           SELECT DISTINCT school_year_id, normalized_student_id
           FROM calculation_year_level_candidates
+          UNION
+          SELECT ml.school_year_id, LOWER(TRIM(ml.student_number))
+          FROM student_masterlist ml
+          WHERE ($1::uuid IS NULL OR ml.school_year_id = $1::uuid)
+            AND public.is_masterlist_school_year(ml.school_year_id)
         ) keys
         LEFT JOIN calculation_latest_year_levels latest
           ON latest.school_year_id IS NOT DISTINCT FROM keys.school_year_id
@@ -7941,6 +7956,7 @@ async function refreshCalculationResultsWithClient(
   const importIds = normalizeImportIds(options.importIds ?? []);
   const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
   const sourceFlags = getCalculationSourceFlags(sourceTypes);
+  const includeMasterlist = importIds.length === 0 && sourceFlags.includeImported && sourceFlags.includeManual && sourceFlags.includeZeroAttendance;
   const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
 
   if (options.resolveUnattachedEvents !== false) {
@@ -8019,10 +8035,6 @@ async function refreshCalculationResultsWithClient(
               )
             )
           )
-      ), selected_student_keys AS (
-        SELECT school_year_id, normalized_student_id FROM selected_imported_records
-        UNION
-        SELECT school_year_id, normalized_student_id FROM selected_manual_records
       ), all_imported_records AS (
         SELECT
           ar.school_year_id,
@@ -8138,6 +8150,25 @@ async function refreshCalculationResultsWithClient(
           MAX(updated_at) AS source_updated_at
         FROM all_manual_records
         GROUP BY school_year_id, normalized_student_id
+      ), masterlist_students AS (
+        SELECT ml.school_year_id, LOWER(TRIM(ml.student_number)) AS normalized_student_id,
+          ml.student_number AS student_id, ml.full_name AS name, ml.year_level, ml.college, ml.program
+        FROM student_masterlist ml
+        WHERE ($1::uuid IS NULL OR ml.school_year_id = $1::uuid)
+          AND $8::boolean
+          AND public.is_masterlist_school_year(ml.school_year_id)
+      ), selected_student_keys AS (
+        SELECT school_year_id, normalized_student_id FROM selected_imported_records
+        UNION
+        SELECT school_year_id, normalized_student_id FROM selected_manual_records
+        UNION
+        SELECT m.school_year_id, m.normalized_student_id FROM masterlist_students m
+        WHERE NOT EXISTS (
+          SELECT 1 FROM (SELECT school_year_id, student_id FROM imported_totals
+                         UNION ALL SELECT school_year_id, student_id FROM manual_totals) r
+          WHERE r.school_year_id IS NOT DISTINCT FROM m.school_year_id
+            AND public.masterlist_student_number_key(r.student_id) = public.masterlist_student_number_key(m.student_id)
+        )
       ), student_college_candidates AS (
         SELECT school_year_id, normalized_student_id, college_key
         FROM all_imported_records
@@ -8206,8 +8237,8 @@ async function refreshCalculationResultsWithClient(
           keys.school_year_id,
           $3::TEXT AS calculation_scope_key,
           COALESCE(selected_imports.import_ids, ARRAY[]::uuid[]) AS import_ids,
-          COALESCE(imported.student_id, manual.student_id, keys.normalized_student_id) AS student_id,
-          COALESCE(imported.name, manual.name, keys.normalized_student_id) AS name,
+          COALESCE(imported.student_id, manual.student_id, master.student_id, keys.normalized_student_id) AS student_id,
+          COALESCE(imported.name, manual.name, master.name, keys.normalized_student_id) AS name,
           COALESCE(
             CASE scope.year_level_key
               WHEN '1' THEN '1st Year'
@@ -8218,10 +8249,11 @@ async function refreshCalculationResultsWithClient(
               ELSE NULL
             END,
             imported.year_level,
-            manual.year_level
+            manual.year_level,
+            master.year_level
           ) AS year_level,
-          COALESCE(imported.college, manual.college) AS college,
-          COALESCE(imported.program, manual.program) AS program,
+          COALESCE(imported.college, manual.college, master.college) AS college,
+          COALESCE(imported.program, manual.program, master.program) AS program,
           COALESCE(imported.institution, manual.institution) AS institution,
           scope.college_key,
           COALESCE(expected.expected_events, 0)::INT AS raw_expected_events,
@@ -8271,6 +8303,9 @@ async function refreshCalculationResultsWithClient(
         LEFT JOIN manual_totals manual
           ON manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
          AND manual.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN masterlist_students master
+          ON master.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND master.normalized_student_id = keys.normalized_student_id
         LEFT JOIN student_event_scope scope
           ON scope.school_year_id IS NOT DISTINCT FROM keys.school_year_id
          AND scope.normalized_student_id = keys.normalized_student_id
@@ -8412,6 +8447,7 @@ async function refreshCalculationResultsWithClient(
       sourceFlags.includeImported,
       sourceFlags.includeManual,
       sourceFlags.includeZeroAttendance,
+      includeMasterlist,
     ],
   );
 
@@ -8421,7 +8457,26 @@ async function refreshCalculationResultsWithClient(
       WHERE ($1::uuid IS NULL OR cr.school_year_id = $1::uuid)
         AND cr.calculation_scope_key = $2::TEXT
         AND NOT (
-          (
+          ($8::boolean AND EXISTS (
+            SELECT 1 FROM student_masterlist ml
+            WHERE ml.school_year_id = cr.school_year_id
+              AND public.is_masterlist_school_year(ml.school_year_id)
+              AND LOWER(TRIM(ml.student_number)) = LOWER(TRIM(cr.student_id))
+              AND NOT EXISTS (
+                SELECT 1 FROM attendance_records ar
+                WHERE ar.school_year_id = ml.school_year_id AND ${getAttendanceRecordVisibilitySql("ar")}
+                  AND public.masterlist_student_number_key(ar.student_id) = ml.student_number_key
+                  AND LOWER(TRIM(ar.student_id)) <> LOWER(TRIM(ml.student_number))
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM manual_attendance_records mar
+                WHERE mar.school_year_id = ml.school_year_id
+                  AND public.masterlist_student_number_key(mar.student_id) = ml.student_number_key
+                  AND LOWER(TRIM(mar.student_id)) <> LOWER(TRIM(ml.student_number))
+                  AND (mar.attendance_type = 'zero_attendance' OR mar.event_id IS NULL OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT) OR ${getManualCalculationRecordEligibilitySql("mar")})
+              )
+          ))
+          OR (
             $5::BOOLEAN
             AND EXISTS (
               SELECT 1
@@ -8479,6 +8534,7 @@ async function refreshCalculationResultsWithClient(
       sourceFlags.includeImported,
       sourceFlags.includeManual,
       sourceFlags.includeZeroAttendance,
+      includeMasterlist,
     ],
   );
 
@@ -10098,10 +10154,24 @@ async function refreshAttendanceFinalResultsWithClient(
           MAX(updated_at) AS source_updated_at
         FROM all_manual_records
         GROUP BY school_year_id, normalized_student_id
+      ), masterlist_students AS (
+        SELECT ml.school_year_id, LOWER(TRIM(ml.student_number)) AS normalized_student_id,
+          ml.student_number AS student_id, ml.full_name AS name, ml.year_level, ml.college, ml.program
+        FROM student_masterlist ml
+        WHERE ($1::uuid IS NULL OR ml.school_year_id = $1::uuid)
+          AND public.is_masterlist_school_year(ml.school_year_id)
       ), student_keys AS (
         SELECT school_year_id, normalized_student_id FROM imported_totals
         UNION
         SELECT school_year_id, normalized_student_id FROM manual_totals
+        UNION
+        SELECT m.school_year_id, m.normalized_student_id FROM masterlist_students m
+        WHERE NOT EXISTS (
+          SELECT 1 FROM (SELECT school_year_id, student_id FROM imported_totals
+                         UNION ALL SELECT school_year_id, student_id FROM manual_totals) r
+          WHERE r.school_year_id IS NOT DISTINCT FROM m.school_year_id
+            AND public.masterlist_student_number_key(r.student_id) = public.masterlist_student_number_key(m.student_id)
+        )
       ), student_college_candidates AS (
         SELECT school_year_id, normalized_student_id, college_key
         FROM all_imported_records
@@ -10156,8 +10226,8 @@ async function refreshAttendanceFinalResultsWithClient(
       ), uncorrected_merged AS (
         SELECT
           keys.school_year_id,
-          COALESCE(imported.student_id, manual.student_id, keys.normalized_student_id) AS student_id,
-          COALESCE(imported.name, manual.name, keys.normalized_student_id) AS name,
+          COALESCE(imported.student_id, manual.student_id, master.student_id, keys.normalized_student_id) AS student_id,
+          COALESCE(imported.name, manual.name, master.name, keys.normalized_student_id) AS name,
           COALESCE(
             CASE scope.year_level_key
               WHEN '1' THEN '1st Year'
@@ -10169,10 +10239,11 @@ async function refreshAttendanceFinalResultsWithClient(
             END,
             imported.year_level,
             manual.year_level,
+            master.year_level,
             ''
           ) AS year_level,
-          COALESCE(imported.college, manual.college, '') AS college,
-          COALESCE(imported.program, manual.program, '') AS program,
+          COALESCE(imported.college, manual.college, master.college, '') AS college,
+          COALESCE(imported.program, manual.program, master.program, '') AS program,
           COALESCE(imported.institution, manual.institution, '') AS institution,
           scope.college_key,
           COALESCE(expected.expected_events, 0)::INT AS raw_expected_events,
@@ -10210,6 +10281,9 @@ async function refreshAttendanceFinalResultsWithClient(
         LEFT JOIN manual_totals manual
           ON manual.school_year_id IS NOT DISTINCT FROM keys.school_year_id
          AND manual.normalized_student_id = keys.normalized_student_id
+        LEFT JOIN masterlist_students master
+          ON master.school_year_id IS NOT DISTINCT FROM keys.school_year_id
+         AND master.normalized_student_id = keys.normalized_student_id
         LEFT JOIN student_event_scope scope
           ON scope.school_year_id IS NOT DISTINCT FROM keys.school_year_id
          AND scope.normalized_student_id = keys.normalized_student_id

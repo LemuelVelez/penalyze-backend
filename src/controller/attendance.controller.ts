@@ -1,3 +1,5 @@
+import { pool } from "../lib/db";
+import { isMasterlistActiveForSchoolYear, masterlistActiveError, MANUAL_ATTENDANCE_MASTERLIST_MESSAGE, ZERO_ATTENDANCE_MASTERLIST_MESSAGE } from "../services/masterlist.service";
 import { NextFunction, Request, Response } from "express";
 import { randomUUID } from "node:crypto";
 import multer from "multer";
@@ -736,12 +738,29 @@ export async function deleteEvent(
   }
 }
 
+async function guardManualAttendance(body: Record<string, unknown>) {
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const rawYear = body.schoolYearId ?? body.school_year_id;
+  const rawEvent = (Array.isArray(body.eventIds) ? body.eventIds[0] : undefined) ?? body.eventId ?? body.event_id;
+  const schoolYearId = typeof rawYear === "string" && uuid.test(rawYear) ? rawYear : undefined;
+  const eventId = typeof rawEvent === "string" && uuid.test(rawEvent) ? rawEvent : undefined;
+  const client = await pool.connect();
+  try {
+    const eventIds = Array.isArray(body.eventIds) ? body.eventIds.filter((id): id is string => typeof id === "string" && uuid.test(id)) : eventId ? [eventId] : [];
+    if (await isMasterlistActiveForSchoolYear(client, schoolYearId, { eventId, eventIds })) {
+      const zero = (Array.isArray(body.eventIds) && body.eventIds.length === 0) || body.attendanceType === "zero_attendance" || body.attendance_type === "zero_attendance";
+      throw masterlistActiveError(zero ? ZERO_ATTENDANCE_MASTERLIST_MESSAGE : MANUAL_ATTENDANCE_MASTERLIST_MESSAGE);
+    }
+  } finally { client.release(); }
+}
+
 export async function manualSave(
   req: Request,
   res: Response,
   next: NextFunction,
 ) {
   try {
+    await guardManualAttendance(req.body ?? {});
     const result = await saveManualAttendanceRecord(req.body ?? {});
     res
       .status(201)
@@ -753,9 +772,31 @@ export async function manualSave(
 
 export async function manualBatchSave(req: Request, res: Response, next: NextFunction) {
   try {
+    await guardManualAttendance(req.body ?? {});
     const result = await saveManualAttendanceRecords(req.body ?? {});
     res.status(201).json({ message: "Manual attendance saved successfully.", data: result });
   } catch (error) { next(error); }
+}
+
+export async function manualBatchSaveWithProgress(req: Request, res: Response, next: NextFunction) {
+  let keepAlive: ReturnType<typeof setInterval> | undefined;
+  try {
+    await guardManualAttendance(req.body ?? {});
+    prepareProgressStream(res, 200);
+    keepAlive = setInterval(() => { if (!res.destroyed && !res.writableEnded) res.write("\n"); }, 15_000);
+    keepAlive.unref();
+    const result = await saveManualAttendanceRecords(req.body ?? {}, (stage, percent, message) => {
+      writeProgressStreamMessage(res, { type: "progress", progress: { stage, percent, message } });
+    });
+    writeProgressStreamMessage(res, { type: "success", message: "Manual attendance saved successfully.", data: result });
+    if (!res.destroyed && !res.writableEnded) res.end();
+  } catch (error) {
+    if (!res.headersSent) return next(error);
+    res.locals.auditOutcome = "failed";
+    const raw = error as { expose?: boolean; message?: string; code?: string };
+    writeProgressStreamMessage(res, { type: "error", message: raw.expose ? raw.message || "Unable to save manual attendance." : "Unable to save manual attendance.", ...(raw.code === "MASTERLIST_ACTIVE" ? { code: raw.code } : {}) });
+    if (!res.destroyed && !res.writableEnded) res.end();
+  } finally { if (keepAlive) clearInterval(keepAlive); }
 }
 
 export async function updateRecord(

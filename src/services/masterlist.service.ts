@@ -38,6 +38,35 @@ function progressReporter(onProgress?: ProgressCallback, isCancelled?: () => boo
 export function isMasterlistSchoolYear(year: SchoolYearRecord | undefined | null): boolean {
   return !!year && year.semester === "first_semester" && (getSchoolYearMetadataLabels(year).some(label => /2026\s*[-–—/]\s*2027/.test(label)) || (new Date(year.starts_at).getUTCFullYear() === 2026 && new Date(year.ends_at).getUTCFullYear() === 2027));
 }
+export const ZERO_ATTENDANCE_MASTERLIST_MESSAGE = "Zero attendance is not needed: every masterlist student is already listed on the Attendance page with all expected events marked absent.";
+export const MANUAL_ATTENDANCE_MASTERLIST_MESSAGE = "Manual attendance is disabled while the masterlist is active. Use the Attendance page: search the student, open Events, then use + / − to add or subtract events.";
+export function masterlistActiveError(message: string) {
+  return Object.assign(new Error(message), { statusCode: 409, expose: true, code: "MASTERLIST_ACTIVE" });
+}
+export async function isMasterlistActiveForSchoolYear(client: PoolClient, schoolYearId: string | null | undefined, fallback?: { eventId?: string; eventIds?: string[] }): Promise<boolean> {
+  const { rows } = await client.query<{ active: boolean }>(`
+    SELECT EXISTS (
+      SELECT 1 FROM student_masterlist ml
+      WHERE (ml.school_year_id = COALESCE($1::uuid,
+        CASE WHEN $3::boolean THEN COALESCE(
+          (SELECT school_year_id FROM attendance_events WHERE id = $2::uuid),
+          (SELECT id FROM school_years WHERE is_active ORDER BY starts_at DESC LIMIT 1)
+        ) END)
+        OR ml.school_year_id IN (SELECT school_year_id FROM attendance_events WHERE id = ANY($4::uuid[])))
+      AND public.is_masterlist_school_year(ml.school_year_id)
+    ) AS active
+  `, [schoolYearId ?? null, fallback?.eventId ?? null, fallback !== undefined, fallback?.eventIds ?? []]);
+  return rows[0]?.active === true;
+}
+export async function getMasterlistStatus(): Promise<{ active: boolean; schoolYearId: string | null; schoolYearName: string | null; studentCount: number }> {
+  const client = await pool.connect();
+  try {
+    const year = (await client.query<SchoolYearRecord>("SELECT * FROM school_years WHERE is_active ORDER BY starts_at DESC LIMIT 1")).rows[0];
+    const active = await isMasterlistActiveForSchoolYear(client, year?.id);
+    const studentCount = active ? Number((await client.query<{ count: string }>("SELECT COUNT(*) AS count FROM student_masterlist WHERE school_year_id = $1", [year.id])).rows[0].count) : 0;
+    return { active, schoolYearId: year?.id ?? null, schoolYearName: year?.name ?? null, studentCount };
+  } finally { client.release(); }
+}
 async function activeYear(client: PoolClient) {
   const year = (await client.query<SchoolYearRecord>("SELECT * FROM school_years WHERE is_active ORDER BY starts_at DESC LIMIT 1")).rows[0];
   if (!isMasterlistSchoolYear(year)) throw bad("Masterlist is only available for the active 1st Semester, A.Y. 2026-2027.");
@@ -543,6 +572,7 @@ export const deleteMasterlist = (importId: string) => withTransaction(async clie
   if (pending && pending.import_id!==importId) throw bad("The masterlist changed since this page was loaded. Refresh and try again.");
   const result = await client.query("DELETE FROM student_masterlist WHERE school_year_id=$1", [year.id]);
   if (pending) await client.query("DELETE FROM student_masterlist_upload_jobs WHERE id=$1",[pending.id]);
+  await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [year.id]);
   return { schoolYear: year, deletedRows: result.rowCount ?? 0 };
 });
 

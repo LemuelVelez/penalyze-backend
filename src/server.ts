@@ -70,6 +70,7 @@ import {
   manualRecords as attendanceManualRecords,
   manualSave,
   manualBatchSave,
+  manualBatchSaveWithProgress,
   previewImport,
   previewCalculationResultRows as previewAttendanceCalculationResults,
   purgeImport as purgeAttendanceImport,
@@ -321,6 +322,8 @@ app.post("/api/masterlist/upload", requireAuth, requireAdmin, masterlistUpload.s
 app.post("/api/masterlist/upload/progress", requireAuth, requireAdmin, masterlistUpload.single("file"), masterlist.uploadWithProgress);
 app.post("/api/masterlist/upload/resume/progress", requireAuth, requireAdmin, masterlist.resumeUploadWithProgress);
 app.delete("/api/masterlist/upload/pending", requireAuth, requireAdmin, masterlist.discardUpload);
+app.get("/api/masterlist/status", requireAuth, masterlist.status);
+app.get("/api/public/masterlist-status", limits(["masterlist-status:minute", 60, 60, clientIp]), masterlist.publicStatus);
 app.get("/api/masterlist", requireAuth, requireAdmin, masterlist.list);
 app.post("/api/masterlist/reconcile", requireAuth, requireAdmin, masterlist.reconcile);
 app.post("/api/masterlist/reconcile/progress", requireAuth, requireAdmin, masterlist.reconcileWithProgress);
@@ -450,6 +453,7 @@ app.delete(
   "/api/attendance/imports/:importId",
   requireAuth, requireAdmin, deleteAttendanceImport,
 );
+app.post("/api/attendance/manual/batch/progress", requireAuth, requireAdmin, manualBatchSaveWithProgress);
 app.post("/api/attendance/manual/batch", requireAuth, requireAdmin, manualBatchSave);
 app.post("/api/attendance/manual", requireAuth, requireAdmin, manualSave);
 app.post(
@@ -550,7 +554,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     : status >= 400 && status < 500 ? status : 500;
   console.error(`[${requestId}] request failed`, error);
   res.setHeader("X-Request-ID", requestId);
-  const response: { message: string; requestId: string; stack?: string } = {
+  const response: { message: string; requestId: string; stack?: string; code?: string } = {
     message: safeStatus === 400 ? "Invalid request." : safeStatus === 404 ? "Resource not found." : "Request failed.",
     requestId,
   };
@@ -562,7 +566,10 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     "23505": "A duplicate record blocked the save.",
     "23503": "A related record blocked the save. No changes were saved.",
   };
-  if (raw?.code && Object.prototype.hasOwnProperty.call(databaseMessages, raw.code)) {
+  if (raw?.code === "MASTERLIST_ACTIVE" && safeStatus === 409 && raw.expose) {
+    response.message = raw.message || response.message;
+    response.code = raw.code;
+  } else if (raw?.code && Object.prototype.hasOwnProperty.call(databaseMessages, raw.code)) {
     response.message = databaseMessages[raw.code];
   } else if (error instanceof multer.MulterError) {
     response.message = error.code === "LIMIT_FILE_SIZE"

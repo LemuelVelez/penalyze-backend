@@ -126,7 +126,7 @@ export async function requests(
 
 function sendReviewFailure(res: Response, error: unknown, fallback: string, stage?: string) {
   const raw = error as { statusCode?: number; message?: string; code?: string; expose?: boolean } | null;
-  const expected = raw?.expose === true && !raw.code &&
+  const expected = raw?.expose === true && (!raw.code || raw.code === "MASTERLIST_ACTIVE") &&
     [400, 401, 403, 404, 409, 422].includes(raw.statusCode ?? 0) &&
     typeof raw.message === "string";
   let status = expected ? raw.statusCode! : 500;
@@ -157,11 +157,11 @@ function sendReviewFailure(res: Response, error: unknown, fallback: string, stag
   }
   if (res.destroyed || res.writableEnded) return;
   if (res.headersSent) {
-    writeProgressStreamMessage(res, { type: "error", message });
+    writeProgressStreamMessage(res, { type: "error", message, ...(raw?.code === "MASTERLIST_ACTIVE" ? { code: raw.code } : {}) });
     res.end();
   } else {
     if (requestId) res.setHeader("X-Request-ID", requestId);
-    res.status(status).json({ message, ...(requestId ? { requestId } : {}) });
+    res.status(status).json({ message, ...(requestId ? { requestId } : {}), ...(raw?.code === "MASTERLIST_ACTIVE" ? { code: raw.code } : {}) });
   }
 }
 

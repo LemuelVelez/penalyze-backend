@@ -7,14 +7,14 @@ import {
   StudentRecord,
 } from "../database/model/schema.model";
 import { DEFAULT_PENALTIES } from "../database/seeder/penalties.seeder";
-import { query, withTransaction } from "../lib/db";
+import { isMasterlistActiveForSchoolYear, masterlistActiveError, ZERO_ATTENDANCE_MASTERLIST_MESSAGE } from "./masterlist.service";
+import { pool, query, withTransaction } from "../lib/db";
 import {
   getAttendanceFinalResultVisibilitySql,
   getAttendanceRecordVisibilitySql,
 } from "./attendance-result-visibility";
 import {
   ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL,
-  getAttendanceRecordEventRosterCollegeSql,
   getCanonicalCollegeKeySql,
   getEventStudentExemptionFilterSql,
   getEventYearLevelExemptionFilterSql,
@@ -682,6 +682,10 @@ export async function registerZeroAttendanceFine(
 ) {
   const cleanInput = validateZeroAttendanceInput(input);
   const schoolYearId = await resolveSchoolYearId(cleanInput.schoolYearId);
+  const client = await pool.connect();
+  try {
+    if (await isMasterlistActiveForSchoolYear(client, schoolYearId)) throw masterlistActiveError(ZERO_ATTENDANCE_MASTERLIST_MESSAGE);
+  } finally { client.release(); }
   const totalEvents = await getAttendanceEventCount(cleanInput, schoolYearId);
 
   await upsertStudentRecord(cleanInput);
@@ -954,7 +958,6 @@ export type PenaltyResultAbsentEvents = {
 export async function getPenaltyResultAbsentEvents(
   penaltyResultId: string,
 ): Promise<PenaltyResultAbsentEvents | null> {
-  const studentCollegeScopeSql = getAttendanceRecordEventRosterCollegeSql("afr");
   const result = await query<{
     student_id: string;
     name: string;
@@ -974,16 +977,12 @@ export async function getPenaltyResultAbsentEvents(
           pr.student_id,
           pr.name,
           pr.no_of_absences,
-          COALESCE(
-            NULLIF(TRIM(afr.college), ''),
-            (
-              SELECT NULLIF(TRIM(scope_student.college), '')
-              FROM students scope_student
-              WHERE LOWER(TRIM(scope_student.student_id)) = LOWER(TRIM(pr.student_id))
-              LIMIT 1
-            )
-          ) AS college,
-          ${studentCollegeScopeSql} AS college_key,
+          afr.college AS college,
+          afr.college_key AS college_key,
+          EXISTS (SELECT 1 FROM student_masterlist ml
+            WHERE ml.school_year_id = afr.school_year_id
+              AND public.is_masterlist_school_year(ml.school_year_id)
+              AND ml.student_number_key = public.masterlist_student_number_key(afr.student_id)) AS is_masterlist_student,
           ${getResolvedStudentYearLevelKeySql("pr.student_id", "pr.school_year_id")} AS year_level_key
         FROM penalty_results pr
         JOIN attendance_final_results afr
@@ -1043,7 +1042,12 @@ export async function getPenaltyResultAbsentEvents(
           AND attended.normalized_student_id = LOWER(TRIM(t.student_id))
           AND attended.college_key IS NOT DISTINCT FROM t.college_key
           AND attended.event_key = roster.event_id::TEXT
-        WHERE attended.event_key IS NULL
+        LEFT JOIN attendance_student_event_overrides correction
+          ON t.is_masterlist_student
+         AND correction.school_year_id IS NOT DISTINCT FROM t.school_year_id
+         AND correction.student_key = LOWER(TRIM(t.student_id))
+         AND correction.event_id = roster.event_id
+        WHERE COALESCE(correction.attended, attended.event_key IS NOT NULL) = FALSE
       )
       SELECT
         t.student_id,

@@ -3,7 +3,7 @@ import type { Response } from "express";
 export type ProgressStreamMessage<TProgress, TData = unknown> =
   | { type: "progress"; progress: TProgress }
   | { type: "success"; message: string; data: TData }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string; code?: string };
 
 export function prepareProgressStream(res: Response, statusCode = 200) {
   res.status(statusCode);

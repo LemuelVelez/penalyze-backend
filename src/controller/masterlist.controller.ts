@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import type { AuthenticatedRequest } from "./auth.controller";
 import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
-import { uploadMasterlist, resumeMasterlistUpload, discardMasterlistUpload, listMasterlist, reconcileMasterlist, deleteMasterlist, getFinalAttendance, getFinalAttendanceUnmatched, exportFinalAttendance, type MasterlistFilters, type MasterlistProgress } from "../services/masterlist.service";
+import { getMasterlistStatus, uploadMasterlist, resumeMasterlistUpload, discardMasterlistUpload, listMasterlist, reconcileMasterlist, deleteMasterlist, getFinalAttendance, getFinalAttendanceUnmatched, exportFinalAttendance, type MasterlistFilters, type MasterlistProgress } from "../services/masterlist.service";
 function filters(req:Request):MasterlistFilters {
   const text=(key:string)=>typeof req.query[key]==="string" ? String(req.query[key]).trim() || undefined : undefined;
   const schoolYearId=text("schoolYearId");
@@ -79,3 +79,6 @@ export async function reconcileWithProgress(req:Request,res:Response,next:NextFu
 export async function finalAttendance(req:Request,res:Response) {res.json(await getFinalAttendance(filters(req)));}
 export async function finalAttendanceUnmatched(req:Request,res:Response) {res.json(await getFinalAttendanceUnmatched(filters(req)));}
 export async function download(req:Request,res:Response) {const result=await exportFinalAttendance(filters(req));res.setHeader("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");res.setHeader("Content-Disposition",`attachment; filename="${result.filename}"`);res.send(result.buffer);}
+
+export async function status(_req: Request, res: Response) { res.json(await getMasterlistStatus()); }
+export async function publicStatus(_req: Request, res: Response) { const { active } = await getMasterlistStatus(); res.json({ active }); }

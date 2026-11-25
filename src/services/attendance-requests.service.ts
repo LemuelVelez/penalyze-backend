@@ -1,3 +1,4 @@
+import { isMasterlistActiveForSchoolYear, masterlistActiveError, ZERO_ATTENDANCE_MASTERLIST_MESSAGE } from "./masterlist.service";
 import type { PoolClient } from "pg";
 
 import type {
@@ -7,7 +8,7 @@ import type {
   AttendanceRequestType,
   SchoolSemester,
 } from "../database/model/schema.model";
-import { query, withTransaction } from "../lib/db";
+import { pool, query, withTransaction } from "../lib/db";
 import {
   attendanceEventRosterScopeCteSql,
   applyExemptionsToPendingAttendanceRequests,
@@ -744,6 +745,7 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
     }
 
     if (requestType === "zero_attendance") {
+      if (await isMasterlistActiveForSchoolYear(client, schoolYearId)) throw masterlistActiveError(ZERO_ATTENDANCE_MASTERLIST_MESSAGE);
       if (input.events != null || input.evidenceUrl != null) {
         throw createHttpError("A no-participation declaration cannot include event evidence.");
       }
@@ -1634,6 +1636,7 @@ async function applyApprovedZeroAttendance(
   client: PoolClient,
   request: AttendanceRequestRecord,
 ) {
+  if (await isMasterlistActiveForSchoolYear(client, request.school_year_id)) throw masterlistActiveError(ZERO_ATTENDANCE_MASTERLIST_MESSAGE);
   const studentId = cleanText(request.student_id);
   if (await findCountedEventParticipationForStudent(client, studentId, request.school_year_id)) {
     throw createHttpError("This student already has recorded event attendance for this school year / semester, so the no-participation declaration cannot be approved. Reject it and ask the student to submit an event review instead.", 409);
@@ -1730,7 +1733,7 @@ export async function preflightAttendanceRequestReview(
 ) {
   const requestId = cleanText(requestIdValue);
   const reviewerId = cleanText(reviewerIdValue);
-  normalizeRequestStatus(input.status, false);
+  const status = normalizeRequestStatus(input.status, false);
 
   if (!requestId) throw createHttpError("Attendance request ID is required.");
   if (!isUuid(requestId)) throw createHttpError("Attendance request ID is invalid.");
@@ -1738,8 +1741,8 @@ export async function preflightAttendanceRequestReview(
 
   const [reviewerResult, requestResult] = await Promise.all([
     query<{ id: string }>(`SELECT id FROM users WHERE id = $1 LIMIT 1`, [reviewerId]),
-    query<Pick<AttendanceRequestRecord, "id" | "status" | "request_type">>(
-      `SELECT id, status, request_type FROM attendance_requests WHERE id = $1 LIMIT 1`,
+    query<Pick<AttendanceRequestRecord, "id" | "status" | "request_type" | "school_year_id">>(
+      `SELECT id, status, request_type, school_year_id FROM attendance_requests WHERE id = $1 LIMIT 1`,
       [requestId],
     ),
   ]);
@@ -1754,6 +1757,12 @@ export async function preflightAttendanceRequestReview(
     throw createHttpError("This attendance request has already been reviewed.", 409);
   }
 
+  if (status === "approved" && request.request_type === "zero_attendance") {
+    const client = await pool.connect();
+    try {
+      if (await isMasterlistActiveForSchoolYear(client, request.school_year_id)) throw masterlistActiveError(ZERO_ATTENDANCE_MASTERLIST_MESSAGE);
+    } finally { client.release(); }
+  }
   return request;
 }
 
@@ -2033,7 +2042,7 @@ export async function preflightAttendanceRequestGroupReview(
   reviewerIdValue: unknown,
   input: AttendanceRequestGroupReviewInput,
 ) {
-  const { reviewerId, studentId, requestIds } = normalizeGroupReviewInput(
+  const { reviewerId, studentId, requestIds, status } = normalizeGroupReviewInput(
     reviewerIdValue,
     input,
   );
@@ -2048,6 +2057,15 @@ export async function preflightAttendanceRequestGroupReview(
     throw createHttpError("Authenticated reviewer account was not found.", 401);
   }
   validateGroupReviewRequests(requestResult.rows, requestIds, studentId);
+  if (status === "approved") {
+    const zeroYears = new Set(requestResult.rows.filter(request => request.request_type === "zero_attendance").map(request => request.school_year_id));
+    if (zeroYears.size) {
+      const client = await pool.connect();
+      try {
+        for (const year of zeroYears) if (await isMasterlistActiveForSchoolYear(client, year)) throw masterlistActiveError(ZERO_ATTENDANCE_MASTERLIST_MESSAGE);
+      } finally { client.release(); }
+    }
+  }
   return requestResult.rows;
 }
 
@@ -2091,6 +2109,11 @@ export async function reviewAttendanceRequestGroup(
     const details = selected.filter((request) => request.request_type === "details_correction");
     const zeroRequests = selected.filter((request) => request.request_type === "zero_attendance");
     const events = selected.filter((request) => request.request_type === "event_review");
+    if (status === "approved") {
+      for (const year of new Set(zeroRequests.map(request => request.school_year_id))) {
+        if (await isMasterlistActiveForSchoolYear(client, year)) throw masterlistActiveError(ZERO_ATTENDANCE_MASTERLIST_MESSAGE);
+      }
+    }
     const total = selected.length;
     let approvedCount = 0;
     let rejectedCount = 0;
