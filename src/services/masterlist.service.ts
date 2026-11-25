@@ -170,6 +170,7 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
   const sourceProfiles = new Map<string, Set<StudentMasterlistRecord>>();
   const matched = new Map<string, StudentMasterlistRecord>();
   const totals = new Map<string, number>();
+  const resolutionCache = new Map<string, Resolution>();
   for (const table of scopedTables) {
     const count = await client.query<{ count: string }>(`SELECT COUNT(*) AS count FROM ${table} WHERE school_year_id=$1`, [schoolYear.id]);
     totals.set(table, Number(count.rows[0].count));
@@ -189,7 +190,12 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
       const rows: Existing[] = (await client.query<Existing>(`SELECT id,student_id,name,${full ? "program,college,year_level" : "NULL::text AS program,NULL::text AS college,NULL::text AS year_level"} FROM ${table} WHERE school_year_id=$1${cursor === null ? "" : " AND id > $2::uuid"} ORDER BY id LIMIT ${MASTERLIST_CHUNK_SIZE}`, cursor === null ? [schoolYear.id] : [schoolYear.id,cursor])).rows;
       if (!rows.length) break;
       for (const row of rows) {
-        let resolution = resolve(index, { studentId: row.student_id, name: row.name, program: row.program, college: row.college });
+        const profileKey = JSON.stringify([row.student_id, row.name, row.program, row.college]);
+        let resolution = resolutionCache.get(profileKey);
+        if (!resolution) {
+          resolution = resolve(index, { studentId: row.student_id, name: row.name, program: row.program, college: row.college });
+          resolutionCache.set(profileKey, resolution);
+        }
         const key = `${normalizeStudentNumberKey(row.student_id)}|${normalizeNameKey(row.name)}`;
         // Profile-less derived records can inherit a unique authoritative match from
         // the scoped source rows, but never guess between conflicting people.
@@ -514,7 +520,9 @@ export async function reconcileMasterlist(onProgress?: ProgressCallback, isCance
   const result = await withTransaction(async client => {
     await client.query("SELECT set_config('statement_timeout','180000ms',true)");
     await client.query("SELECT set_config('lock_timeout','60000ms',true)");
+    emit({ stage: "reconciling_records", percent: 0, message: "Waiting for the attendance database lock…" });
     await lockAttendanceAbsenceSync(client);
+    emit({ stage: "reconciling_records", percent: 2, message: "Lock acquired. Checking active school year and upload state…" });
     const year = await activeYear(client);
     if (await getUploadCheckpoint(client,year.id)) throw bad("Resume or discard the unfinished masterlist upload first.");
     const summary = await reconcileWithClient(client, year, true, new Map(), emit, isCancelled);

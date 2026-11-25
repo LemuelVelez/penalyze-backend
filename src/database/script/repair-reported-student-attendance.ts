@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { closeDatabasePool, query } from "../../lib/db";
 import type { AttendanceFinalResultRecord } from "../model/schema.model";
-import { listAttendanceFinalResults, setStudentEventAttendances, type StudentEventAttendanceChange } from "../../services/attendance.service";
+import { listAttendanceFinalResults, setStudentEventAttendancesBatch, type StudentEventAttendanceChange } from "../../services/attendance.service";
 import { reconcileMasterlist } from "../../services/masterlist.service";
 import { normalizeStudentNumberKey, normalizeNameKey, nameKeysAgree } from "../../services/masterlist-normalize";
 
@@ -48,17 +48,47 @@ async function listStudent(schoolYearId: string, studentId: string) {
   return listAttendanceFinalResults({ schoolYearId, studentId, consolidatedOnly: true, includeEventDetails: true, limit: 100 });
 }
 
+const startedAt = Date.now();
+let currentStage = "Starting repair";
+let stageStartedAt = startedAt;
+function progress(message: string) {
+  if (currentStage === message) return;
+  currentStage = message;
+  stageStartedAt = Date.now();
+  console.log(`[${Math.floor((stageStartedAt - startedAt) / 1000)}s] ${message}`);
+}
+function describeError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+  return code ? `${message} (PostgreSQL ${code})` : message;
+}
+
+type RepairPlan = {
+  final: AttendanceFinalResultRecord;
+  rule: Exclude<Rule, { type: "absentTotal" }>;
+  matchingIds: Set<string>;
+  changes: StudentEventAttendanceChange[];
+};
+
 async function main() {
+  console.log("Penalyze • reported student attendance repair");
+  progress("Connecting to PostgreSQL and finding the active school year…");
   const active = (await query<{ id: string }>("SELECT id FROM school_years WHERE is_active ORDER BY starts_at DESC LIMIT 1")).rows[0];
   if (!active) throw new Error("No active school year.");
-  const reconciliation = await reconcileMasterlist();
+  progress(`Reconciling the active school year ${active.id}…`);
+  const reconciliation = await reconcileMasterlist(update => {
+    progress(`[Reconciliation ${Math.floor(update.percent)}%] ${update.message}`);
+  });
   if (reconciliation.schoolYear.id !== active.id) throw new Error("The active school year changed during reconciliation.");
   const schoolYearId = active.id;
+  progress(`Reconciliation committed: ${reconciliation.recordsUpdated} record updates. Loading student identities…`);
   // Load only identities for the name lookup; event details are loaded for each
   // uniquely resolved student immediately before making changes.
   const identities = await listAttendanceFinalResults({ schoolYearId, consolidatedOnly: true, limit: 2147483647 });
   const needsAdmin: string[] = [];
-  for (const { student, rule } of REPORTS) {
+  const plans: RepairPlan[] = [];
+  for (const [index, { student, rule }] of REPORTS.entries()) {
+    progress(`Checking reported student ${index + 1}/${REPORTS.length}: ${student}…`);
     const byId = /^TC-\d{2}-[A-Z]-\d{5}$/.test(student);
     const candidates = byId
       ? await listStudent(schoolYearId, normalizeStudentNumberKey(student))
@@ -121,15 +151,54 @@ async function main() {
       }
       if (attended !== event.attended) changes.push({ eventId: event.id, attended });
     }
+    plans.push({ final, rule, matchingIds, changes });
+  }
+
+  // Do not let two reported names silently select the same actual student.
+  const plannedCounts = new Map<string, number>();
+  for (const plan of plans) plannedCounts.set(plan.final.id, (plannedCounts.get(plan.final.id) ?? 0) + 1);
+  const uniquePlans = plans.filter(plan => {
+    if (plannedCounts.get(plan.final.id) === 1) return true;
+    needsAdmin.push(`${plan.final.student_id} ${plan.final.name}: multiple reports resolved to the same student; skipped.`);
+    return false;
+  });
+  const pending = uniquePlans.filter(plan => plan.changes.length > 0);
+  const savedCounts = new Map<string, number>();
+  const failedPlans = new Map<string, string>();
+  if (pending.length) {
+    progress(`Applying ${pending.reduce((total, plan) => total + plan.changes.length, 0)} event corrections across ${pending.length} students in one transaction…`);
+    const saved = await setStudentEventAttendancesBatch(schoolYearId,
+      pending.map(plan => ({ finalResultId: plan.final.id, changes: plan.changes })), progress);
+    for (const result of saved) {
+      if (result.saved) savedCounts.set(result.finalResultId, result.saved.updatedCount);
+      else failedPlans.set(result.finalResultId, result.error);
+    }
+    progress("Repair batch committed. Verifying final absence totals…");
+  } else {
+    progress("No automatic event corrections required. Checking results…");
+  }
+
+  for (const [index, { final, rule, matchingIds, changes }] of uniquePlans.entries()) {
+    const label = `${final.student_id} ${final.name}`;
+    const before = final.total_absences;
+    const details = final.event_details ?? [];
+    const count = savedCounts.get(final.id) ?? 0;
+    const summary = (count: number, after: number, suffix = "") => console.log(`${label}: ${count} event(s) changed; absences ${before} → ${after}${suffix}`);
+    progress(`Verifying student ${index + 1}/${uniquePlans.length}: ${label}…`);
+    const failure = failedPlans.get(final.id);
+    if (failure) {
+      needsAdmin.push(`${label}: ${failure}`);
+      summary(0, before, " (NEEDS ADMIN CHOICE; correction rejected)");
+      continue;
+    }
     try {
-      if (changes.length) await setStudentEventAttendances(final.id, changes);
       const refreshedRows = changes.length ? await listStudent(schoolYearId, final.student_id) : [final];
       const refreshed = refreshedRows.length === 1 ? refreshedRows[0] : undefined;
       if (!refreshed) {
         needsAdmin.push(`${label}: override saved but final result is unavailable; verify the current totals.`);
-        console.log(`${label}: ${changes.length} event(s) requested; absences ${before} → unavailable`); continue;
+        console.log(`${label}: ${count} event(s) changed; absences ${before} → unavailable`); continue;
       }
-      summary(changes.length, refreshed.total_absences, changes.length ? ` (${changes.map(change => `${details.find(e => e.id === change.eventId)?.name}: ${change.attended ? "present" : "absent"}`).join("; ")})` : " (no changes)");
+      summary(count, refreshed.total_absences, changes.length ? ` (${changes.map(change => `${details.find(e => e.id === change.eventId)?.name}: ${change.attended ? "present" : "absent"}`).join("; ")})` : " (no changes)");
       if (rule.type === "presentInMatching" && rule.expectedAbsences !== undefined) {
         const frcAbsences = (refreshed.event_details ?? []).filter(e => FRC.test(e.name) && !e.attended).length;
         if (frcAbsences !== rule.expectedAbsences || refreshed.total_absences !== rule.expectedAbsences) {
@@ -139,13 +208,29 @@ async function main() {
         needsAdmin.push(`${label}: remaining calculated absence total ${refreshed.total_absences} differs from the expected total; inspect source/roster.`);
       }
     } catch (error) {
-      needsAdmin.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
-      console.log(`${label}: repair failed; absences ${before} → unverified`);
+      needsAdmin.push(`${label}: ${describeError(error)}`);
+      console.log(`${label}: ${count} event(s) changed; absences ${before} → unverified`);
+      process.exitCode = 1;
     }
   }
   console.log("\nNEEDS ADMIN CHOICE");
   for (const note of needsAdmin) console.log(note);
   if (!needsAdmin.length) console.log("None");
+  progress("Repair finished.");
 }
 
-main().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => closeDatabasePool());
+// PostgreSQL statements can legitimately take time. Print the actual current
+// operation and elapsed time while awaiting I/O; never claim a write succeeded
+// before its transaction commits.
+const heartbeat = setInterval(() => {
+  console.log(`[${Math.floor((Date.now() - startedAt) / 1000)}s] Still processing: ${currentStage} (${Math.floor((Date.now() - stageStartedAt) / 1000)}s in this stage)`);
+}, 10000);
+heartbeat.unref();
+main().catch(error => {
+  console.error(`Repair stopped during ${currentStage}: ${describeError(error)}`);
+  console.error("Any uncommitted transaction was rolled back. Previously committed reconciliation remains saved; the repair can be rerun.");
+  process.exitCode = 1;
+}).finally(async () => {
+  clearInterval(heartbeat);
+  await closeDatabasePool();
+});
