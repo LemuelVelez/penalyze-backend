@@ -10,6 +10,7 @@ import {
 
 import {
   attachExpectedEventConsistencyWarnings,
+  attendanceEventRosterScopeCteSql,
   getExpectedEventConsistencyQuery,
   getDenominatorEventScopeCtesSql,
   getStudentEventOverrideExclusionSql,
@@ -467,4 +468,14 @@ test("selected event overrides detected row events for single-event imports", ()
     rows,
   });
   assert.equal(reviewed.rows.length, 2);
+});
+
+
+test("request roster filtering limits both sources to the requested term and events", () => {
+  const sql = attendanceEventRosterScopeCteSql("$1", "$4");
+  assert.ok(sql.includes("ar.school_year_id = $1::uuid"));
+  assert.ok(sql.includes("mar.school_year_id = $1::uuid"));
+  assert.ok(sql.includes("COALESCE(ar.event_id, ai.event_id) = ANY($4::uuid[])"));
+  assert.ok(sql.includes("mar.event_id = ANY($4::uuid[])"));
+  assert.ok(!attendanceEventRosterScopeCteSql().includes("ANY($4::uuid[])"));
 });

@@ -2516,8 +2516,9 @@ function attendanceEventParticipationCteSql(scoped = false) {
 }
 const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = attendanceEventParticipationCteSql();
 
-function attendanceEventRosterScopeCteSql(schoolYearParam?: string) {
+export function attendanceEventRosterScopeCteSql(schoolYearParam?: string, eventIdsParam?: string) {
   const scope = (alias: string) => schoolYearParam ? `AND ${alias}.school_year_id = ${schoolYearParam}::uuid` : "";
+  const eventScope = (eventSql: string) => eventIdsParam ? `AND ${eventSql} = ANY(${eventIdsParam}::uuid[])` : "";
   return `
   event_roster_scope AS ${schoolYearParam ? "MATERIALIZED " : ""}(
     SELECT DISTINCT
@@ -2530,6 +2531,7 @@ function attendanceEventRosterScopeCteSql(schoolYearParam?: string) {
      AND ai.deleted_at IS NULL
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
       ${scope("ar")}
+      ${eventScope("COALESCE(ar.event_id, ai.event_id)")}
       AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
       AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
       AND ${getEventStudentExemptionFilterSql(
@@ -2547,6 +2549,7 @@ function attendanceEventRosterScopeCteSql(schoolYearParam?: string) {
     FROM manual_attendance_records mar
     WHERE mar.event_id IS NOT NULL
       ${scope("mar")}
+      ${eventScope("mar.event_id")}
       AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
       AND ${MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL

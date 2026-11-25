@@ -123,15 +123,51 @@ export async function requests(
   }
 }
 
-function getStreamErrorMessage(error: unknown, fallback: string) {
-  const raw = error as { statusCode?: number; message?: string; code?: string } | null;
-  if (raw && [400, 401, 403, 404, 409, 422].includes(raw.statusCode ?? 0) &&
-      typeof raw.message === "string" && raw.message.length <= 700 && !raw.code) {
-    return raw.message;
+function sendReviewFailure(res: Response, error: unknown, fallback: string, stage?: string) {
+  const raw = error as { statusCode?: number; message?: string; code?: string; expose?: boolean } | null;
+  const expected = raw?.expose === true && !raw.code &&
+    [400, 401, 403, 404, 409, 422].includes(raw.statusCode ?? 0) &&
+    typeof raw.message === "string";
+  let status = expected ? raw.statusCode! : 500;
+  let message = expected ? raw.message! : fallback;
+  let requestId: string | undefined;
+  if (!expected) {
+    requestId = randomUUID();
+    const code = raw?.code ?? "";
+    if (["40P01", "40001", "55P03", "53300", "57P03"].includes(code)) {
+      status = 503;
+      message = "Attendance processing is busy. Refresh the request list and try again shortly.";
+    } else if (code === "57014") {
+      status = 503;
+      message = "Attendance processing exceeded its time limit. Refresh the request list before trying again.";
+    }
+    console.error(`[${requestId}] Attendance request review failed (${stage ?? "validating"}):`, error);
+    message += ` Reference: ${requestId}.`;
   }
-  const requestId = randomUUID();
-  console.error(`[${requestId}] Attendance request review stream failed:`, error);
-  return `${fallback} Reference: ${requestId}.`;
+  res.locals.auditOutcome = "failed";
+  if (res.destroyed || res.writableEnded) return;
+  if (res.headersSent) {
+    writeProgressStreamMessage(res, { type: "error", message });
+    res.end();
+  } else {
+    if (requestId) res.setHeader("X-Request-ID", requestId);
+    res.status(status).json({ message, ...(requestId ? { requestId } : {}) });
+  }
+}
+
+// A database statement or advisory lock can run without progress events for
+// longer than a proxy's idle timeout. Blank NDJSON lines are ignored by clients.
+function startReviewHeartbeat(res: Response) {
+  const timer = setInterval(() => {
+    if (!res.destroyed && !res.writableEnded && !res.writableNeedDrain) res.write("\n");
+  }, 10000);
+  timer.unref();
+  const stop = () => {
+    clearInterval(timer);
+    res.removeListener("close", stop);
+  };
+  res.once("close", stop);
+  return stop;
 }
 
 function getReviewSuccessMessage(result: Awaited<ReturnType<typeof reviewAttendanceRequest>>) {
@@ -154,7 +190,7 @@ function getReviewSuccessMessage(result: Awaited<ReturnType<typeof reviewAttenda
 export async function reviewRequest(
   req: AuthenticatedRequest,
   res: Response,
-  next: NextFunction,
+  _next: NextFunction,
 ) {
   try {
     const result = await reviewAttendanceRequest(
@@ -170,15 +206,17 @@ export async function reviewRequest(
       data: result,
     });
   } catch (error) {
-    next(error);
+    sendReviewFailure(res, error, "Unable to review attendance request.");
   }
 }
 
 export async function reviewRequestWithProgress(
   req: AuthenticatedRequest,
   res: Response,
-  next: NextFunction,
+  _next: NextFunction,
 ) {
+  let stopHeartbeat: (() => void) | undefined;
+  let stage = "validating";
   try {
     const preflight = await preflightAttendanceRequestReview(
       req.params.id,
@@ -188,11 +226,13 @@ export async function reviewRequestWithProgress(
     res.locals.auditAttendanceRequestType = preflight.request_type;
 
     prepareProgressStream(res, 200);
+    stopHeartbeat = startReviewHeartbeat(res);
     const result = await reviewAttendanceRequest(
       req.params.id,
       req.user?.sub,
       req.body ?? {},
       (progress) => {
+        stage = progress.stage;
         writeProgressStreamMessage(res, { type: "progress", progress });
       },
     );
@@ -207,17 +247,9 @@ export async function reviewRequestWithProgress(
     });
     res.end();
   } catch (error) {
-    if (res.headersSent) {
-      res.locals.auditOutcome = "failed";
-      writeProgressStreamMessage(res, {
-        type: "error",
-        message: getStreamErrorMessage(error, "Unable to review attendance request."),
-      });
-      res.end();
-      return;
-    }
-
-    next(error);
+    sendReviewFailure(res, error, "Unable to review attendance request.", stage);
+  } finally {
+    stopHeartbeat?.();
   }
 }
 
@@ -236,7 +268,7 @@ function getGroupReviewSuccessMessage(
 export async function reviewRequestGroup(
   req: AuthenticatedRequest,
   res: Response,
-  next: NextFunction,
+  _next: NextFunction,
 ) {
   try {
     const result = await reviewAttendanceRequestGroup(req.user?.sub, req.body ?? {});
@@ -250,15 +282,17 @@ export async function reviewRequestGroup(
       data: result,
     });
   } catch (error) {
-    next(error);
+    sendReviewFailure(res, error, "Unable to review attendance request group.");
   }
 }
 
 export async function reviewRequestGroupWithProgress(
   req: AuthenticatedRequest,
   res: Response,
-  next: NextFunction,
+  _next: NextFunction,
 ) {
+  let stopHeartbeat: (() => void) | undefined;
+  let stage = "validating";
   try {
     const preflight = await preflightAttendanceRequestGroupReview(
       req.user?.sub,
@@ -270,10 +304,14 @@ export async function reviewRequestGroupWithProgress(
       (request) => request.request_type === "zero_attendance",
     ) ? "zero_attendance" : "event_review";
     prepareProgressStream(res, 200);
+    stopHeartbeat = startReviewHeartbeat(res);
     const result = await reviewAttendanceRequestGroup(
       req.user?.sub,
       req.body ?? {},
-      (progress) => writeProgressStreamMessage(res, { type: "progress", progress }),
+      (progress) => {
+        stage = progress.stage;
+        writeProgressStreamMessage(res, { type: "progress", progress });
+      },
     );
     writeProgressStreamMessage(res, {
       type: "success",
@@ -282,16 +320,9 @@ export async function reviewRequestGroupWithProgress(
     });
     res.end();
   } catch (error) {
-    if (res.headersSent) {
-      res.locals.auditOutcome = "failed";
-      writeProgressStreamMessage(res, {
-        type: "error",
-        message: getStreamErrorMessage(error, "Unable to review attendance request group."),
-      });
-      res.end();
-      return;
-    }
-    next(error);
+    sendReviewFailure(res, error, "Unable to review attendance request group.", stage);
+  } finally {
+    stopHeartbeat?.();
   }
 }
 

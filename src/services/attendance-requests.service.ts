@@ -9,7 +9,7 @@ import type {
 } from "../database/model/schema.model";
 import { query, withTransaction } from "../lib/db";
 import {
-  ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL,
+  attendanceEventRosterScopeCteSql,
   applyExemptionsToPendingAttendanceRequests,
   getEventCollegeExemptionFilterSql,
   getEventYearLevelExemptionFilterSql,
@@ -161,7 +161,7 @@ function isUuid(value: string) {
 }
 
 function createHttpError(message: string, statusCode = 400) {
-  return Object.assign(new Error(message), { statusCode });
+  return Object.assign(new Error(message), { statusCode, expose: true });
 }
 
 function normalizeRequestStatus(value: unknown, allowPending = true) {
@@ -248,6 +248,29 @@ function normalizeRequestEvents(value: unknown) {
   });
 }
 
+// Reviews can rebuild a whole term's derived results. Keep the longer limits
+// local to approval transactions, and acquire the same lock as imports and
+// exemptions before touching request/student rows (consistent lock order).
+async function prepareAttendanceReviewTransaction(
+  client: PoolClient,
+  status: AttendanceRequestStatus,
+  emit: AttendanceRequestReviewProgressCallback,
+) {
+  if (status !== "approved") return;
+  const configuredTimeout = Number(process.env.ATTENDANCE_REVIEW_TIMEOUT_MS ?? 180000);
+  const timeoutMs = Number.isFinite(configuredTimeout)
+    ? Math.min(600000, Math.max(60000, Math.round(configuredTimeout)))
+    : 180000;
+  const configuredLockTimeout = Number(process.env.ATTENDANCE_REVIEW_LOCK_TIMEOUT_MS ?? 60000);
+  const lockTimeoutMs = Number.isFinite(configuredLockTimeout)
+    ? Math.min(timeoutMs, Math.max(5000, Math.round(configuredLockTimeout)))
+    : 60000;
+  await client.query("SELECT set_config('statement_timeout', $1, true)", [`${timeoutMs}ms`]);
+  await client.query("SELECT set_config('lock_timeout', $1, true)", [`${lockTimeoutMs}ms`]);
+  emit({ stage: "validating", percent: 5, message: "Waiting for attendance recalculation access." });
+  await lockAttendanceAbsenceSync(client);
+}
+
 async function getRequestableEventIds(
   client: PoolClient,
   schoolYearId: string,
@@ -255,8 +278,9 @@ async function getRequestableEventIds(
   collegeKey: string,
   eventIds: string[],
 ): Promise<Set<string>> {
+  if (!eventIds.length) return new Set<string>();
   const result = await client.query<{ id: string }>(
-    `WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}
+    `WITH ${attendanceEventRosterScopeCteSql("$1", "$4")}
      SELECT DISTINCT roster.event_id::text AS id
      FROM event_roster_scope roster
      LEFT JOIN attendance_student_event_overrides correction
@@ -961,6 +985,7 @@ async function addApprovedManualAttendance(
   client: PoolClient,
   request: AttendanceRequestRecord,
   events: AttendanceRequestEventWithSchoolYear[],
+  reviewerId: string,
   onEventProgress?: (
     event: AttendanceRequestEventWithSchoolYear,
     index: number,
@@ -1051,6 +1076,15 @@ async function addApprovedManualAttendance(
       [event.event_id, studentId],
     );
 
+    // An explicit absent override takes precedence over source rows. An
+    // approved review must reverse it, even when a source row already exists.
+    await client.query(
+      `UPDATE attendance_student_event_overrides
+       SET attended = TRUE, updated_by = $4::uuid, updated_at = NOW()
+       WHERE school_year_id = $1::uuid AND student_key = LOWER(TRIM($2::text))
+         AND event_id = $3::uuid AND attended = FALSE`,
+      [request.school_year_id, studentId, event.event_id, reviewerId],
+    );
     if (existingResult.rows[0]?.exists) continue;
 
     await client.query(
@@ -1309,14 +1343,25 @@ async function resolveRequestEventsForApproval(
       );
     }
 
-    await client.query(
+    const relinked = await client.query(
       `
-        UPDATE attendance_request_events
+        UPDATE attendance_request_events target
         SET event_id = $2
-        WHERE id = $1
+        WHERE target.id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM attendance_request_events duplicate
+            WHERE duplicate.request_id = target.request_id
+              AND duplicate.event_id = $2 AND duplicate.id <> target.id
+          )
       `,
       [event.id, resolvedEvent.id],
     );
+    if (!relinked.rowCount) {
+      throw createHttpError(
+        `More than one request entry resolves to “${event.event_name}”. Remove the duplicate entry after checking its evidence, then approve again.`,
+        409,
+      );
+    }
 
     resolvedEvents.push({
       ...event,
@@ -1511,8 +1556,7 @@ async function applyApprovedDetailsCorrection(
       completed,
       total: scopeTotal,
     });
-    await lockAttendanceAbsenceSync(client);
-    await syncAbsencesForStudents(client, [studentId], schoolYearId);
+    await syncAbsencesForStudents(client, [studentId], schoolYearId, true);
 
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
       client,
@@ -1713,6 +1757,7 @@ export async function reviewAttendanceRequest(
       throw createHttpError("Authenticated reviewer account was not found.", 401);
     }
 
+    await prepareAttendanceReviewTransaction(client, status, emit);
     const requestResult = await client.query<AttendanceRequestRecord>(
       `SELECT * FROM attendance_requests WHERE id = $1 FOR UPDATE`,
       [requestId],
@@ -1747,8 +1792,7 @@ export async function reviewAttendanceRequest(
           stage: "syncing_absences", percent: 45,
           message: "Calculating the student's missed events and fines.",
         });
-        await lockAttendanceAbsenceSync(client);
-        await syncAbsencesForStudents(client, [request.student_id], request.school_year_id);
+        await syncAbsencesForStudents(client, [request.student_id], request.school_year_id, true);
         await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
           client, [request.school_year_id], (progress) => {
             const stages = {
@@ -1779,6 +1823,7 @@ export async function reviewAttendanceRequest(
             requestType: request.request_type,
             removedExemptedEventCount,
             autoClosedByExemption: true,
+            request: await getRequestViewById(requestId, client),
           };
         }
 
@@ -1786,6 +1831,7 @@ export async function reviewAttendanceRequest(
           client,
           request,
           resolved.events,
+          reviewerId,
           (event, index, total) => {
             const eventPercent = total
               ? 17 + (index / total) * 17
@@ -1801,13 +1847,6 @@ export async function reviewAttendanceRequest(
         );
 
         emit({
-          stage: "waiting_for_lock",
-          percent: 36,
-          message: "Waiting for attendance recalculation access.",
-        });
-        await lockAttendanceAbsenceSync(client);
-
-        emit({
           stage: "syncing_absences",
           percent: 42,
           message: "Recalculating the student's absences.",
@@ -1816,6 +1855,7 @@ export async function reviewAttendanceRequest(
           client,
           [request.student_id],
           request.school_year_id,
+          true,
         );
 
         await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
@@ -1878,16 +1918,17 @@ export async function reviewAttendanceRequest(
       requestType: request.request_type,
       removedExemptedEventCount,
       autoClosedByExemption: false,
+      request: await getRequestViewById(requestId, client),
     };
   });
 
   emit({
     stage: "finalizing",
     percent: 98,
-    message: "Request saved. Loading the updated request.",
+    message: "Request review saved.",
   });
 
-  const request = await getRequestViewById(requestId);
+  const request = result.request;
 
   emit({
     stage: "finalizing",
@@ -1995,6 +2036,7 @@ export async function reviewAttendanceRequestGroup(
     if (!reviewerResult.rows[0]) {
       throw createHttpError("Authenticated reviewer account was not found.", 401);
     }
+    await prepareAttendanceReviewTransaction(client, status, emit);
     const requestResult = await client.query<AttendanceRequestRecord>(
       `SELECT * FROM attendance_requests WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
       [requestIds],
@@ -2109,6 +2151,7 @@ export async function reviewAttendanceRequestGroup(
           client,
           request,
           resolved.events,
+          reviewerId,
           (event, eventIndex, eventTotal) => emit({
             stage: "adding_attendance",
             percent: 37 + ((index + eventIndex / Math.max(eventTotal, 1)) / Math.max(events.length, 1)) * 16,
@@ -2122,14 +2165,6 @@ export async function reviewAttendanceRequestGroup(
       }
 
       if (approvedEventSchoolYearIds.size) {
-        emit({
-          stage: "waiting_for_lock",
-          percent: 54,
-          message: "Waiting for attendance recalculation access.",
-          completed: approvedIds.length,
-          total,
-        });
-        await lockAttendanceAbsenceSync(client);
         const schoolYearIds = [...approvedEventSchoolYearIds];
         for (let index = 0; index < schoolYearIds.length; index += 1) {
           emit({
@@ -2139,7 +2174,7 @@ export async function reviewAttendanceRequestGroup(
             completed: approvedIds.length,
             total,
           });
-          await syncAbsencesForStudents(client, [studentId], schoolYearIds[index]);
+          await syncAbsencesForStudents(client, [studentId], schoolYearIds[index], true);
         }
         await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
           client,
@@ -2179,7 +2214,14 @@ export async function reviewAttendanceRequestGroup(
       }
       approvedCount = approvedIds.length;
     }
+    const requests: AttendanceRequestView[] = [];
+    for (const id of requestIds) {
+      const view = await getRequestViewById(id, client);
+      if (!view) throw createHttpError("An attendance request is no longer available.", 409);
+      requests.push(view);
+    }
     return {
+      requests,
       approvedCount,
       rejectedCount,
       autoClosedCount,
@@ -2192,11 +2234,10 @@ export async function reviewAttendanceRequestGroup(
   emit({
     stage: "finalizing",
     percent: 98,
-    message: "Group review saved. Loading updated requests.",
+    message: "Group review saved.",
     completed: requestIds.length,
     total: requestIds.length,
   });
-  const views = await Promise.all(requestIds.map((id) => getRequestViewById(id)));
   emit({
     stage: "finalizing",
     percent: 100,
@@ -2204,10 +2245,7 @@ export async function reviewAttendanceRequestGroup(
     completed: requestIds.length,
     total: requestIds.length,
   });
-  return {
-    ...result,
-    requests: views.filter((view): view is AttendanceRequestView => view !== null),
-  };
+  return result;
 }
 
 export async function removeAttendanceRequestEvent(
