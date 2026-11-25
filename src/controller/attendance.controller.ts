@@ -58,6 +58,7 @@ import {
   mergeAttendanceEvents,
   updateAttendanceEvent,
   updateAttendanceFinalResultProfile,
+  type AttendanceFinalResultProfileProgress,
   updateAttendanceRecord,
   updateAttendanceRecords as updateAttendanceRecordsService,
   UploadedAttendanceFile,
@@ -1263,6 +1264,61 @@ export async function updateFinalResultProfile(
     });
   } catch (error) {
     next(error);
+  }
+}
+
+export async function updateFinalResultProfileWithProgress(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  const id = getRouteParam(req, "id");
+  if (!id) {
+    res.status(400).json({ message: "Final attendance result ID is required." });
+    return;
+  }
+  let lastProgress: AttendanceFinalResultProfileProgress = { percent: 0, message: "Preparing student profile update." };
+  let stageStarted = Date.now();
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  try {
+    prepareProgressStream(res);
+    const emit = (progress: AttendanceFinalResultProfileProgress) => {
+      lastProgress = progress;
+      stageStarted = Date.now();
+      writeProgressStreamMessage(res, { type: "progress", progress });
+    };
+    emit(lastProgress);
+    heartbeat = setInterval(() => {
+      const seconds = Math.floor((Date.now() - stageStarted) / 1000);
+      writeProgressStreamMessage(res, {
+        type: "progress",
+        progress: { ...lastProgress, message: `${lastProgress.message} (${seconds}s in this stage)` },
+      });
+    }, 5000);
+    const result = await updateAttendanceFinalResultProfile(id, req.body ?? {}, emit, () => res.destroyed || res.writableEnded);
+    writeProgressStreamMessage(res, { type: "success", message: "Student attendance details updated successfully.", data: result });
+    res.end();
+  } catch (error) {
+    if (!res.headersSent) { next(error); return; }
+    res.locals.auditOutcome = "failed";
+    const requestId = randomUUID();
+    console.error(`[${requestId}] Attendance profile update failed:`, error);
+    const raw = error as { code?: string; statusCode?: number; expose?: boolean; message?: string };
+    const messages: Record<string, string> = {
+      "57014": "The profile save exceeded the database statement timeout and was rolled back.",
+      "55P03": "A database row remained locked during the profile save. The transaction was rolled back.",
+      "40P01": "The profile save conflicted with another update. The transaction was rolled back.",
+      "40001": "The profile save conflicted with another update. The transaction was rolled back.",
+      "23505": "A duplicate record blocked the profile save. The transaction was rolled back.",
+    };
+    const message = raw?.code && Object.prototype.hasOwnProperty.call(messages, raw.code)
+      ? messages[raw.code]
+      : raw?.expose === true && !raw.code && raw.message
+        ? raw.message : "Unable to save student details. Check the attendance result before retrying.";
+    writeProgressStreamMessage(res, { type: "error", message: `${message} (Request ID: ${requestId})` });
+    res.end();
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
   }
 }
 

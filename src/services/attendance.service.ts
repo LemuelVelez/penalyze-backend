@@ -5984,6 +5984,18 @@ export async function purgeAttendanceImport(importId: string) {
 
 export async function purgeExpiredAttendanceImports() {
   return withTransaction(async (client) => {
+    const expired = await client.query<{ exists: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM attendance_imports
+        WHERE deleted_at IS NOT NULL
+          AND deleted_at <= NOW() - ($1::TEXT || ' days')::INTERVAL) AS exists`,
+      [String(ATTENDANCE_IMPORT_RETENTION_DAYS)],
+    );
+    if (!expired.rows[0]?.exists) return 0;
+    // Do not hold import row locks while waiting for an attendance transaction.
+    // Retention is background maintenance: defer to the next sweep if busy.
+    if (!(await tryLockAttendanceAbsenceSync(client))) return 0;
+    await client.query("SELECT set_config('application_name','penalyze: attendance retention sweep',true)");
+    await client.query("SELECT set_config('statement_timeout','180000ms',true)");
     const result = await client.query<{ id: string }>(
       `
         SELECT id
@@ -10573,9 +10585,42 @@ function parseAttendanceFinalResultProfileFields(value: unknown) {
   );
 }
 
+export type AttendanceFinalResultProfileProgress = {
+  percent: number;
+  message: string;
+};
+
+// A profile/ID merge can affect every attendance result in its school years.
+// Queue behind the same lock as approvals instead of repeatedly failing with
+// the default five-second transaction lock timeout. PostgreSQL manages the queue.
+async function lockAttendanceProfileTransaction(client: PoolClient) {
+  const configured = Number(process.env.ATTENDANCE_PROFILE_LOCK_WAIT_MS ?? 600000);
+  const waitMs = Number.isFinite(configured)
+    ? Math.min(1800000, Math.max(1000, Math.floor(configured))) : 600000;
+  await client.query("SELECT set_config('application_name','penalyze: attendance profile update',true)");
+  await client.query("SELECT set_config('statement_timeout',$1,true), set_config('lock_timeout',$1,true)", [`${waitMs}ms`]);
+  if (!(await tryLockAttendanceAbsenceSync(client))) {
+    const holders = await listAttendanceAbsenceSyncLockHolders(client);
+    console.info("Attendance profile update waiting for lock:", holders);
+    try {
+      await lockAttendanceAbsenceSync(client);
+    } catch (error) {
+      const code = (error as { code?: string })?.code;
+      if (code === "55P03" || code === "57014") {
+        // Avoid restarting the entire lock wait through withTransaction retries.
+        throw createValidationError("Attendance recalculation is still running after the lock wait limit. No profile changes were saved. Check the active attendance operation before retrying.", 409);
+      }
+      throw error;
+    }
+  }
+  await client.query("SELECT set_config('statement_timeout','180000ms',true), set_config('lock_timeout','60000ms',true)");
+}
+
 export async function updateAttendanceFinalResultProfile(
   id: string,
   input: RawImportRow,
+  onProgress?: (progress: AttendanceFinalResultProfileProgress) => void,
+  isDisconnected?: () => boolean,
 ): Promise<AttendanceFinalResultProfileUpdateResult> {
   const updatedFields = parseAttendanceFinalResultProfileFields(input.fields);
 
@@ -10585,10 +10630,15 @@ export async function updateAttendanceFinalResultProfile(
 
   const fieldSet = new Set(updatedFields);
 
-  return withTransaction(async (client) => {
+  const emit = (percent: number, message: string) => onProgress?.({ percent, message });
+  const result = await withTransaction(async (client) => {
     // Use the same transaction lock as the attendance refresh and event-update
     // paths. A merge must not race a recalculation or another student-ID edit.
-    await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
+    emit(5, "Waiting for attendance recalculation access. Your save will continue when the database lock is available.");
+    if (isDisconnected?.()) throw createValidationError("Profile save disconnected before it started. No changes were saved.", 409);
+    await lockAttendanceProfileTransaction(client);
+    if (isDisconnected?.()) throw createValidationError("Profile save disconnected before it started. No changes were saved.", 409);
+    emit(15, "Database lock acquired. Checking student identities and affected school years.");
 
     const finalResultQuery = await client.query<AttendanceFinalResultRecord>(
       `
@@ -10765,6 +10815,7 @@ export async function updateAttendanceFinalResultProfile(
         : cleanText(destinationProfile?.institution ?? canonicalStudent?.institution ?? finalResult.institution),
     };
 
+    emit(30, "Saving the canonical student profile.");
     if (canonicalStudent) {
       await client.query(
         `
@@ -10867,6 +10918,7 @@ export async function updateAttendanceFinalResultProfile(
       }
     }
 
+    emit(45, "Updating selected profile fields and merging student IDs if needed.");
     if (normalizedIdChanged) {
       // These are the original evidence and transaction rows. Preserve every
       // source row and its primary key rather than collapsing event attendance,
@@ -11016,6 +11068,11 @@ export async function updateAttendanceFinalResultProfile(
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
       client,
       affectedSchoolYearIds,
+      ({ stage, scopeIndex, scopeTotal }) => {
+        const phase = { refreshing_final_results: 0, refreshing_calculations: 1, refreshing_penalties: 2 }[stage];
+        const label = { refreshing_final_results: "Rebuilding final attendance results", refreshing_calculations: "Refreshing calculations", refreshing_penalties: "Refreshing penalties" }[stage];
+        emit(55 + Math.floor(36 * ((scopeIndex - 1) * 3 + phase) / (scopeTotal * 3)), `${label} (school year ${scopeIndex}/${scopeTotal}).`);
+      },
     );
 
     // The source final-result row can legitimately disappear when its scope
@@ -11038,12 +11095,15 @@ export async function updateAttendanceFinalResultProfile(
       throw new Error("Updated final attendance result could not be reloaded.");
     }
 
+    emit(95, "Committing the student profile and recalculated results.");
     return {
       finalResult: refreshedResult,
       updatedFields,
       mergedIntoExistingStudent,
     };
   });
+  emit(100, "Student profile saved successfully.");
+  return result;
 }
 
 export type StudentEventAttendanceProgress = {

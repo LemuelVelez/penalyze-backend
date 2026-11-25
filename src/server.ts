@@ -87,6 +87,7 @@ import {
   restoreImport as restoreAttendanceImport,
   updateEvent as updateAttendanceEvent,
   updateFinalResultProfile as updateAttendanceFinalResultProfile,
+  updateFinalResultProfileWithProgress,
   updateStudentEventAttendance,
   updateStudentEventAttendanceWithProgress,
   updateStudentEventAttendancesWithProgress,
@@ -387,6 +388,10 @@ app.patch(
 app.patch(
   "/api/attendance/final-results/:id/profile",
   requireAuth, requireAdmin, updateAttendanceFinalResultProfile,
+);
+app.patch(
+  "/api/attendance/final-results/:id/profile/progress",
+  requireAuth, requireAdmin, updateFinalResultProfileWithProgress,
 );
 app.delete("/api/attendance/final-results", requireAuth, requireAdmin, deleteAttendanceFinalResults);
 app.delete("/api/attendance/final-results/:id", requireAuth, requireAdmin, deleteAttendanceFinalResult);
