@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as XLSX from "xlsx";
 import type { MasterlistStatus, SchoolYearRecord, StudentMasterlistRecord, StudentMasterlistImportRecord, ParsedAttendanceRow } from "../database/model/schema.model";
@@ -350,35 +351,130 @@ export async function uploadMasterlist(file: {originalname: string;buffer: Buffe
   }
   if (!rows.length) throw bad("No valid masterlist students found.");
   emit({ stage: "parsing", percent: 5, message: `Parsed ${rows.length} valid students.` });
-  const result = await withTransaction(async client => {
-    await lockAttendanceAbsenceSync(client); const schoolYear=await activeYear(client);
-    emit({ stage: "saving_masterlist", percent: 5, message: "Saving masterlist…" });
-    await client.query("SELECT set_config('statement_timeout','180000ms',true)");
-    checkFilename(file.originalname, schoolYear);
+  const hash = createHash("sha256").update(file.buffer).digest("hex");
+  const jobId = await withTransaction(async client => {
+    await lockAttendanceAbsenceSync(client);
+    const year = await activeYear(client);
+    checkFilename(file.originalname,year);
     checkCancelled(isCancelled);
-    const imported=(await client.query<StudentMasterlistImportRecord>("INSERT INTO student_masterlist_imports(school_year_id,file_name,rows_total,rows_valid,rows_invalid,created_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING *",[schoolYear.id,file.originalname,total,rows.length,invalid,actor ?? null])).rows[0];
-    await client.query("DELETE FROM student_masterlist WHERE school_year_id=$1",[schoolYear.id]);
-    await yieldChunk(isCancelled);
-    for (let i = 0; i < rows.length; i += MASTERLIST_CHUNK_SIZE) {
-      const chunk = rows.slice(i,i + MASTERLIST_CHUNK_SIZE);
-      await client.query(`INSERT INTO student_masterlist(school_year_id,import_id,student_number,student_number_key,last_name,given_name,middle_initial,full_name,name_key,program,year_level,year_level_key,college) SELECT $1,$2,x.* FROM jsonb_to_recordset($3::jsonb) AS x(student_number text,student_number_key text,last_name text,given_name text,middle_initial text,full_name text,name_key text,program text,year_level text,year_level_key text,college text)`,[schoolYear.id,imported.id,JSON.stringify(chunk)]);
-      const processed = i + chunk.length;
-      emit({ stage: "saving_masterlist", percent: 5 + 5 * processed / rows.length, message: `Saving masterlist: ${processed} / ${rows.length} students`, processed, total: rows.length, chunkIndex: Math.floor(i / MASTERLIST_CHUNK_SIZE) + 1, chunkTotal: Math.ceil(rows.length / MASTERLIST_CHUNK_SIZE) });
-      await yieldChunk(isCancelled);
+    await client.query("SELECT set_config('statement_timeout','180000ms',true)");
+    const existing = await getUploadCheckpoint(client,year.id);
+    if (existing) {
+      if (existing.file_hash !== hash) throw bad("An unfinished masterlist upload exists. Resume it or discard it before uploading another file.");
+      return existing.id;
     }
-    const summary=await reconcileWithClient(client,schoolYear,true,new Map(),emit,isCancelled);
-    const saved=(await client.query<StudentMasterlistImportRecord>("UPDATE student_masterlist_imports SET summary=$2 WHERE id=$1 RETURNING *",[imported.id,JSON.stringify(summary)])).rows[0];
-    await yieldChunk(isCancelled);
-    return {import:saved,schoolYear,summary};
+    const result = await client.query<{id:string}>(`INSERT INTO student_masterlist_upload_jobs(school_year_id,file_name,file_hash,rows_total,rows_valid,rows_invalid,source_rows,created_by) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8) RETURNING id`,[year.id,file.originalname,hash,total,rows.length,invalid,JSON.stringify(rows),actor ?? null]);
+    return result.rows[0].id;
   });
-  onProgress?.({ stage: "finalizing", percent: 100, message: "Masterlist reconciled." });
-  return result;
+  return resumeMasterlistUpload(jobId,emit,isCancelled);
 }
+
+type MasterlistSummary = Awaited<ReturnType<typeof reconcileWithClient>>;
+type UploadResult = { import: StudentMasterlistImportRecord; schoolYear: SchoolYearRecord; summary: MasterlistSummary };
+type SourceRow = Omit<StudentMasterlistRecord,"id"|"school_year_id"|"import_id"|"created_at"|"updated_at">;
+type UploadCheckpoint = {
+  id:string; file_name:string; file_hash:string; rows_total:number; rows_valid:number; rows_invalid:number;
+  phase:"staged"|"syncing"|"refreshing"; import_id:string|null; processed:number; total_students:number;
+};
+type UploadStep = { done:false; progress:MasterlistProgress } | { done:true; result:UploadResult };
+const RESUMABLE_ABSENCE_CHUNK_SIZE = 25;
+
+async function getUploadCheckpoint(client:PoolClient,schoolYearId:string) {
+  return (await client.query<UploadCheckpoint>(`SELECT id,file_name,file_hash,rows_total,rows_valid,rows_invalid,phase,import_id,processed,cardinality(student_ids) AS total_students FROM student_masterlist_upload_jobs WHERE school_year_id=$1`,[schoolYearId])).rows[0] ?? null;
+}
+function absenceCheckpoint(processed:number,total:number):MasterlistProgress {
+  return { stage:"syncing_absences",percent:total ? 68+12*processed/total : 80,message:`Saved absence synchronization: ${processed} / ${total} students`,processed,total, ...(total ? {chunkIndex:Math.max(1,Math.ceil(processed/RESUMABLE_ABSENCE_CHUNK_SIZE)),chunkTotal:Math.ceil(total/RESUMABLE_ABSENCE_CHUNK_SIZE)} : {}) };
+}
+
+// The source snapshot, identity reconciliation, and each absence batch have
+// separate durable checkpoints. The checkpoint and its writes commit together.
+// Keep identity remapping/deduplication and the derived refresh atomic.
+export async function resumeMasterlistUpload(jobId:string,onProgress?:ProgressCallback,isCancelled?:()=>boolean):Promise<UploadResult> {
+  const emit=progressReporter(onProgress,isCancelled);
+  let announced=false;
+  while (true) {
+    checkCancelled(isCancelled);
+    const step=await withTransaction<UploadStep>(async client=>{
+      await lockAttendanceAbsenceSync(client);
+      await client.query("SELECT set_config('statement_timeout','180000ms',true)");
+      const year=await activeYear(client);
+      const job=await getUploadCheckpoint(client,year.id);
+      if (!job || job.id!==jobId) throw bad("The saved upload changed or was removed. Refresh the masterlist and try again.");
+      checkCancelled(isCancelled);
+      if (!announced) {
+        if (job.phase==="staged") emit({stage:"saving_masterlist",percent:5,message:`${job.rows_valid} students saved in the upload checkpoint.`});
+        else if (job.phase==="syncing") emit(absenceCheckpoint(job.processed,job.total_students));
+        else emit({stage:"refreshing_final_results",percent:80,message:"Resuming the saved results refresh…"});
+        announced=true;
+      }
+      if (job.phase==="staged") {
+        const source=(await client.query<{source_rows:SourceRow[];created_by:string|null}>("SELECT source_rows,created_by FROM student_masterlist_upload_jobs WHERE id=$1",[job.id])).rows[0];
+        const imported=(await client.query<StudentMasterlistImportRecord>("INSERT INTO student_masterlist_imports(school_year_id,file_name,rows_total,rows_valid,rows_invalid,created_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING *",[year.id,job.file_name,job.rows_total,job.rows_valid,job.rows_invalid,source.created_by])).rows[0];
+        await client.query("DELETE FROM student_masterlist WHERE school_year_id=$1",[year.id]);
+        for (let i=0;i<source.source_rows.length;i+=MASTERLIST_CHUNK_SIZE) {
+          const chunk=source.source_rows.slice(i,i+MASTERLIST_CHUNK_SIZE);
+          await client.query(`INSERT INTO student_masterlist(school_year_id,import_id,student_number,student_number_key,last_name,given_name,middle_initial,full_name,name_key,program,year_level,year_level_key,college) SELECT $1,$2,x.* FROM jsonb_to_recordset($3::jsonb) AS x(student_number text,student_number_key text,last_name text,given_name text,middle_initial text,full_name text,name_key text,program text,year_level text,year_level_key text,college text)`,[year.id,imported.id,JSON.stringify(chunk)]);
+          const processed=i+chunk.length;
+          emit({stage:"saving_masterlist",percent:5+5*processed/job.rows_valid,message:`Publishing masterlist: ${processed} / ${job.rows_valid} students`,processed,total:job.rows_valid,chunkIndex:Math.floor(i/MASTERLIST_CHUNK_SIZE)+1,chunkTotal:Math.ceil(job.rows_valid/MASTERLIST_CHUNK_SIZE)});
+          await yieldChunk(isCancelled);
+        }
+        const summary=await reconcileWithClient(client,year,false,new Map(),emit,isCancelled);
+        const students=(await client.query<{student_id:string}>("SELECT DISTINCT LOWER(TRIM(student_id)) AS student_id FROM attendance_records WHERE school_year_id=$1 AND deleted_at IS NULL AND NULLIF(TRIM(student_id),'') IS NOT NULL ORDER BY student_id",[year.id])).rows.map(row=>row.student_id);
+        await client.query("UPDATE student_masterlist_upload_jobs SET phase=$2,import_id=$3,summary=$4::jsonb,student_ids=$5::text[],source_rows='[]'::jsonb,processed=0,updated_at=NOW() WHERE id=$1",[job.id,students.length ? "syncing" : "refreshing",imported.id,JSON.stringify(summary),students]);
+        await yieldChunk(isCancelled);
+        return {done:false,progress:absenceCheckpoint(0,students.length)};
+      }
+      if (job.phase==="syncing") {
+        const chunk=(await client.query<{ids:string[]}>("SELECT student_ids[($2::int):($3::int)] AS ids FROM student_masterlist_upload_jobs WHERE id=$1",[job.id,job.processed+1,job.processed+RESUMABLE_ABSENCE_CHUNK_SIZE])).rows[0].ids;
+        if (!chunk.length) throw new Error("Invalid saved absence checkpoint.");
+        emit({...absenceCheckpoint(job.processed,job.total_students),message:`Syncing absences: ${job.processed} / ${job.total_students} students`,chunkIndex:Math.floor(job.processed/RESUMABLE_ABSENCE_CHUNK_SIZE)+1});
+        await syncAbsencesForStudents(client,chunk,year.id,true);
+        const processed=job.processed+chunk.length;
+        await client.query("UPDATE student_masterlist_upload_jobs SET processed=$2,phase=$3,updated_at=NOW() WHERE id=$1",[job.id,processed,processed===job.total_students ? "refreshing" : "syncing"]);
+        await yieldChunk(isCancelled);
+        return {done:false,progress:absenceCheckpoint(processed,job.total_students)};
+      }
+      const saved=(await client.query<{summary:MasterlistSummary|null}>("SELECT summary FROM student_masterlist_upload_jobs WHERE id=$1",[job.id])).rows[0];
+      if (!saved.summary || !job.import_id) throw new Error("Invalid saved masterlist reconciliation checkpoint.");
+      await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client,[year.id],progress=>{
+        const stages=["refreshing_final_results","refreshing_calculations","refreshing_penalties"] as const;
+        const messages=["Refreshing final attendance results…","Refreshing calculations…","Refreshing penalties…"];
+        const index=stages.indexOf(progress.stage);
+        emit({stage:progress.stage,percent:80+6*index,message:messages[index]});
+      });
+      await yieldChunk(isCancelled);
+      emit({stage:"finalizing",percent:98,message:"Finalizing reconciliation…"});
+      const imported=(await client.query<StudentMasterlistImportRecord>("UPDATE student_masterlist_imports SET summary=$2::jsonb WHERE id=$1 AND school_year_id=$3 RETURNING *",[job.import_id,JSON.stringify(saved.summary),year.id])).rows[0];
+      if (!imported) throw new Error("The saved masterlist import no longer exists.");
+      await client.query("DELETE FROM student_masterlist_upload_jobs WHERE id=$1",[job.id]);
+      checkCancelled(isCancelled);
+      return {done:true,result:{import:imported,schoolYear:year,summary:saved.summary}};
+    });
+    if (step.done) {
+      onProgress?.({stage:"finalizing",percent:100,message:"Masterlist reconciled."});
+      return step.result;
+    }
+    emit(step.progress);
+    await yieldChunk(isCancelled);
+  }
+}
+
+export const discardMasterlistUpload=(jobId:string)=>withTransaction(async client=>{
+  await lockAttendanceAbsenceSync(client);
+  const year=await activeYear(client);
+  const job=await getUploadCheckpoint(client,year.id);
+  if (!job || job.id!==jobId) throw bad("The saved upload changed. Refresh and try again.");
+  if (job.phase!=="staged") throw bad("This upload has already published records. Resume it or use Delete masterlist to start over.");
+  await client.query("DELETE FROM student_masterlist_upload_jobs WHERE id=$1",[job.id]);
+  return {schoolYear:year,discardedRows:job.rows_valid};
+});
+
 export async function reconcileMasterlist(onProgress?: ProgressCallback, isCancelled?: () => boolean) {
   const emit = progressReporter(onProgress, isCancelled);
   const result = await withTransaction(async client => {
     await lockAttendanceAbsenceSync(client);
     const year = await activeYear(client);
+    if (await getUploadCheckpoint(client,year.id)) throw bad("Resume or discard the unfinished masterlist upload first.");
     const summary = await reconcileWithClient(client, year, true, new Map(), emit, isCancelled);
     await client.query(`UPDATE student_masterlist_imports SET summary=$2 WHERE id=(SELECT id FROM student_masterlist_imports WHERE school_year_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1)`, [year.id, JSON.stringify(summary)]);
     await yieldChunk(isCancelled);
@@ -392,7 +488,11 @@ export const deleteMasterlist = (importId: string) => withTransaction(async clie
   const year = await activeYear(client);
   const latest = (await client.query<StudentMasterlistImportRecord>("SELECT * FROM student_masterlist_imports WHERE school_year_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1", [year.id])).rows[0];
   if (!latest || latest.id !== importId) throw bad("The masterlist changed since this page was loaded. Refresh and try again.");
+  const pending=await getUploadCheckpoint(client,year.id);
+  if (pending?.phase==="staged") throw bad("Discard the unfinished upload before deleting the published masterlist.");
+  if (pending && pending.import_id!==importId) throw bad("The masterlist changed since this page was loaded. Refresh and try again.");
   const result = await client.query("DELETE FROM student_masterlist WHERE school_year_id=$1", [year.id]);
+  if (pending) await client.query("DELETE FROM student_masterlist_upload_jobs WHERE id=$1",[pending.id]);
   return { schoolYear: year, deletedRows: result.rowCount ?? 0 };
 });
 
@@ -416,7 +516,9 @@ export async function listMasterlist(f:MasterlistFilters) {
     const index=schoolYear ? await loadMasterlist(client,schoolYear.id) : null;
     const rows=sortRows(filterRows(index?.rows ?? [],f));
     const latest=schoolYear && index?.rows.length ? (await client.query<StudentMasterlistImportRecord>("SELECT * FROM student_masterlist_imports WHERE school_year_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1",[schoolYear.id])).rows[0] : null;
-    return {rows:rows.slice(f.offset ?? 0,(f.offset ?? 0)+(f.limit ?? 50)),total:rows.length,schoolYear,import:latest};
+    const checkpoint=schoolYear ? await getUploadCheckpoint(client,schoolYear.id) : null;
+    const pendingUpload=checkpoint ? {id:checkpoint.id,fileName:checkpoint.file_name,rowsValid:checkpoint.rows_valid,phase:checkpoint.phase,processed:checkpoint.processed,totalStudents:checkpoint.total_students,percent:checkpoint.phase==="staged" ? 5 : checkpoint.phase==="refreshing" ? 80 : absenceCheckpoint(checkpoint.processed,checkpoint.total_students).percent} : null;
+    return {rows:rows.slice(f.offset ?? 0,(f.offset ?? 0)+(f.limit ?? 50)),total:rows.length,schoolYear,import:latest,pendingUpload};
   } finally {client.release();}
 }
 
@@ -448,6 +550,8 @@ async function finalAttendanceSchoolYear(client: PoolClient, f: MasterlistFilter
 export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
   return withFinalAttendanceSnapshot(async client => {
     const schoolYear=await finalAttendanceSchoolYear(client,f);
+    const pending=await getUploadCheckpoint(client,schoolYear.id);
+    if (pending && pending.phase!=="staged") throw Object.assign(new Error("Final attendance is being rebuilt. Resume the unfinished masterlist upload before viewing or exporting results."),{statusCode:409,expose:true});
     const index=await loadMasterlist(client,schoolYear.id);
     const hasMasterlist=index.rows.length>0;
     const events=(await client.query<EventColumn>("SELECT id,name,event_order,event_start_at FROM attendance_events WHERE school_year_id=$1 ORDER BY event_order NULLS LAST,COALESCE(event_start_at,event_end_at) NULLS LAST,name",[schoolYear.id])).rows;
@@ -509,6 +613,8 @@ async function loadUnmatched(client: PoolClient, schoolYearId: string, index: Ma
 export async function getFinalAttendanceUnmatched(f: MasterlistFilters) {
   return withFinalAttendanceSnapshot(async client => {
     const schoolYear=await finalAttendanceSchoolYear(client,f);
+    const pending=await getUploadCheckpoint(client,schoolYear.id);
+    if (pending && pending.phase!=="staged") throw Object.assign(new Error("Final attendance is being rebuilt. Resume the unfinished masterlist upload before viewing or exporting results."),{statusCode:409,expose:true});
     const index=await loadMasterlist(client,schoolYear.id);
     const rows=await loadUnmatched(client,schoolYear.id,index,f);
     const offset=f.offset ?? 0;

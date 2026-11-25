@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import type { AuthenticatedRequest } from "./auth.controller";
 import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
-import { uploadMasterlist, listMasterlist, reconcileMasterlist, deleteMasterlist, getFinalAttendance, getFinalAttendanceUnmatched, exportFinalAttendance, type MasterlistFilters, type MasterlistProgress } from "../services/masterlist.service";
+import { uploadMasterlist, resumeMasterlistUpload, discardMasterlistUpload, listMasterlist, reconcileMasterlist, deleteMasterlist, getFinalAttendance, getFinalAttendanceUnmatched, exportFinalAttendance, type MasterlistFilters, type MasterlistProgress } from "../services/masterlist.service";
 function filters(req:Request):MasterlistFilters {
   const text=(key:string)=>typeof req.query[key]==="string" ? String(req.query[key]).trim() || undefined : undefined;
   const schoolYearId=text("schoolYearId");
@@ -47,7 +47,7 @@ async function streamMasterlist<T>(req: Request,res: Response,next: NextFunction
       const code=typeof exposed?.code === "string" && /^[0-9A-Z]{5}$/.test(exposed.code) ? exposed.code : undefined;
       if(!exposed?.expose && exposed?.statusCode!==499) console.error("[masterlist-progress]",{stage,chunk,code},error);
       const reason=code === "57014" ? "Database query timed out." : code === "55P03" ? "Database lock timed out." : code === "40P01" || code === "40001" ? "Database transaction conflicted with another operation." : code === "23505" ? "A duplicate record conflicts with reconciliation." : code ? `Database error (${code}).` : "Masterlist request failed.";
-      const message=(exposed?.expose || exposed?.statusCode===499) && exposed.message ? exposed.message : `${reason} Failed during ${stage}${chunk}. Refresh the masterlist before retrying.`;
+      const message=(exposed?.expose || exposed?.statusCode===499) && exposed.message ? exposed.message : `${reason} Failed during ${stage}${chunk}. Refresh the masterlist to see saved upload progress before retrying.`;
       writeProgressStreamMessage(res,{type:"error",message});
       if(!res.destroyed && !res.writableEnded) res.end();
     } else next(error);
@@ -61,6 +61,17 @@ export async function uploadWithProgress(req:AuthenticatedRequest,res:Response,n
   const file=req.file;
   if(!file){res.status(400).json({message:"Choose a masterlist file."});return;}
   await streamMasterlist(req,res,next,(onProgress,isCancelled)=>uploadMasterlist(file,req.user?.sub,onProgress,isCancelled));
+}
+export async function resumeUploadWithProgress(req:Request,res:Response,next:NextFunction) {
+  const jobId=typeof req.body?.jobId === "string" ? req.body.jobId : "";
+  if(!jobId){res.status(400).json({message:"Choose a saved masterlist upload."});return;}
+  await streamMasterlist(req,res,next,(onProgress,isCancelled)=>resumeMasterlistUpload(jobId,onProgress,isCancelled));
+}
+export async function discardUpload(req:Request,res:Response) {
+  const confirmation=typeof req.body?.confirmation === "string" ? req.body.confirmation.trim().toUpperCase() : "";
+  if(confirmation!=="DISCARD UPLOAD"){res.status(400).json({message:"Type DISCARD UPLOAD to confirm deletion."});return;}
+  const jobId=typeof req.body?.jobId === "string" ? req.body.jobId : "";
+  res.json(await discardMasterlistUpload(jobId));
 }
 export async function reconcileWithProgress(req:Request,res:Response,next:NextFunction) {
   await streamMasterlist(req,res,next,reconcileMasterlist);

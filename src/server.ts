@@ -317,6 +317,8 @@ app.delete(
 
 app.post("/api/masterlist/upload", requireAuth, requireAdmin, masterlistUpload.single("file"), masterlist.upload);
 app.post("/api/masterlist/upload/progress", requireAuth, requireAdmin, masterlistUpload.single("file"), masterlist.uploadWithProgress);
+app.post("/api/masterlist/upload/resume/progress", requireAuth, requireAdmin, masterlist.resumeUploadWithProgress);
+app.delete("/api/masterlist/upload/pending", requireAuth, requireAdmin, masterlist.discardUpload);
 app.get("/api/masterlist", requireAuth, requireAdmin, masterlist.list);
 app.post("/api/masterlist/reconcile", requireAuth, requireAdmin, masterlist.reconcile);
 app.post("/api/masterlist/reconcile/progress", requireAuth, requireAdmin, masterlist.reconcileWithProgress);
