@@ -5,7 +5,7 @@ import type { MasterlistStatus, SchoolYearRecord, StudentMasterlistRecord, Stude
 import { pool, withTransaction } from "../lib/db";
 import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelKey, normalizeCollegeKey, lockAttendanceAbsenceSync, refreshDerivedAttendanceResultsForSchoolYearsWithClient, listAttendanceFinalResults, listFinalAttendanceEventRoster, syncAbsencesForStudents, ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL } from "./attendance.service";
 import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
-import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram } from "./masterlist-normalize";
+import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram, parseStudentNumberParts, isPlaceholderStudentNumber, nameTokens, nameTokensAgree, nameKeysAgree, sharedNameTokenCount, nameTokenSignatures } from "./masterlist-normalize";
 
 const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, expose: true });
 export type MasterlistProgress = {
@@ -51,31 +51,30 @@ function checkFilename(file: string, year: SchoolYearRecord) {
 }
 type Profile = { studentId: string; name: string; program?: string | null; college?: string | null };
 type Resolution = { status: MasterlistStatus; master?: StudentMasterlistRecord };
-type MasterIndex = { rows: StudentMasterlistRecord[]; ids: Map<string, StudentMasterlistRecord>; names: Map<string, StudentMasterlistRecord[]>; tokens: Map<string, StudentMasterlistRecord[]> };
+type MasterIndex = { rows: StudentMasterlistRecord[]; ids: Map<string, StudentMasterlistRecord>; names: Map<string, StudentMasterlistRecord[]>; tokens: Map<string, StudentMasterlistRecord[]>; serials: Map<string, StudentMasterlistRecord[]> };
 export type MasterlistCache = Map<string, MasterIndex>;
-const tokens = (key: string) => [...new Set(key.split(" ").filter(Boolean))];
-const contains = (system: Set<string>, master: string) => !!master && tokens(master).every(t => system.has(t));
+
 export async function loadMasterlist(client: PoolClient, schoolYearId: string, cache: MasterlistCache = new Map()): Promise<MasterIndex> {
   const cached = cache.get(schoolYearId); if (cached) return cached;
   const year = (await client.query<SchoolYearRecord>("SELECT * FROM school_years WHERE id=$1", [schoolYearId])).rows[0];
   const rows = isMasterlistSchoolYear(year) ? (await client.query<StudentMasterlistRecord>("SELECT * FROM student_masterlist WHERE school_year_id=$1", [schoolYearId])).rows : [];
-  const index: MasterIndex = { rows, ids: new Map(), names: new Map(), tokens: new Map() };
+  const index: MasterIndex = { rows, ids: new Map(), names: new Map(), tokens: new Map(), serials: new Map() };
   for (const row of rows) {
-    index.ids.set(row.student_number_key, row);
+    const parts = parseStudentNumberParts(row.student_number_key);
+    if (parts) {
+      index.ids.set(row.student_number_key, row);
+      const serialRows = index.serials.get(parts.serial) ?? [];
+      serialRows.push(row); index.serials.set(parts.serial, serialRows);
+    }
     index.names.set(row.name_key, [...(index.names.get(row.name_key) ?? []), row]);
-    for (const token of tokens(row.name_key)) index.tokens.set(token, [...(index.tokens.get(token) ?? []), row]);
+    for (const signature of new Set(nameTokens(row.name_key).flatMap(nameTokenSignatures))) {
+      const candidates = index.tokens.get(signature) ?? [];
+      candidates.push(row); index.tokens.set(signature, candidates);
+    }
   }
   cache.set(schoolYearId, index); return index;
 }
-function resolve(index: MasterIndex, profile: Profile): Resolution {
-  if (!index.rows.length) return { status: "no_masterlist" };
-  const id = normalizeStudentNumberKey(profile.studentId);
-  const nameKey = normalizeNameKey(profile.name);
-  const nameTokens = new Set(tokens(nameKey));
-  const master = /-00000$/.test(id) ? undefined : index.ids.get(id);
-  if (master) return { status: contains(nameTokens, master.name_key) ? "matched_by_id" : "id_name_mismatch", master };
-  if (!nameKey) return { status: "unmatched" };
-  let candidates = [...new Set([...(index.names.get(nameKey) ?? []), ...[...nameTokens].flatMap(t => index.tokens.get(t) ?? []).filter(r => contains(nameTokens, r.name_key))])];
+function narrowCandidates(candidates: StudentMasterlistRecord[], profile: Profile): StudentMasterlistRecord[] {
   if (candidates.length > 1 && profile.college) {
     const narrowed = candidates.filter(r => normalizeCollegeKey(r.college) === normalizeCollegeKey(profile.college));
     if (narrowed.length) candidates = narrowed;
@@ -84,6 +83,36 @@ function resolve(index: MasterIndex, profile: Profile): Resolution {
     const narrowed = candidates.filter(r => normalizeProgram(r.program) === normalizeProgram(profile.program));
     if (narrowed.length) candidates = narrowed;
   }
+  return candidates;
+}
+function resolve(index: MasterIndex, profile: Profile): Resolution {
+  if (!index.rows.length) return { status: "no_masterlist" };
+  const id = normalizeStudentNumberKey(profile.studentId);
+  const nameKey = normalizeNameKey(profile.name);
+  const placeholder = isPlaceholderStudentNumber(profile.studentId);
+  const master = placeholder ? undefined : index.ids.get(id);
+  if (master) return { status: nameKeysAgree(nameKey, master.name_key) ? "matched_by_id" : "id_name_mismatch", master };
+  const parts = placeholder ? null : parseStudentNumberParts(profile.studentId);
+  if (parts) {
+    let candidates = (index.serials.get(parts.serial) ?? []).filter(r => {
+      const candidate = parseStudentNumberParts(r.student_number_key);
+      return candidate && (!parts.year || candidate.year === parts.year) && (!parts.letter || candidate.letter === parts.letter);
+    });
+    if (nameKey) {
+      candidates = candidates.filter(r =>
+        nameTokens(normalizeNameKey(r.last_name)).some(surname => nameTokens(nameKey).some(token => nameTokensAgree(token, surname))) ||
+        sharedNameTokenCount(nameKey, r.name_key) >= 2);
+    } else {
+      const college = normalizeCollegeKey(profile.college);
+      candidates = college ? candidates.filter(r => normalizeCollegeKey(r.college) === college) : [];
+    }
+    candidates = narrowCandidates(candidates, profile);
+    if (candidates.length === 1) return { status: "matched_by_partial_id", master: candidates[0] };
+  }
+  if (!nameKey) return { status: "unmatched" };
+  const candidates = narrowCandidates([...new Set(nameTokens(nameKey).flatMap(nameTokenSignatures)
+    .flatMap(signature => index.tokens.get(signature) ?? []))].filter(r =>
+      !isPlaceholderStudentNumber(r.student_number_key) && nameKeysAgree(nameKey, r.name_key)), profile);
   return candidates.length === 1 ? { status: "matched_by_name", master: candidates[0] } : { status: "unmatched" };
 }
 export async function resolveStudentAgainstMasterlist(client: PoolClient, schoolYearId: string, profile: Profile, cache: MasterlistCache = new Map()): Promise<Resolution> {
@@ -91,9 +120,12 @@ export async function resolveStudentAgainstMasterlist(client: PoolClient, school
 }
 export async function reconcileAttendanceRow(client: PoolClient, schoolYearId: string, row: ParsedAttendanceRow, cache: MasterlistCache): Promise<ParsedAttendanceRow> {
   const result = await resolveStudentAgainstMasterlist(client, schoolYearId, row, cache);
-  if (result.status === "no_masterlist") return row;
   const m = result.master;
-  if (!m) return { ...row, masterlist_status: result.status };
+  if (!m) {
+    const key = normalizeStudentNumberKey(row.studentId);
+    const studentId = /^TC-\d{2}-[A-Z]-\d{5}$/.test(key) ? key : row.studentId;
+    return { ...row, studentId, masterlist_status: result.status === "no_masterlist" ? row.masterlist_status : result.status, masterlist_original: row.masterlist_original ?? (studentId !== row.studentId ? { studentId: row.studentId, name: row.name } : undefined) };
+  }
   const changed = row.studentId !== m.student_number || row.name !== m.full_name || row.college !== (m.college ?? undefined) || row.program !== (m.program ?? undefined) || row.yearLevel !== (m.year_level ?? undefined);
   return { ...row, studentId: m.student_number, name: m.full_name, college: m.college ?? undefined, program: m.program ?? undefined, yearLevel: m.year_level ?? undefined, masterlist_status: result.status, masterlist_original: row.masterlist_original ?? (changed ? { studentId: row.studentId, name: row.name } : undefined), errors: row.errors.filter(e => !e.includes(": unrecognised college ") && e !== "Student ID is required." && e !== "Name is required.") };
 }
@@ -127,9 +159,10 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
   const emit = progressReporter(onProgress, isCancelled);
   emit({ stage: "reconciling_records", percent: 10, message: "Counting attendance records…" });
   await client.query("SELECT set_config('statement_timeout','180000ms',true)");
+  await client.query("SELECT set_config('lock_timeout','60000ms',true)");
   const index = await loadMasterlist(client, schoolYear.id, cache);
   if (!index.rows.length) throw bad("Upload a masterlist before reconciling.");
-  const summary = { schoolYear, masterlistRows: index.rows.length, matchedById: 0, matchedByName: 0, idNameMismatches: 0, unmatched: 0, studentsUpdated: 0, recordsUpdated: 0, unmappedPrograms: [...new Set(index.rows.filter(r => !r.college).map(r => r.program ?? ""))] };
+  const summary = { schoolYear, masterlistRows: index.rows.length, matchedById: 0, matchedByPartialId: 0, matchedByName: 0, idNameMismatches: 0, unmatched: 0, studentsUpdated: 0, recordsUpdated: 0, unmappedPrograms: [...new Set(index.rows.filter(r => !r.college).map(r => r.program ?? ""))] };
   const seen = new Set<string>();
   const aliases = new Map<string, Set<string>>();
   const changed = new Set<string>();
@@ -164,9 +197,16 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
         if (resolution.status === "unmatched" && !full && prior?.size === 1) {
           resolution = { status: "matched_by_name", master: [...prior][0] };
         }
-        if (!seen.has(key)) { seen.add(key); if (resolution.status === "matched_by_id") summary.matchedById++; else if (resolution.status === "matched_by_name") summary.matchedByName++; else if (resolution.status === "id_name_mismatch") summary.idNameMismatches++; else summary.unmatched++; }
+        if (!seen.has(key)) { seen.add(key); if (resolution.status === "matched_by_id") summary.matchedById++; else if (resolution.status === "matched_by_partial_id") summary.matchedByPartialId++; else if (resolution.status === "matched_by_name") summary.matchedByName++; else if (resolution.status === "id_name_mismatch") summary.idNameMismatches++; else summary.unmatched++; }
         const m = resolution.master;
-        if (!m) { unresolvedAliases.add(row.student_id.trim().toLowerCase()); continue; }
+        if (!m) {
+          unresolvedAliases.add(row.student_id.trim().toLowerCase());
+          const canonical = normalizeStudentNumberKey(row.student_id);
+          if (/^TC-\d{2}-[A-Z]-\d{5}$/.test(canonical) && canonical !== row.student_id) {
+            updates.push({ ...row, student_id: canonical });
+          }
+          continue;
+        }
         if (full) {
           const profiles = sourceProfiles.get(key) ?? new Set<StudentMasterlistRecord>();
           profiles.add(m); sourceProfiles.set(key, profiles);
@@ -217,7 +257,7 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
   for (const { student_key } of overrideKeys) {
     if (aliases.has(student_key) || unresolvedAliases.has(student_key)) continue;
     const key = normalizeStudentNumberKey(student_key);
-    const master = /-00000$/.test(key) ? undefined : index.ids.get(key);
+    const master = isPlaceholderStudentNumber(student_key) ? undefined : index.ids.get(key);
     if (master) aliases.set(student_key, new Set([master.student_number]));
   }
   const mapping = [...aliases].filter(([, values]) => values.size === 1).filter(([old]) => !unresolvedAliases.has(old)).map(([old, values]) => ({ old, target: [...values][0].toLowerCase() }));
@@ -342,10 +382,10 @@ export async function uploadMasterlist(file: {originalname: string;buffer: Buffe
     if (r.every(v => !String(v ?? "").trim()) || (r.map(header).includes("studentnumber") && r.map(header).includes("lastname"))) continue;
     total++;
     const get = (f:string) => String(r[headers.indexOf(f)] ?? "").trim();
-    const student_number=get("studentnumber"), student_number_key=normalizeStudentNumberKey(student_number), last_name=get("lastname"), given_name=get("givenname"), middle_initial=get("middleinitial").replace(/\.+$/, "") || null;
+    const student_number=normalizeStudentNumberKey(get("studentnumber")), student_number_key=student_number, last_name=get("lastname"), given_name=get("givenname"), middle_initial=get("middleinitial").replace(/\.+$/, "") || null;
     const program=cleanProgram(get("degreeprogram")); const year_level_key=normalizeYearLevelKey(get("yearlevel"));
     const year_level=({"1":"1st Year","2":"2nd Year","3":"3rd Year","4":"4th Year"} as Record<string,string>)[year_level_key ?? ""];
-    if (!/^TC-\d{2}-[A-Z]-\d{5}$/.test(student_number_key) || !last_name || !given_name || !year_level || ids.has(student_number_key)) { invalid++; continue; }
+    if (!/^TC-\d{2}-[A-Z]-\d{5}$/.test(student_number_key) || isPlaceholderStudentNumber(student_number_key) || !last_name || !given_name || !year_level || ids.has(student_number_key)) { invalid++; continue; }
     ids.add(student_number_key);
     rows.push({student_number,student_number_key,last_name,given_name,middle_initial,full_name:`${last_name}, ${given_name}${middle_initial ? ` ${middle_initial}.` : ""}`,name_key:normalizeNameKey(`${given_name} ${last_name}`),program,year_level,year_level_key,college:collegeForProgram(program)});
   }
@@ -472,6 +512,8 @@ export const discardMasterlistUpload=(jobId:string)=>withTransaction(async clien
 export async function reconcileMasterlist(onProgress?: ProgressCallback, isCancelled?: () => boolean) {
   const emit = progressReporter(onProgress, isCancelled);
   const result = await withTransaction(async client => {
+    await client.query("SELECT set_config('statement_timeout','180000ms',true)");
+    await client.query("SELECT set_config('lock_timeout','60000ms',true)");
     await lockAttendanceAbsenceSync(client);
     const year = await activeYear(client);
     if (await getUploadCheckpoint(client,year.id)) throw bad("Resume or discard the unfinished masterlist upload first.");

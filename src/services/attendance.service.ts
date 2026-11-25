@@ -1,4 +1,5 @@
-import { reconcileAttendanceRow, upsertMasterlistStudent, reconcileMasterlistForAttendanceUpload, loadMasterlist, syncMasterlistAbsences, type MasterlistCache } from "./masterlist.service";
+import { isPlaceholderStudentNumber, normalizeNameKey, normalizeStudentNumberKey } from "./masterlist-normalize";
+import { reconcileAttendanceRow, resolveStudentAgainstMasterlist, upsertMasterlistStudent, reconcileMasterlistForAttendanceUpload, loadMasterlist, syncMasterlistAbsences, type MasterlistCache } from "./masterlist.service";
 import path from "path";
 import { createHash } from "crypto";
 import { TextDecoder } from "util";
@@ -1365,7 +1366,10 @@ function getAttendanceRowMergeKey(
   ].join("::");
   const collegeKey = cleanText(row.college) || "no-college";
 
-  return `${normalizeHeader(eventKey)}:${normalizeHeader(collegeKey)}:${cleanText(row.studentId).toLowerCase()}`;
+  const studentKey = normalizeStudentNumberKey(row.studentId).toLowerCase();
+  const base = `${normalizeHeader(eventKey)}:${normalizeHeader(collegeKey)}:${studentKey}`;
+  return isPlaceholderStudentNumber(row.studentId) || row.masterlist_status === "unmatched" || (!row.masterlist_status && !/^tc-\d{2}-[a-z]-\d{5}$/.test(studentKey))
+    ? `${base}:${normalizeNameKey(row.name)}` : base;
 }
 
 type AttendanceRowMergeResult = {
@@ -2187,9 +2191,8 @@ async function insertAttendanceRecord(
   return result.rows[0];
 }
 
-function validateAttendanceInput(input: RawImportRow) {
-  const preview = buildPreview("manual-attendance", "manual", [input]);
-  const row = preview.rows[0];
+function validateAttendanceInput(input: RawImportRow, reconciledRow?: ParsedAttendanceRow) {
+  const row = reconciledRow ?? buildPreview("manual-attendance", "manual", [input]).rows[0];
 
   if (!row || row.errors.length > 0) {
     throw createValidationError(
@@ -2197,7 +2200,8 @@ function validateAttendanceInput(input: RawImportRow) {
     );
   }
 
-  return row;
+  const canonical = normalizeStudentNumberKey(row.studentId);
+  return /^TC-\d{2}-[A-Z]-\d{5}$/.test(canonical) ? { ...row, studentId: canonical } : row;
 }
 
 const FINE_RETURNING_COLUMNS_SQL = `
@@ -4794,112 +4798,137 @@ async function upsertPenaltyResultForManualRecord(
   return result.rows[0];
 }
 
-export async function saveManualAttendanceRecord(input: RawImportRow) {
-  const validatedRow = validateAttendanceInput(input);
-  let row = {
-    ...validatedRow,
-    studentId: cleanText(validatedRow.studentId),
-  };
+async function lockManualAttendanceTransaction(client: PoolClient) {
+  // Also extend the lock wait itself, not only the work after it is acquired.
+  await client.query("SELECT set_config('statement_timeout','180000ms',true)");
+  await client.query("SELECT set_config('lock_timeout','60000ms',true)");
+  await lockAttendanceAbsenceSync(client);
+}
+
+async function insertManualAttendanceRecord(client: PoolClient, input: RawImportRow, cache: MasterlistCache) {
+  let row = normalizeImportRows([input])[0];
   const attendanceType = getManualAttendanceType(input);
-  return withTransaction(async (client) => {
-    await lockAttendanceAbsenceSync(client);
-    const requestedEventId = cleanText(input.eventId ?? input.event_id);
-    const requestedEvent = attendanceType === "manual" && requestedEventId ? await getAttendanceEventById(client, requestedEventId) : null;
-    const masterlistYearId = requestedEvent?.school_year_id ?? await resolveSchoolYearId(client, (input.schoolYearId ?? input.school_year_id), [row.scannedAt]);
-    row = await reconcileAttendanceRow(client, masterlistYearId, row, new Map());
-    if ((!row.masterlist_status || row.masterlist_status === "no_masterlist" || row.masterlist_status === "unmatched") && !cleanText(row.college)) {
-      throw createValidationError("Select a college before saving manual attendance.", 400);
-    }
-    const recordCollege = row.masterlist_status && row.masterlist_status !== "unmatched" && row.masterlist_status !== "no_masterlist" ? row.college ?? "" : await getEffectiveAttendanceCollege(
+  const requestedEventId = cleanText(input.eventId ?? input.event_id);
+  const requestedEvent = attendanceType === "manual" && requestedEventId ? await getAttendanceEventById(client, requestedEventId) : null;
+  const masterlistYearId = requestedEvent?.school_year_id ?? await resolveSchoolYearId(client, (input.schoolYearId ?? input.school_year_id), [row.scannedAt]);
+  row = validateAttendanceInput(input, await reconcileAttendanceRow(client, masterlistYearId, row, cache));
+  if ((!row.masterlist_status || row.masterlist_status === "no_masterlist" || row.masterlist_status === "unmatched") && !cleanText(row.college)) {
+    throw createValidationError("Select a college before saving manual attendance.", 400);
+  }
+  const recordCollege = row.masterlist_status && row.masterlist_status !== "unmatched" && row.masterlist_status !== "no_masterlist" ? row.college ?? "" : await getEffectiveAttendanceCollege(
+    client,
+    row.studentId,
+    row.college,
+  );
+  const event = await getManualAttendanceEvent(
+    client,
+    input,
+    attendanceType,
+    recordCollege,
+    row.yearLevel,
+  );
+  const schoolYearId =
+    event?.school_year_id ??
+    (await resolveSchoolYearId(
       client,
-      row.studentId,
-      row.college,
-    );
-    const event = await getManualAttendanceEvent(
-      client,
-      input,
+      (input as Record<string, unknown>).schoolYearId ??
+        (input as Record<string, unknown>).school_year_id,
+      [row.scannedAt],
+    ));
+  const noOfAbsences =
+    attendanceType === "manual" && event
+      ? 0
+      : Math.max(0, Number(row.noOfAbsences ?? 0));
+
+  if (row.masterlist_status && row.masterlist_status !== "no_masterlist") await upsertMasterlistStudent(client, schoolYearId, { ...row, noOfAbsences });
+  else await upsertStudent(client, {
+    ...row,
+    noOfAbsences,
+  });
+
+  const result = await client.query<ManualAttendanceRecord>(
+    `
+      INSERT INTO manual_attendance_records (
+        school_year_id,
+        event_id,
+        attendance_type,
+        student_id,
+        name,
+        year_level,
+        college,
+        program,
+        institution,
+        no_of_absences,
+        remarks,
+        scanned_at
+      )
+      VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''), $10, NULLIF($11, ''), $12::TIMESTAMPTZ)
+      RETURNING *
+    `,
+    [
+      schoolYearId,
+      event?.id ?? null,
       attendanceType,
-      recordCollege,
-      row.yearLevel,
-    );
-    const schoolYearId =
-      event?.school_year_id ??
-      (await resolveSchoolYearId(
-        client,
-        (input as Record<string, unknown>).schoolYearId ??
-          (input as Record<string, unknown>).school_year_id,
-        [row.scannedAt],
-      ));
-    const noOfAbsences =
-      attendanceType === "manual" && event
-        ? 0
-        : Math.max(0, Number(row.noOfAbsences ?? 0));
-
-    if (row.masterlist_status && row.masterlist_status !== "no_masterlist") await upsertMasterlistStudent(client, schoolYearId, { ...row, noOfAbsences });
-    else await upsertStudent(client, {
-      ...row,
+      row.studentId,
+      row.name,
+      row.yearLevel ?? "",
+      row.college ?? "",
+      row.program ?? "",
+      row.institution ?? "",
       noOfAbsences,
-    });
+      row.remarks ?? "",
+      row.scannedAt ?? null,
+    ],
+  );
+  const manualRecord = result.rows[0];
+  const record = manualRecordToAttendanceRecord({
+    ...manualRecord,
+    event_name: event?.name ?? null,
+  });
+  const penaltyResult = await upsertPenaltyResultForManualRecord(
+    client,
+    manualRecord,
+  );
 
-    const result = await client.query<ManualAttendanceRecord>(
-      `
-        INSERT INTO manual_attendance_records (
-          school_year_id,
-          event_id,
-          attendance_type,
-          student_id,
-          name,
-          year_level,
-          college,
-          program,
-          institution,
-          no_of_absences,
-          remarks,
-          scanned_at
-        )
-        VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''), $10, NULLIF($11, ''), $12::TIMESTAMPTZ)
-        RETURNING *
-      `,
-      [
-        schoolYearId,
-        event?.id ?? null,
-        attendanceType,
-        row.studentId,
-        row.name,
-        row.yearLevel ?? "",
-        row.college ?? "",
-        row.program ?? "",
-        row.institution ?? "",
-        noOfAbsences,
-        row.remarks ?? "",
-        row.scannedAt ?? null,
-      ],
-    );
-    const manualRecord = result.rows[0];
-    const record = manualRecordToAttendanceRecord({
+  return {
+    event,
+    manualRecord: {
       ...manualRecord,
       event_name: event?.name ?? null,
-    });
-    const penaltyResult = await upsertPenaltyResultForManualRecord(
-      client,
-      manualRecord,
-    );
+    },
+    record,
+    records: [record],
+    fine: penaltyResult ? penaltyResultToFine(penaltyResult) : null,
+  };
+}
 
-    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [
-      schoolYearId,
-    ]);
-
-    return {
-      event,
-      manualRecord: {
-        ...manualRecord,
-        event_name: event?.name ?? null,
-      },
-      record,
-      records: [record],
-      fine: penaltyResult ? penaltyResultToFine(penaltyResult) : null,
-    };
+async function saveManualAttendanceInputs(inputs: RawImportRow[]) {
+  return withTransaction(async client => {
+    await lockManualAttendanceTransaction(client);
+    const cache: MasterlistCache = new Map();
+    const results: Awaited<ReturnType<typeof insertManualAttendanceRecord>>[] = [];
+    for (const input of inputs) results.push(await insertManualAttendanceRecord(client, input, cache));
+    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, results.map(result => result.manualRecord.school_year_id));
+    return results;
   });
+}
+
+export async function saveManualAttendanceRecord(input: RawImportRow) {
+  const [result] = await saveManualAttendanceInputs([input]);
+  return result;
+}
+
+export async function saveManualAttendanceRecords(input: RawImportRow) {
+  const eventIds = input.eventIds;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!Array.isArray(eventIds) || eventIds.length > 10000 || eventIds.some(id => typeof id !== "string" || !uuid.test(id))) {
+    throw createValidationError("Provide valid attendance event IDs.");
+  }
+  const ids = [...new Set((eventIds as string[]).map(id => id.toLowerCase()))];
+  // An empty selection retains the existing zero-attendance registration behaviour.
+  const inputs = ids.length ? ids.map(eventId => ({ ...input, attendanceType: "manual", eventId })) :
+    [{ ...input, attendanceType: "zero_attendance", eventId: undefined, event_id: undefined }];
+  return saveManualAttendanceInputs(inputs);
 }
 
 export async function updateAttendanceRecords(
@@ -5078,11 +5107,8 @@ async function updateManualAttendanceRecord(
   id: string,
   input: RawImportRow,
 ) {
-  const validatedRow = validateAttendanceInput(input);
-  let row = {
-    ...validatedRow,
-    studentId: cleanText(validatedRow.studentId),
-  };
+  let row = normalizeImportRows([input])[0];
+  await lockManualAttendanceTransaction(client);
   const existingResult = await client.query<ManualAttendanceRecord>(
     `
       SELECT ${getManualRecordSelectSql()}
@@ -5100,11 +5126,10 @@ async function updateManualAttendanceRecord(
   }
 
   const attendanceType = existingRecord.attendance_type;
-  await lockAttendanceAbsenceSync(client);
   const requestedEventId = cleanText(input.eventId ?? input.event_id);
   const requestedEvent = attendanceType === "manual" && requestedEventId ? await getAttendanceEventById(client, requestedEventId) : null;
   const masterlistYearId = requestedEvent?.school_year_id ?? await resolveSchoolYearId(client, (input.schoolYearId ?? input.school_year_id ?? existingRecord.school_year_id), [row.scannedAt, existingRecord.scanned_at]);
-  row = await reconcileAttendanceRow(client, masterlistYearId, row, new Map());
+  row = validateAttendanceInput(input, await reconcileAttendanceRow(client, masterlistYearId, row, new Map()));
   const recordCollege = row.masterlist_status && row.masterlist_status !== "unmatched" && row.masterlist_status !== "no_masterlist" ? row.college ?? "" : await getEffectiveAttendanceCollege(
     client,
     row.studentId || existingRecord.student_id,
@@ -5206,7 +5231,6 @@ async function updateManualAttendanceRecord(
 }
 
 export async function updateAttendanceRecord(id: string, input: RawImportRow) {
-  const row = validateAttendanceInput(input);
 
   return withTransaction(async (client) => {
     const existingResult = await client.query<AttendanceRecord>(
@@ -5219,6 +5243,7 @@ export async function updateAttendanceRecord(id: string, input: RawImportRow) {
       return updateManualAttendanceRecord(client, id, input);
     }
 
+    const row = validateAttendanceInput(input);
     const existingEventRosterCollegeKeys = existingRecord.event_id
       ? await getAttendanceRecordEventRosterCollegeKeys(client, [
           existingRecord.id,
@@ -5360,6 +5385,7 @@ export async function deleteAttendanceRecord(id: string) {
       return record;
     }
 
+    await lockManualAttendanceTransaction(client);
     const manualResult = await client.query<ManualAttendanceRecord>(
       `
         SELECT ${getManualRecordSelectSql()}
@@ -9810,6 +9836,7 @@ type AttendanceFinalResultsFilter = {
   schoolYearId?: string;
   importId?: string;
   studentId?: string;
+  studentProfile?: { name: string; college?: string; program?: string };
   studentKeys?: string[];
   college?: string;
   includeMissedEvents?: boolean;
@@ -10978,7 +11005,7 @@ export async function setStudentEventAttendances(
 
   const result = await withTransaction(async (client) => {
     emitProgress("waiting_for_lock", 10, `Waiting for the attendance database lock to update ${label}.`);
-    await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
+    await lockManualAttendanceTransaction(client);
     emitProgress("checking_student", 20, "Lock acquired. Checking the student's final record and school year.");
 
     const studentResult = await client.query<{
@@ -11183,10 +11210,21 @@ export async function listAttendanceFinalResults(
   }
 
   if (options.studentId) {
-    params.push(options.studentId);
-    clauses.push(
-      `LOWER(TRIM(afr.student_id)) = LOWER(TRIM($${params.length}))`,
-    );
+    let studentId = options.studentId;
+    if (options.studentProfile && options.schoolYearId) {
+      const lookupClient = client ?? await pool.connect();
+      try {
+        const resolution = await resolveStudentAgainstMasterlist(lookupClient, options.schoolYearId, { studentId, ...options.studentProfile });
+        if (resolution.master) studentId = resolution.master.student_number;
+        else if (isPlaceholderStudentNumber(studentId) || (resolution.status !== "no_masterlist" && !/^TC-\d{2}-[A-Z]-\d{5}$/.test(normalizeStudentNumberKey(studentId)))) return [];
+      } finally { if (!client) lookupClient.release(); }
+    }
+    params.push(studentId);
+    if (/^TC-\d{2}-[A-Z]-\d{5}$/.test(normalizeStudentNumberKey(studentId))) {
+      clauses.push(`public.masterlist_student_number_key(afr.student_id) = public.masterlist_student_number_key($${params.length}::text)`);
+    } else {
+      clauses.push(`LOWER(TRIM(afr.student_id)) = LOWER(TRIM($${params.length}::text))`);
+    }
   }
 
   if (options.studentKeys !== undefined) {

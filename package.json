@@ -9,6 +9,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "migrate": "tsx src/database/script/migration.ts",
+    "repair:reported-attendance": "tsx src/database/script/repair-reported-student-attendance.ts",
     "seed": "tsx src/database/script/seed.ts",
     "security:purge-fixtures": "node scripts/purge-private-fixtures.mjs"
   },

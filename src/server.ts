@@ -69,6 +69,7 @@ import {
   index as attendanceIndex,
   manualRecords as attendanceManualRecords,
   manualSave,
+  manualBatchSave,
   previewImport,
   previewCalculationResultRows as previewAttendanceCalculationResults,
   purgeImport as purgeAttendanceImport,
@@ -444,6 +445,7 @@ app.delete(
   "/api/attendance/imports/:importId",
   requireAuth, requireAdmin, deleteAttendanceImport,
 );
+app.post("/api/attendance/manual/batch", requireAuth, requireAdmin, manualBatchSave);
 app.post("/api/attendance/manual", requireAuth, requireAdmin, manualSave);
 app.post(
   "/api/attendance/import/preview",
@@ -537,7 +539,16 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     message: safeStatus === 400 ? "Invalid request." : safeStatus === 404 ? "Resource not found." : "Request failed.",
     requestId,
   };
-  if (error instanceof multer.MulterError) {
+  const databaseMessages: Record<string, string> = {
+    "57014": "The save took too long and was cancelled. Try again.",
+    "55P03": "Another attendance update is still running. Try again in a moment.",
+    "40P01": "The save conflicted with another update. Try again.",
+    "40001": "The save conflicted with another update. Try again.",
+    "23505": "A duplicate record blocked the save.",
+  };
+  if (raw?.code && Object.prototype.hasOwnProperty.call(databaseMessages, raw.code)) {
+    response.message = databaseMessages[raw.code];
+  } else if (error instanceof multer.MulterError) {
     response.message = error.code === "LIMIT_FILE_SIZE"
       ? "Attendance file exceeds the 5 MB upload limit."
       : error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE"

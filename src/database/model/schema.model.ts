@@ -370,7 +370,7 @@ export type AttendanceImportInput = {
   attendanceType?: ManualAttendanceType;
 };
 
-export type MasterlistStatus = "matched_by_id" | "matched_by_name" | "id_name_mismatch" | "unmatched" | "no_masterlist";
+export type MasterlistStatus = "matched_by_id" | "matched_by_partial_id" | "matched_by_name" | "id_name_mismatch" | "unmatched" | "no_masterlist";
 
 export type StudentMasterlistRecord = {
   id: string; school_year_id: string; import_id: string | null; student_number: string; student_number_key: string;

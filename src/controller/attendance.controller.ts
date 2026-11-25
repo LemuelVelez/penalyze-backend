@@ -52,6 +52,7 @@ import {
   saveAttendanceFiles,
   saveAttendanceRows,
   saveManualAttendanceRecord,
+  saveManualAttendanceRecords,
   setStudentEventAttendance,
   setStudentEventAttendances,
   mergeAttendanceEvents,
@@ -749,6 +750,13 @@ export async function manualSave(
   }
 }
 
+export async function manualBatchSave(req: Request, res: Response, next: NextFunction) {
+  try {
+    const result = await saveManualAttendanceRecords(req.body ?? {});
+    res.status(201).json({ message: "Manual attendance saved successfully.", data: result });
+  } catch (error) { next(error); }
+}
+
 export async function updateRecord(
   req: Request,
   res: Response,
@@ -1101,6 +1109,11 @@ export async function finalResults(
       studentId: req.query.studentId
         ? String(req.query.studentId).trim()
         : undefined,
+      studentProfile: req.query.studentName !== undefined || req.query.studentCollege !== undefined || req.query.studentProgram !== undefined ? {
+        name: String(req.query.studentName ?? ""),
+        college: String(req.query.studentCollege ?? ""),
+        program: String(req.query.studentProgram ?? ""),
+      } : undefined,
       college: req.query.college ? String(req.query.college).trim() : undefined,
       includeMissedEvents:
         String(req.query.includeMissedEvents ?? "")
