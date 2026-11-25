@@ -134,7 +134,13 @@ function sendReviewFailure(res: Response, error: unknown, fallback: string, stag
   if (!expected) {
     requestId = randomUUID();
     const code = raw?.code ?? "";
-    if (["40P01", "40001", "55P03", "53300", "57P03"].includes(code)) {
+    if (code === "ATTENDANCE_REVIEW_LOCK_TIMEOUT") {
+      status = 503;
+      message = "Another attendance operation still holds the database lock. This approval was not saved. Finish the ongoing import, masterlist reconciliation, or other attendance update before retrying.";
+    } else if (code === "55P03") {
+      status = 503;
+      message = "A database lock blocked the approval. No changes were saved. Finish the other attendance operation before trying again.";
+    } else if (["40P01", "40001", "53300", "57P03"].includes(code)) {
       status = 503;
       message = "Attendance processing is busy. Refresh the request list and try again shortly.";
     } else if (code === "57014") {
@@ -235,6 +241,7 @@ export async function reviewRequestWithProgress(
         stage = progress.stage;
         writeProgressStreamMessage(res, { type: "progress", progress });
       },
+      () => res.destroyed || res.writableEnded,
     );
 
     if (result.request) {
@@ -312,6 +319,7 @@ export async function reviewRequestGroupWithProgress(
         stage = progress.stage;
         writeProgressStreamMessage(res, { type: "progress", progress });
       },
+      () => res.destroyed || res.writableEnded,
     );
     writeProgressStreamMessage(res, {
       type: "success",

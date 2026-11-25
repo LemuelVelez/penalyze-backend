@@ -2381,7 +2381,11 @@ type AttendanceRecordWithEventRosterScope = AttendanceRecord & {
 
 function masterlistProfileSql(studentId: string, schoolYear: string, field: string, fallback: string) {
   const predicate = `ml.school_year_id = ${schoolYear} AND public.is_masterlist_school_year(ml.school_year_id) AND ml.student_number_key = public.masterlist_student_number_key(${studentId})`;
-  return `(CASE WHEN EXISTS (SELECT 1 FROM student_masterlist ml WHERE ${predicate}) THEN (SELECT ml.${field} FROM student_masterlist ml WHERE ${predicate}) ELSE ${fallback} END)`;
+  // A one-element array distinguishes a missing row (NULL array) from an
+  // existing masterlist row with a NULL field (array containing NULL). This
+  // preserves masterlist authority without repeating the indexed lookup for
+  // every profile field during the school-year rebuild.
+  return `((COALESCE((SELECT ARRAY[ml.${field}] FROM student_masterlist ml WHERE ${predicate}), ARRAY[${fallback}]))[1])`;
 }
 
 export function getCanonicalCollegeKeySql(
@@ -2623,8 +2627,30 @@ export function attendanceEventRosterScopeCteSql(schoolYearParam?: string, event
 `;
 }
 export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = attendanceEventRosterScopeCteSql();
+const ATTENDANCE_ABSENCE_SYNC_LOCK_KEY_SQL = "hashtext('penalyze.attendance_absence_sync')::bigint";
 const ATTENDANCE_ABSENCE_SYNC_LOCK_SQL =
-  "SELECT pg_advisory_xact_lock(hashtext('penalyze.attendance_absence_sync')::bigint)";
+  `SELECT pg_advisory_xact_lock(${ATTENDANCE_ABSENCE_SYNC_LOCK_KEY_SQL})`;
+
+// Use the identical transaction-scoped lock for interactive approval waits.
+// A failed try does not abort the transaction, unlike a lock_timeout.
+export async function tryLockAttendanceAbsenceSync(client: PoolClient) {
+  const result = await client.query<{ acquired: boolean }>(
+    `SELECT pg_try_advisory_xact_lock(${ATTENDANCE_ABSENCE_SYNC_LOCK_KEY_SQL}) AS acquired`,
+  );
+  return result.rows[0]?.acquired === true;
+}
+
+export async function listAttendanceAbsenceSyncLockHolders(client: PoolClient) {
+  const result = await client.query<{ pid: number | null; application_name: string | null; state: string | null; xact_start: string | null }>(
+    `SELECT locks.pid, activity.application_name, activity.state, activity.xact_start
+     FROM pg_locks locks
+     LEFT JOIN pg_stat_activity activity ON activity.pid = locks.pid
+     WHERE locks.locktype = 'advisory' AND locks.granted AND locks.objsubid = 1
+       AND locks.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+       AND ((locks.classid::bigint << 32) | locks.objid::bigint) = ${ATTENDANCE_ABSENCE_SYNC_LOCK_KEY_SQL}`,
+  );
+  return result.rows;
+}
 
 function uniqueAttendanceRecords(records: AttendanceRecord[]) {
   const recordsById = new Map<string, AttendanceRecord>();
@@ -9294,6 +9320,7 @@ export async function previewCalculationResults(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
 ) {
   await withTransaction(async (client) => {
+    await lockManualAttendanceTransaction(client);
     await resolveUnattachedAttendanceEventIdsWithClient(
       client,
       cleanText(options.schoolYearId) || null,
@@ -9325,6 +9352,7 @@ export async function previewCalculationResults(
         previewTableError,
       );
       await client.query("BEGIN");
+      await lockManualAttendanceTransaction(client);
     }
 
     const importIds = normalizeImportIds(options.importIds ?? []);
@@ -9373,6 +9401,7 @@ export async function refreshCalculationResults(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
 ) {
   await withTransaction(async (client) => {
+    await lockManualAttendanceTransaction(client);
     await resolveUnattachedAttendanceEventIdsWithClient(
       client,
       cleanText(options.schoolYearId) || null,
@@ -9389,6 +9418,7 @@ export async function refreshCalculationResults(
   }
 
   return withTransaction(async (client) => {
+    await lockManualAttendanceTransaction(client);
     const importIds = normalizeImportIds(options.importIds ?? []);
     const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
     const rows = await refreshCalculationResultsWithClient(client, {
@@ -10503,6 +10533,7 @@ export async function refreshAttendanceFinalResults(
   options: Pick<AttendanceFinalResultsFilter, "schoolYearId" | "importId"> = {},
 ) {
   return withTransaction(async (client) => {
+    await lockManualAttendanceTransaction(client);
     const rows = await refreshAttendanceFinalResultsWithClient(client, options);
     await refreshPenaltyResultsForSchoolYearWithClient(
       client,

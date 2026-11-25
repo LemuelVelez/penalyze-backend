@@ -15,7 +15,8 @@ import {
   getEventYearLevelExemptionFilterSql,
   normalizeCollegeKey,
   normalizeYearLevelKey,
-  lockAttendanceAbsenceSync,
+  tryLockAttendanceAbsenceSync,
+  listAttendanceAbsenceSyncLockHolders,
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
   syncAbsencesForStudents,
 } from "./attendance.service";
@@ -248,21 +249,63 @@ function normalizeRequestEvents(value: unknown) {
   });
 }
 
-// Reviews can rebuild a whole term's derived results. Keep the longer limits
-// local to approval transactions, and acquire the same lock as imports and
-// exemptions before touching request/student rows (consistent lock order).
+// Keep approval writes atomic with imports, reconciliation and other reviews.
+// Poll the same transaction advisory lock without aborting/restarting the
+// transaction every 60 seconds. Report real wait time, not fictional progress.
+const configuredReviewLockWait = Number(process.env.ATTENDANCE_REVIEW_LOCK_WAIT_MS ?? 600000);
+const REVIEW_LOCK_WAIT_MS = Number.isFinite(configuredReviewLockWait)
+  ? Math.min(1800000, Math.max(1000, Math.floor(configuredReviewLockWait)))
+  : 600000;
+const REVIEW_LOCK_POLL_MS = 1000;
+const REVIEW_LOCK_PROGRESS_MS = 5000;
+
 async function prepareAttendanceReviewTransaction(
   client: PoolClient,
   status: AttendanceRequestStatus,
   emit: AttendanceRequestReviewProgressCallback,
+  isDisconnected?: () => boolean,
 ) {
   if (status !== "approved") return;
-  const timeoutMs = 180000;
-  const lockTimeoutMs = 60000;
-  await client.query("SELECT set_config('statement_timeout', $1, true)", [`${timeoutMs}ms`]);
-  await client.query("SELECT set_config('lock_timeout', $1, true)", [`${lockTimeoutMs}ms`]);
-  emit({ stage: "validating", percent: 5, message: "Waiting for attendance recalculation access." });
-  await lockAttendanceAbsenceSync(client);
+  await client.query("SELECT set_config('statement_timeout','180000ms',true)");
+  await client.query("SELECT set_config('lock_timeout','60000ms',true)");
+  await client.query("SELECT set_config('application_name','penalyze: attendance request review',true)");
+  const started = Date.now();
+  let nextProgress = started;
+  while (true) {
+    if (isDisconnected?.()) {
+      throw createHttpError("Approval was disconnected before it started. No changes were saved.", 409);
+    }
+    const now = Date.now();
+    if (now >= nextProgress) {
+      const elapsed = Math.floor((now - started) / 1000);
+      emit({ stage: "validating", percent: 5, message: elapsed
+        ? `Another attendance update is running. Waiting for database access (${elapsed}s elapsed). Approval will continue automatically.`
+        : "Waiting for attendance recalculation access." });
+      nextProgress = now + REVIEW_LOCK_PROGRESS_MS;
+    }
+    if (await tryLockAttendanceAbsenceSync(client)) {
+      if (isDisconnected?.()) {
+        throw createHttpError("Approval was disconnected before it started. No changes were saved.", 409);
+      }
+      emit({ stage: "validating", percent: 7, message: "Attendance database lock acquired. Checking selected requests." });
+      return;
+    }
+    const remaining = REVIEW_LOCK_WAIT_MS - (Date.now() - started);
+    if (remaining <= 0) {
+      // A distinct application code prevents withTransaction from repeating the
+      // entire wait via its automatic PostgreSQL lock-timeout retry policy.
+      // Diagnostic metadata stays in server logs, not in the public response.
+      // If the owner disappears between the failed try and this query, the
+      // empty list simply means the lock was released at the deadline.
+      const holders = await listAttendanceAbsenceSyncLockHolders(client).catch(() => []);
+      throw Object.assign(new Error("Attendance review lock wait expired"), {
+        code: "ATTENDANCE_REVIEW_LOCK_TIMEOUT",
+        waitedMs: Date.now() - started,
+        holders,
+      });
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(REVIEW_LOCK_POLL_MS, remaining)));
+  }
 }
 
 async function getRequestableEventIds(
@@ -1410,6 +1453,7 @@ async function applyApprovedDetailsCorrection(
   client: PoolClient,
   request: AttendanceRequestRecord,
   onProgress?: AttendanceRequestReviewProgressCallback,
+  deferredSchoolYearIds?: Set<string>,
 ) {
   const studentId = cleanText(request.student_id);
   const requestedName = cleanText(request.name);
@@ -1533,6 +1577,11 @@ async function applyApprovedDetailsCorrection(
     WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
       AND status = 'pending' AND request_type = 'event_review'
   `, [studentId, requestedCollege, requestedYearLevel]);
+
+  if (deferredSchoolYearIds) {
+    for (const schoolYearId of schoolYearIds) deferredSchoolYearIds.add(schoolYearId);
+    return updatedRowCount;
+  }
 
   const scopeTotal = schoolYearIds.length;
   const scopeSpan = scopeTotal ? 72 / scopeTotal : 0;
@@ -1713,6 +1762,7 @@ export async function reviewAttendanceRequest(
   reviewerIdValue: unknown,
   input: AttendanceRequestReviewInput,
   onProgress?: AttendanceRequestReviewProgressCallback,
+  isDisconnected?: () => boolean,
 ) {
   const requestId = cleanText(requestIdValue);
   const reviewerId = cleanText(reviewerIdValue);
@@ -1751,7 +1801,7 @@ export async function reviewAttendanceRequest(
       throw createHttpError("Authenticated reviewer account was not found.", 401);
     }
 
-    await prepareAttendanceReviewTransaction(client, status, emit);
+    await prepareAttendanceReviewTransaction(client, status, emit, isDisconnected);
     const requestResult = await client.query<AttendanceRequestRecord>(
       `SELECT * FROM attendance_requests WHERE id = $1 FOR UPDATE`,
       [requestId],
@@ -2005,6 +2055,7 @@ export async function reviewAttendanceRequestGroup(
   reviewerIdValue: unknown,
   input: AttendanceRequestGroupReviewInput,
   onProgress?: AttendanceRequestReviewProgressCallback,
+  isDisconnected?: () => boolean,
 ): Promise<AttendanceRequestGroupReviewResult> {
   const { reviewerId, studentId, requestIds, status, reviewNote } =
     normalizeGroupReviewInput(reviewerIdValue, input);
@@ -2030,7 +2081,7 @@ export async function reviewAttendanceRequestGroup(
     if (!reviewerResult.rows[0]) {
       throw createHttpError("Authenticated reviewer account was not found.", 401);
     }
-    await prepareAttendanceReviewTransaction(client, status, emit);
+    await prepareAttendanceReviewTransaction(client, status, emit, isDisconnected);
     const requestResult = await client.query<AttendanceRequestRecord>(
       `SELECT * FROM attendance_requests WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
       [requestIds],
@@ -2068,6 +2119,8 @@ export async function reviewAttendanceRequestGroup(
       );
       rejectedCount = total;
     } else {
+      const deferredDetailYears = events.length === 0 && zeroRequests.length === 0
+        ? approvedEventSchoolYearIds : undefined;
       for (let index = 0; index < details.length; index += 1) {
         const request = details[index];
         const completed = index + 1;
@@ -2088,6 +2141,7 @@ export async function reviewAttendanceRequestGroup(
             completed,
             total,
           }),
+          deferredDetailYears,
         );
         const exemptions = await applyExemptionsToPendingAttendanceRequests(client, {
           schoolYearId: request.school_year_id,
