@@ -257,14 +257,8 @@ async function prepareAttendanceReviewTransaction(
   emit: AttendanceRequestReviewProgressCallback,
 ) {
   if (status !== "approved") return;
-  const configuredTimeout = Number(process.env.ATTENDANCE_REVIEW_TIMEOUT_MS ?? 180000);
-  const timeoutMs = Number.isFinite(configuredTimeout)
-    ? Math.min(600000, Math.max(60000, Math.round(configuredTimeout)))
-    : 180000;
-  const configuredLockTimeout = Number(process.env.ATTENDANCE_REVIEW_LOCK_TIMEOUT_MS ?? 60000);
-  const lockTimeoutMs = Number.isFinite(configuredLockTimeout)
-    ? Math.min(timeoutMs, Math.max(5000, Math.round(configuredLockTimeout)))
-    : 60000;
+  const timeoutMs = 180000;
+  const lockTimeoutMs = 60000;
   await client.query("SELECT set_config('statement_timeout', $1, true)", [`${timeoutMs}ms`]);
   await client.query("SELECT set_config('lock_timeout', $1, true)", [`${lockTimeoutMs}ms`]);
   emit({ stage: "validating", percent: 5, message: "Waiting for attendance recalculation access." });
