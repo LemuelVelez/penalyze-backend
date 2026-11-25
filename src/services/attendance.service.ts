@@ -2450,8 +2450,12 @@ export function getStudentEventOverrideExclusionSql(
   )`;
 }
 
-const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
-  event_participation AS (
+function attendanceEventParticipationCteSql(scoped = false) {
+  const scope = (alias: string, studentKey: string) => scoped
+    ? `AND ${alias}.school_year_id = $2::uuid AND ${studentKey} = ANY($1::text[])`
+    : "";
+  return `
+  event_participation AS ${scoped ? "MATERIALIZED " : ""}(
     SELECT DISTINCT
       ar.school_year_id,
       COALESCE(ar.event_id, ai.event_id) AS event_id,
@@ -2463,6 +2467,7 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
     LEFT JOIN students participation_student
       ON LOWER(TRIM(participation_student.student_id)) = LOWER(TRIM(ar.student_id))
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
+      ${scope("ar", "LOWER(TRIM(ar.student_id))")}
       AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
       AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
       AND ${getStudentEventOverrideExclusionSql(
@@ -2484,6 +2489,7 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
     LEFT JOIN students participation_manual_student
       ON LOWER(TRIM(participation_manual_student.student_id)) = LOWER(TRIM(mar.student_id))
     WHERE mar.event_id IS NOT NULL
+      ${scope("mar", "LOWER(TRIM(mar.student_id))")}
       AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
       AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
@@ -2504,10 +2510,16 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = `
       correction.student_key AS normalized_student_id
     FROM attendance_student_event_overrides correction
     WHERE correction.attended = TRUE
+      ${scope("correction", "correction.student_key")}
   )
-`
-export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
-  event_roster_scope AS (
+`;
+}
+const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = attendanceEventParticipationCteSql();
+
+function attendanceEventRosterScopeCteSql(schoolYearParam?: string) {
+  const scope = (alias: string) => schoolYearParam ? `AND ${alias}.school_year_id = ${schoolYearParam}::uuid` : "";
+  return `
+  event_roster_scope AS ${schoolYearParam ? "MATERIALIZED " : ""}(
     SELECT DISTINCT
       ar.school_year_id,
       COALESCE(ar.event_id, ai.event_id) AS event_id,
@@ -2517,6 +2529,7 @@ export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
       ON ai.id = ar.import_id
      AND ai.deleted_at IS NULL
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
+      ${scope("ar")}
       AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
       AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
       AND ${getEventStudentExemptionFilterSql(
@@ -2533,6 +2546,7 @@ export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
       ${MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL} AS college_key
     FROM manual_attendance_records mar
     WHERE mar.event_id IS NOT NULL
+      ${scope("mar")}
       AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
       AND ${MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
@@ -2543,6 +2557,8 @@ export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = `
       )}
   )
 `;
+}
+export const ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL = attendanceEventRosterScopeCteSql();
 const ATTENDANCE_ABSENCE_SYNC_LOCK_SQL =
   "SELECT pg_advisory_xact_lock(hashtext('penalyze.attendance_absence_sync')::bigint)";
 
@@ -2770,9 +2786,25 @@ async function syncZeroAttendanceFineRecordsForStudents(
   schoolYearId: string | null,
   scopeFines = false,
 ) {
+  if (scopeFines && schoolYearId) {
+    const candidates = await client.query<{ present: boolean }>(
+      `SELECT EXISTS (
+        SELECT 1 FROM attendance_records ar
+        WHERE ar.deleted_at IS NULL AND ar.event_id IS NULL
+          AND ar.school_year_id = $2::uuid
+          AND LOWER(TRIM(ar.student_id)) = ANY($1::text[])
+          AND LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($3::text)
+      ) AS present`,
+      [studentIds, schoolYearId, ZERO_ATTENDANCE_REMARK],
+    );
+    if (!candidates.rows[0]?.present) return { records: [], fines: [] };
+  }
+  const rosterCte = scopeFines && schoolYearId
+    ? attendanceEventRosterScopeCteSql("$2")
+    : ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL;
   const result = await client.query<AttendanceRecord>(
     `
-      WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
+      WITH ${rosterCte},
       target_records AS (
         SELECT
           ar.id,
@@ -2846,11 +2878,18 @@ export async function syncAbsencesForStudents(
     scopeFines,
   );
 
+  const scoped = scopeFines && schoolYearId !== null;
+  const rosterCte = scoped
+    ? attendanceEventRosterScopeCteSql("$2")
+    : ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL;
+  const participationCte = scoped
+    ? attendanceEventParticipationCteSql(true)
+    : ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL;
   const updatedResult = await client.query<AttendanceRecordWithEventRosterScope>(
     `
-      WITH ${ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL},
-      ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL},
-      student_scope AS (
+      WITH ${participationCte},
+      ${rosterCte},
+      student_scope AS ${scoped ? "MATERIALIZED " : ""}(
         SELECT DISTINCT
           LOWER(TRIM(ar.student_id)) AS student_key,
           ar.school_year_id,
@@ -2860,9 +2899,9 @@ export async function syncAbsencesForStudents(
         WHERE ar.deleted_at IS NULL
           AND ar.event_id IS NOT NULL
           AND LOWER(TRIM(ar.student_id)) = ANY($1::TEXT[])
-          AND ($2::uuid IS NULL OR ar.school_year_id = $2::uuid)
+          AND ${scoped ? "ar.school_year_id = $2::uuid" : "($2::uuid IS NULL OR ar.school_year_id = $2::uuid)"}
       ),
-      student_absences AS (
+      student_absences AS ${scoped ? "MATERIALIZED " : ""}(
         SELECT
           ss.student_key,
           ss.college_key,
@@ -2876,7 +2915,7 @@ export async function syncAbsencesForStudents(
         FROM student_scope ss
         LEFT JOIN event_roster_scope roster
           ON roster.college_key = ss.college_key
-         AND roster.school_year_id IS NOT DISTINCT FROM ss.school_year_id
+         AND roster.school_year_id ${scoped ? "=" : "IS NOT DISTINCT FROM"} ss.school_year_id
          AND ${getEventYearLevelExemptionFilterSql(
            "roster.event_id",
            "ss.year_level_key",
@@ -2885,7 +2924,7 @@ export async function syncAbsencesForStudents(
         LEFT JOIN event_participation attended
           ON attended.normalized_student_id = ss.student_key
           AND attended.event_id = roster.event_id
-          AND attended.school_year_id IS NOT DISTINCT FROM ss.school_year_id
+          AND attended.school_year_id ${scoped ? "=" : "IS NOT DISTINCT FROM"} ss.school_year_id
         GROUP BY ss.student_key, ss.college_key, ss.year_level_key, ss.school_year_id
       ),
       target_records AS (
@@ -2898,9 +2937,10 @@ export async function syncAbsencesForStudents(
         JOIN student_absences sa
           ON LOWER(TRIM(ar.student_id)) = sa.student_key
          AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} = sa.college_key
-         AND ar.school_year_id IS NOT DISTINCT FROM sa.school_year_id
+         AND ar.school_year_id ${scoped ? "=" : "IS NOT DISTINCT FROM"} sa.school_year_id
         WHERE ar.deleted_at IS NULL
           AND ar.event_id IS NOT NULL
+          ${scoped ? "AND ar.school_year_id = $2::uuid AND LOWER(TRIM(ar.student_id)) = ANY($1::text[])" : ""}
         ORDER BY ar.id
         FOR UPDATE OF ar
       )

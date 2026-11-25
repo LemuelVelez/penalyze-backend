@@ -285,6 +285,10 @@ export async function syncMasterlistAbsences(client: PoolClient, schoolYearId: s
   const chunkSize = 250;
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i,i + chunkSize);
+    const chunkIndex = Math.floor(i / chunkSize) + 1;
+    const chunkTotal = Math.ceil(ids.length / chunkSize);
+    emit({ stage: "syncing_absences", percent: 68 + 12 * i / ids.length, message: `Syncing absences: ${i} / ${ids.length} students`, processed: i, total: ids.length, chunkIndex, chunkTotal });
+    await yieldChunk(isCancelled);
     const result = await syncAbsencesForStudents(client, chunk, schoolYearId, true);
     for (const record of result.records) records.set(record.id,record);
     for (const fine of result.fines) fines.set(fine.id,fine);

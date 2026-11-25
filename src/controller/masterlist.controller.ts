@@ -20,6 +20,7 @@ export async function remove(req:Request,res:Response) {
 }
 async function streamMasterlist<T>(req: Request,res: Response,next: NextFunction,work: (onProgress: (p: MasterlistProgress) => void,isCancelled: () => boolean) => Promise<T>) {
   let clientCancelled=false;
+  let lastProgress: MasterlistProgress | undefined;
   let keepAlive: ReturnType<typeof setInterval> | undefined;
   const markClientCancelled=()=>{if(!res.writableEnded) clientCancelled=true;};
   req.on("aborted",markClientCancelled);
@@ -29,7 +30,10 @@ async function streamMasterlist<T>(req: Request,res: Response,next: NextFunction
     prepareProgressStream(res,200);
     keepAlive=setInterval(()=>{if(!res.destroyed && !res.writableEnded) res.write("\n");},15_000);
     keepAlive.unref();
-    const result=await work(progress=>writeProgressStreamMessage(res,{type:"progress",progress}),isCancelled);
+    const result=await work(progress=>{
+      lastProgress=progress;
+      writeProgressStreamMessage(res,{type:"progress",progress});
+    },isCancelled);
     if(!isCancelled()) {
       writeProgressStreamMessage(res,{type:"success",message:"Masterlist reconciled.",data:result});
       res.end();
@@ -37,9 +41,14 @@ async function streamMasterlist<T>(req: Request,res: Response,next: NextFunction
   } catch(error) {
     if(res.headersSent) {
       res.locals.auditOutcome="failed";
-      const exposed=error as {expose?:boolean;statusCode?:number;message?:string};
-      if(!exposed?.expose && exposed?.statusCode!==499) console.error("[masterlist-progress]",error);
-      writeProgressStreamMessage(res,{type:"error",message:(exposed?.expose || exposed?.statusCode===499) && exposed.message ? exposed.message : "Masterlist request failed."});
+      const exposed=error as {expose?:boolean;statusCode?:number;message?:string;code?:string};
+      const stage=lastProgress?.stage.replace(/_/g," ") ?? "starting";
+      const chunk=lastProgress?.chunkIndex !== undefined && lastProgress.chunkTotal !== undefined ? ` (chunk ${lastProgress.chunkIndex} of ${lastProgress.chunkTotal})` : "";
+      const code=typeof exposed?.code === "string" && /^[0-9A-Z]{5}$/.test(exposed.code) ? exposed.code : undefined;
+      if(!exposed?.expose && exposed?.statusCode!==499) console.error("[masterlist-progress]",{stage,chunk,code},error);
+      const reason=code === "57014" ? "Database query timed out." : code === "55P03" ? "Database lock timed out." : code === "40P01" || code === "40001" ? "Database transaction conflicted with another operation." : code === "23505" ? "A duplicate record conflicts with reconciliation." : code ? `Database error (${code}).` : "Masterlist request failed.";
+      const message=(exposed?.expose || exposed?.statusCode===499) && exposed.message ? exposed.message : `${reason} Failed during ${stage}${chunk}. Refresh the masterlist before retrying.`;
+      writeProgressStreamMessage(res,{type:"error",message});
       if(!res.destroyed && !res.writableEnded) res.end();
     } else next(error);
   } finally {
