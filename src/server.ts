@@ -316,10 +316,13 @@ app.delete(
 );
 
 app.post("/api/masterlist/upload", requireAuth, requireAdmin, masterlistUpload.single("file"), masterlist.upload);
+app.post("/api/masterlist/upload/progress", requireAuth, requireAdmin, masterlistUpload.single("file"), masterlist.uploadWithProgress);
 app.get("/api/masterlist", requireAuth, requireAdmin, masterlist.list);
 app.post("/api/masterlist/reconcile", requireAuth, requireAdmin, masterlist.reconcile);
+app.post("/api/masterlist/reconcile/progress", requireAuth, requireAdmin, masterlist.reconcileWithProgress);
 app.delete("/api/masterlist", requireAuth, requireAdmin, masterlist.remove);
 app.get("/api/attendance/final-attendance", requireAuth, requireAdmin, masterlist.finalAttendance);
+app.get("/api/attendance/final-attendance/unmatched", requireAuth, requireAdmin, masterlist.finalAttendanceUnmatched);
 app.get("/api/attendance/final-attendance/export", requireAuth, requireAdmin, masterlist.download);
 app.get("/api/attendance/colleges", requireAuth, attendanceColleges);
 app.get("/api/attendance/event-exemptions", requireAuth, requireAdmin, attendanceEventExemptions);

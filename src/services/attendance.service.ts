@@ -9767,6 +9767,7 @@ type AttendanceFinalResultsFilter = {
   schoolYearId?: string;
   importId?: string;
   studentId?: string;
+  studentKeys?: string[];
   college?: string;
   includeMissedEvents?: boolean;
   includeEventDetails?: boolean;
@@ -11065,6 +11066,59 @@ export async function setStudentEventAttendance(
   return { studentId: result.studentId, ...result.changes[0] };
 }
 
+export async function listFinalAttendanceEventRoster(client: PoolClient, schoolYearId: string) {
+  const result = await client.query<{ college: string | null; event_id: string }>(`
+    WITH final_scopes AS (
+      SELECT DISTINCT afr.college, afr.college_key,
+        ${getResolvedStudentYearLevelKeySql("afr.student_id", "afr.school_year_id")} AS year_level_key
+      FROM attendance_final_results afr
+      WHERE afr.school_year_id=$1 AND afr.import_id IS NULL AND ${getAttendanceFinalResultVisibilitySql("afr")}
+    ), roster AS (
+          SELECT DISTINCT
+            COALESCE(detail_record.event_id, detail_import.event_id) AS event_id,
+            ${getCanonicalCollegeKeySql("detail_record", "detail_student")} AS college_key
+          FROM attendance_records detail_record
+          LEFT JOIN attendance_imports detail_import
+            ON detail_import.id = detail_record.import_id
+           AND detail_import.deleted_at IS NULL
+          LEFT JOIN students detail_student
+            ON LOWER(TRIM(detail_student.student_id)) = LOWER(TRIM(detail_record.student_id))
+          WHERE ${getAttendanceRecordVisibilitySql("detail_record")}
+            AND detail_record.school_year_id = $1
+            AND COALESCE(detail_record.event_id, detail_import.event_id) IS NOT NULL
+            AND ${getEventStudentExemptionFilterSql(
+              "COALESCE(detail_record.event_id, detail_import.event_id)",
+              getResolvedStudentYearLevelKeySql("detail_record.student_id", "detail_record.school_year_id"),
+              getCanonicalCollegeKeySql("detail_record", "detail_student"),
+            )}
+
+          UNION
+
+          SELECT DISTINCT
+            detail_manual.event_id,
+            ${getCanonicalCollegeKeySql("detail_manual", "detail_manual_student")} AS college_key
+          FROM manual_attendance_records detail_manual
+          LEFT JOIN students detail_manual_student
+            ON LOWER(TRIM(detail_manual_student.student_id)) = LOWER(TRIM(detail_manual.student_id))
+          WHERE detail_manual.school_year_id = $1
+            AND detail_manual.event_id IS NOT NULL
+            AND COALESCE(detail_manual.attendance_type, 'manual') <> 'zero_attendance'
+            AND LOWER(TRIM(COALESCE(detail_manual.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+            AND ${getEventStudentExemptionFilterSql(
+              "detail_manual.event_id",
+              getResolvedStudentYearLevelKeySql("detail_manual.student_id", "detail_manual.school_year_id"),
+              getCanonicalCollegeKeySql("detail_manual", "detail_manual_student"),
+            )}
+    )
+    SELECT DISTINCT scope.college, roster.event_id
+    FROM final_scopes scope
+    JOIN roster ON roster.college_key=scope.college_key
+    JOIN attendance_events expected_event ON expected_event.id=roster.event_id
+      AND ${getEventYearLevelExemptionFilterSql("roster.event_id", "scope.year_level_key", "scope.college_key")}
+  `, [schoolYearId]);
+  return result.rows;
+}
+
 export async function listAttendanceFinalResults(
   options: AttendanceFinalResultsFilter = {},
   client?: PoolClient,
@@ -11090,6 +11144,11 @@ export async function listAttendanceFinalResults(
     clauses.push(
       `LOWER(TRIM(afr.student_id)) = LOWER(TRIM($${params.length}))`,
     );
+  }
+
+  if (options.studentKeys !== undefined) {
+    params.push(options.studentKeys);
+    clauses.push(`public.masterlist_student_number_key(afr.student_id) = ANY($${params.length}::text[])`);
   }
 
   if (options.college) {
