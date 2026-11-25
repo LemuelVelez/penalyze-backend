@@ -1,3 +1,4 @@
+import * as masterlist from "./controller/masterlist.controller";
 import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
 import multer from "multer";
@@ -180,7 +181,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   if (allowed) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Access-Control-Expose-Headers", "Retry-After");
+    res.setHeader("Access-Control-Expose-Headers", "Retry-After, Content-Disposition");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-Penalyze-Request");
@@ -313,6 +314,12 @@ app.delete(
   requireAuth, requireAdmin, removeAttendanceRequestEvent,
 );
 
+app.post("/api/masterlist/upload", requireAuth, requireAdmin, attendanceUpload.single("file"), masterlist.upload);
+app.get("/api/masterlist", requireAuth, requireAdmin, masterlist.list);
+app.post("/api/masterlist/reconcile", requireAuth, requireAdmin, masterlist.reconcile);
+app.delete("/api/masterlist", requireAuth, requireAdmin, masterlist.remove);
+app.get("/api/attendance/final-attendance", requireAuth, requireAdmin, masterlist.finalAttendance);
+app.get("/api/attendance/final-attendance/export", requireAuth, requireAdmin, masterlist.download);
 app.get("/api/attendance/colleges", requireAuth, attendanceColleges);
 app.get("/api/attendance/event-exemptions", requireAuth, requireAdmin, attendanceEventExemptions);
 app.get("/api/attendance/event-college-checker", requireAuth, requireAdmin, attendanceEventCollegeChecker);

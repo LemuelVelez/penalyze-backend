@@ -1,3 +1,4 @@
+import { reconcileAttendanceRow, upsertMasterlistStudent, type MasterlistCache } from "./masterlist.service";
 import path from "path";
 import { createHash } from "crypto";
 import { TextDecoder } from "util";
@@ -329,6 +330,7 @@ const HEADER_ALIASES = {
   ],
   studentId: [
     "studentid",
+    "student number",
     "student id",
     "student_id",
     "student no",
@@ -1007,7 +1009,7 @@ function decodeCsvBuffer(buffer: Buffer) {
 // Inspect ZIP central-directory metadata BEFORE passing XLSX bytes to SheetJS.
 // Parser-level row limits are not enough to prevent a tiny compressed ZIP bomb
 // from allocating excessive memory when decompressed.
-function validateXlsxContainer(buffer: Buffer): void {
+export function validateXlsxContainer(buffer: Buffer): void {
   const invalid = () => new Error("Invalid or oversized XLSX workbook archive.");
   const minimumEnd = Math.max(0, buffer.length - 22 - 65535);
   let eocd = -1;
@@ -1668,7 +1670,7 @@ function normalizeAttendanceMetadataIdentity(value: unknown) {
     .trim();
 }
 
-function getSchoolYearMetadataLabels(schoolYear: SchoolYearRecord) {
+export function getSchoolYearMetadataLabels(schoolYear: SchoolYearRecord) {
   const semesterLabel =
     schoolYear.semester === "second_semester"
       ? "Second Semester"
@@ -2315,6 +2317,11 @@ type AttendanceRecordWithEventRosterScope = AttendanceRecord & {
   attendance_school_year_id: string | null;
 };
 
+function masterlistProfileSql(studentId: string, schoolYear: string, field: string, fallback: string) {
+  const predicate = `ml.school_year_id = ${schoolYear} AND ml.student_number_key = UPPER(TRIM(${studentId}))`;
+  return `(CASE WHEN EXISTS (SELECT 1 FROM student_masterlist ml WHERE ${predicate}) THEN (SELECT ml.${field} FROM student_masterlist ml WHERE ${predicate}) ELSE ${fallback} END)`;
+}
+
 export function getCanonicalCollegeKeySql(
   recordAlias: string,
   studentAlias?: string,
@@ -2329,11 +2336,13 @@ export function getCanonicalCollegeKeySql(
         LIMIT 1
       )`;
 
+  const fallbackCollege = `COALESCE(${studentCollegeSql}, NULLIF(TRIM(${recordAlias}.college), ''))`;
+  const resolvedCollege = recordAlias === studentAlias ? fallbackCollege : masterlistProfileSql(`${recordAlias}.student_id`, `${recordAlias}.school_year_id`, "college", fallbackCollege);
   return `NULLIF(
     TRIM(
       REGEXP_REPLACE(
         REGEXP_REPLACE(
-          LOWER(REPLACE(COALESCE(${studentCollegeSql}, NULLIF(TRIM(${recordAlias}.college), '')), '&', ' and ')),
+          LOWER(REPLACE(${resolvedCollege}, '&', ' and ')),
           '[^a-z0-9]+',
           ' ',
           'g'
@@ -2367,7 +2376,7 @@ export function getResolvedStudentYearLevelKeySql(
   const attendanceKey = getYearLevelKeySql('year_scope_ar.year_level');
   const manualKey = getYearLevelKeySql('year_scope_mar.year_level');
   const fallbackKey = getYearLevelKeySql('year_scope_student.year_level');
-  return `COALESCE(
+  const fallback = `COALESCE(
     (
       SELECT year_scope.year_level_key
       FROM (
@@ -2406,6 +2415,7 @@ export function getResolvedStudentYearLevelKeySql(
       LIMIT 1
     )
   )`;
+  return masterlistProfileSql(studentIdExpr, schoolYearIdExpr, "year_level_key", fallback);
 }
 
 export function getAttendanceRecordEventRosterCollegeSql(recordAlias: string) {
@@ -3387,6 +3397,8 @@ export async function previewAttendanceFiles(
   college?: string | (string | undefined)[],
   rowCollegeOverrides?: Record<string, string>[],
   tolerateInvalidFiles = false,
+  requestedSchoolYearId?: string,
+  reconcilePreview = true,
 ): Promise<AttendancePreviewResult[]> {
   const selectedColleges = Array.isArray(college) ? college : files.map(() => college);
   const previews = await Promise.all(files.map(async (file, index) => {
@@ -3407,8 +3419,23 @@ export async function previewAttendanceFiles(
     }
   }));
   const schoolYearIds = await Promise.all(
-    previews.map((preview) => preview.previewError ? Promise.resolve("") : findSchoolYearIdForAttendancePreview(preview)),
+    previews.map((preview) => preview.previewError ? Promise.resolve("") : findSchoolYearIdForAttendancePreview(preview).then(id => id || requestedSchoolYearId || "")),
   );
+
+  if (reconcilePreview) {
+    const client = await pool.connect();
+    try {
+      const cache: MasterlistCache = new Map();
+      for (const [index, preview] of previews.entries()) {
+        if (preview.previewError || !schoolYearIds[index]) continue;
+        const rows: ParsedAttendanceRow[] = [];
+        for (const row of preview.rows) rows.push(await reconcileAttendanceRow(client, schoolYearIds[index], row, cache));
+        preview.rows = rows;
+        preview.rowsValid = preview.rows.filter(row => !row.errors.length).length;
+        preview.rowsInvalid = preview.rows.length - preview.rowsValid;
+      }
+    } finally { client.release(); }
+  }
 
   await Promise.all(
     previews.map(async (preview, index) => {
@@ -3465,8 +3492,7 @@ function prepareAttendanceRowsForSave(input: SaveRowsInput) {
     input.fileType ?? "json",
     input.rows,
   ), selected.label, input.rowCollegeOverrides);
-  assertNoInvalidAttendanceColleges(preview);
-  const validRows = preview.rows.filter((row) => row.errors.length === 0);
+  const validRows = preview.rows.filter((row) => !row.errors.filter(e => !e.includes(": unrecognised college ")).length);
 
   if (!validRows.length) {
     throw createValidationError(
@@ -3506,6 +3532,7 @@ async function saveAttendanceRowsWithClient(
   originalInput: SaveRowsInput,
   suppliedPreview?: AttendancePreviewResult,
 ): Promise<SavedAttendanceImportResult> {
+  await lockAttendanceAbsenceSync(client);
   assertAttendanceImportNotCancelled(originalInput);
   const prepared = suppliedPreview
     ? {
@@ -3519,9 +3546,8 @@ async function saveAttendanceRowsWithClient(
   let preview = scopeAttendancePreviewToCollege(
     prepared.preview, selectedCollege.label, input.rowCollegeOverrides,
   );
-  assertNoInvalidAttendanceColleges(preview);
   preview = applyReviewedRowEvents(preview, input);
-  const validRows = preview.rows.filter((row) => !row.errors.length);
+  let validRows = preview.rows.filter((row) => !row.errors.filter(e => !e.includes(": unrecognised college ")).length);
 
   if (!validRows.length) {
     throw createValidationError(
@@ -3563,6 +3589,14 @@ async function saveAttendanceRowsWithClient(
       input.eventEndAt,
       validRows.find((row) => row.scannedAt)?.scannedAt,
     ]));
+
+  const masterlistCache: MasterlistCache = new Map();
+  const correctedRows: ParsedAttendanceRow[] = [];
+  for (const row of preview.rows) correctedRows.push(await reconcileAttendanceRow(client, resolvedSchoolYearId, row, masterlistCache));
+  preview = { ...preview, rows: correctedRows, rowsValid: correctedRows.filter(row => !row.errors.length).length, rowsInvalid: correctedRows.filter(row => row.errors.length).length };
+  assertNoInvalidAttendanceColleges(preview);
+  validRows = preview.rows.filter(row => !row.errors.length);
+  if (!validRows.length) throw createValidationError("No parseable attendance rows were found in the uploaded attendance file.");
 
   if (!existingImport) {
     const duplicateImport = await findDuplicateAttendanceImport(client, {
@@ -3713,6 +3747,7 @@ async function saveAttendanceRowsWithClient(
     if (!event && row.eventName && !defaultEvent) {
       event = await findOrCreateAttendanceEvent(client, {
         ...input,
+        ...(row.masterlist_status ? { schoolYearId: resolvedSchoolYearId } : {}),
         eventName: row.eventName,
         eventStartAt: row.eventStartAt ?? input.eventStartAt,
         eventEndAt: row.eventEndAt ?? input.eventEndAt,
@@ -3725,7 +3760,8 @@ async function saveAttendanceRowsWithClient(
       );
     }
 
-    const recordCollege = await getEffectiveAttendanceCollege(
+    if (row.masterlist_status && event.school_year_id && event.school_year_id !== resolvedSchoolYearId) throw createValidationError("Masterlist attendance cannot be saved into another school year.", 400);
+    const recordCollege = row.masterlist_status && row.masterlist_status !== "unmatched" && row.masterlist_status !== "no_masterlist" ? row.college ?? "" : await getEffectiveAttendanceCollege(
       client,
       row.studentId,
       row.college,
@@ -3753,7 +3789,8 @@ async function saveAttendanceRowsWithClient(
       continue;
     }
 
-    await upsertStudent(client, row);
+    if (row.masterlist_status && row.masterlist_status !== "no_masterlist") await upsertMasterlistStudent(client, event.school_year_id ?? resolvedSchoolYearId, row);
+    else await upsertStudent(client, row);
     const record = await insertAttendanceRecord(
       client,
       importId,
@@ -4102,6 +4139,7 @@ export async function saveAttendanceFiles(
     files,
     selectedColleges,
     options.map((option) => option.rowCollegeOverrides ?? {}),
+    false, undefined, false,
   );
   await emitAttendanceImportProgress(onProgress, {
     stage: "validating", percent: 12,
@@ -4109,7 +4147,6 @@ export async function saveAttendanceFiles(
     processedRows: previews.reduce((sum, preview) => sum + preview.rowsTotal, 0),
     totalRows: previews.reduce((sum, preview) => sum + preview.rowsTotal, 0),
   });
-  previews.forEach(assertNoInvalidAttendanceColleges);
   previews.forEach((preview, index) => {
     applyReviewedRowEvents(preview, options[index]);
   });
@@ -4672,7 +4709,7 @@ async function upsertPenaltyResultForManualRecord(
 
 export async function saveManualAttendanceRecord(input: RawImportRow) {
   const validatedRow = validateAttendanceInput(input);
-  const row = {
+  let row = {
     ...validatedRow,
     studentId: cleanText(validatedRow.studentId),
   };
@@ -4682,7 +4719,12 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
   }
 
   return withTransaction(async (client) => {
-    const recordCollege = await getEffectiveAttendanceCollege(
+    await lockAttendanceAbsenceSync(client);
+    const requestedEventId = cleanText(input.eventId ?? input.event_id);
+    const requestedEvent = attendanceType === "manual" && requestedEventId ? await getAttendanceEventById(client, requestedEventId) : null;
+    const masterlistYearId = requestedEvent?.school_year_id ?? await resolveSchoolYearId(client, (input.schoolYearId ?? input.school_year_id), [row.scannedAt]);
+    row = await reconcileAttendanceRow(client, masterlistYearId, row, new Map());
+    const recordCollege = row.masterlist_status && row.masterlist_status !== "unmatched" && row.masterlist_status !== "no_masterlist" ? row.college ?? "" : await getEffectiveAttendanceCollege(
       client,
       row.studentId,
       row.college,
@@ -4707,7 +4749,8 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
         ? 0
         : Math.max(0, Number(row.noOfAbsences ?? 0));
 
-    await upsertStudent(client, {
+    if (row.masterlist_status && row.masterlist_status !== "no_masterlist") await upsertMasterlistStudent(client, schoolYearId, { ...row, noOfAbsences });
+    else await upsertStudent(client, {
       ...row,
       noOfAbsences,
     });
@@ -4950,7 +4993,7 @@ async function updateManualAttendanceRecord(
   input: RawImportRow,
 ) {
   const validatedRow = validateAttendanceInput(input);
-  const row = {
+  let row = {
     ...validatedRow,
     studentId: cleanText(validatedRow.studentId),
   };
@@ -4971,7 +5014,12 @@ async function updateManualAttendanceRecord(
   }
 
   const attendanceType = existingRecord.attendance_type;
-  const recordCollege = await getEffectiveAttendanceCollege(
+  await lockAttendanceAbsenceSync(client);
+  const requestedEventId = cleanText(input.eventId ?? input.event_id);
+  const requestedEvent = attendanceType === "manual" && requestedEventId ? await getAttendanceEventById(client, requestedEventId) : null;
+  const masterlistYearId = requestedEvent?.school_year_id ?? await resolveSchoolYearId(client, (input.schoolYearId ?? input.school_year_id ?? existingRecord.school_year_id), [row.scannedAt]);
+  row = await reconcileAttendanceRow(client, masterlistYearId, row, new Map());
+  const recordCollege = row.masterlist_status && row.masterlist_status !== "unmatched" && row.masterlist_status !== "no_masterlist" ? row.college ?? "" : await getEffectiveAttendanceCollege(
     client,
     row.studentId || existingRecord.student_id,
     cleanText(row.college) || existingRecord.college,
@@ -5000,7 +5048,8 @@ async function updateManualAttendanceRecord(
           Number(row.noOfAbsences ?? existingRecord.no_of_absences ?? 0),
         );
 
-  await upsertStudent(client, {
+  if (row.masterlist_status && row.masterlist_status !== "no_masterlist") await upsertMasterlistStudent(client, schoolYearId, { ...row, noOfAbsences });
+  else await upsertStudent(client, {
     ...row,
     noOfAbsences,
   });
@@ -7387,6 +7436,8 @@ function getStudentEventScopeCteSql(keysCte: "selected_student_keys" | "student_
       keys.school_year_id,
       keys.normalized_student_id,
       CASE
+        WHEN EXISTS (SELECT 1 FROM student_masterlist ml WHERE ml.school_year_id=keys.school_year_id AND ml.student_number_key=UPPER(keys.normalized_student_id))
+          THEN ${getCanonicalCollegeKeySql("scoped_master", "scoped_master")}
         WHEN ${getCanonicalCollegeKeySql("s", "s")} IS NOT NULL
           THEN ${getCanonicalCollegeKeySql("s", "s")}
         WHEN COALESCE(colleges.college_key_count, 0) = 1
@@ -7395,6 +7446,7 @@ function getStudentEventScopeCteSql(keysCte: "selected_student_keys" | "student_
       END AS college_key,
       resolved_year_level.year_level_key
     FROM ${keysCte} keys
+    LEFT JOIN student_masterlist scoped_master ON scoped_master.school_year_id=keys.school_year_id AND scoped_master.student_number_key=UPPER(keys.normalized_student_id)
     LEFT JOIN canonical_students s
       ON LOWER(TRIM(s.student_id)) = keys.normalized_student_id
     LEFT JOIN calculation_resolved_year_levels resolved_year_level
@@ -7454,10 +7506,7 @@ function getYearLevelResolutionCtesSql() {
         SELECT
           keys.school_year_id,
           keys.normalized_student_id,
-          COALESCE(
-            latest.year_level_key,
-            ${getYearLevelKeySql("student.year_level")}
-          ) AS year_level_key
+          ${masterlistProfileSql("keys.normalized_student_id", "keys.school_year_id", "year_level_key", `COALESCE(latest.year_level_key, ${getYearLevelKeySql("student.year_level")})`)} AS year_level_key
         FROM (
           SELECT DISTINCT school_year_id, normalized_student_id
           FROM calculation_year_level_candidates
@@ -7765,10 +7814,10 @@ async function refreshCalculationResultsWithClient(
           ar.import_id,
           LOWER(TRIM(ar.student_id)) AS normalized_student_id,
           ar.student_id,
-          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(ar.name), ''), ar.student_id) AS name,
-          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(ar.year_level), '')) AS year_level,
-          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), '')) AS college,
-          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), '')) AS program,
+          ${masterlistProfileSql("ar.student_id", "ar.school_year_id", "full_name", "COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(ar.name), ''), ar.student_id)")} AS name,
+          ${masterlistProfileSql("ar.student_id", "ar.school_year_id", "year_level", "COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(ar.year_level), ''))")} AS year_level,
+          ${masterlistProfileSql("ar.student_id", "ar.school_year_id", "college", "COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), ''))")} AS college,
+          ${masterlistProfileSql("ar.student_id", "ar.school_year_id", "program", "COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), ''))")} AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
           ${getCanonicalCollegeKeySql("ar", "s")} AS college_key,
           CASE
@@ -7799,10 +7848,10 @@ async function refreshCalculationResultsWithClient(
           mar.school_year_id,
           LOWER(TRIM(mar.student_id)) AS normalized_student_id,
           mar.student_id,
-          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id) AS name,
-          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(mar.year_level), '')) AS year_level,
-          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')) AS college,
-          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), '')) AS program,
+          ${masterlistProfileSql("mar.student_id", "mar.school_year_id", "full_name", "COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id)")} AS name,
+          ${masterlistProfileSql("mar.student_id", "mar.school_year_id", "year_level", "COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(mar.year_level), ''))")} AS year_level,
+          ${masterlistProfileSql("mar.student_id", "mar.school_year_id", "college", "COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), ''))")} AS college,
+          ${masterlistProfileSql("mar.student_id", "mar.school_year_id", "program", "COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), ''))")} AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(mar.institution), '')) AS institution,
           ${getCanonicalCollegeKeySql("mar", "s")} AS college_key,
           CASE
@@ -9724,10 +9773,10 @@ async function refreshAttendanceFinalResultsWithClient(
           ar.school_year_id,
           LOWER(TRIM(ar.student_id)) AS normalized_student_id,
           ar.student_id,
-          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(ar.name), ''), ar.student_id) AS name,
-          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(ar.year_level), '')) AS year_level,
-          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), '')) AS college,
-          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), '')) AS program,
+          ${masterlistProfileSql("ar.student_id", "ar.school_year_id", "full_name", "COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(ar.name), ''), ar.student_id)")} AS name,
+          ${masterlistProfileSql("ar.student_id", "ar.school_year_id", "year_level", "COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(ar.year_level), ''))")} AS year_level,
+          ${masterlistProfileSql("ar.student_id", "ar.school_year_id", "college", "COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(ar.college), ''))")} AS college,
+          ${masterlistProfileSql("ar.student_id", "ar.school_year_id", "program", "COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(ar.program), ''))")} AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(ar.institution), '')) AS institution,
           ${getCanonicalCollegeKeySql("ar", "s")} AS college_key,
           CASE
@@ -9755,10 +9804,10 @@ async function refreshAttendanceFinalResultsWithClient(
           mar.school_year_id,
           LOWER(TRIM(mar.student_id)) AS normalized_student_id,
           mar.student_id,
-          COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id) AS name,
-          COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(mar.year_level), '')) AS year_level,
-          COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), '')) AS college,
-          COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), '')) AS program,
+          ${masterlistProfileSql("mar.student_id", "mar.school_year_id", "full_name", "COALESCE(NULLIF(TRIM(s.name), ''), NULLIF(TRIM(mar.name), ''), mar.student_id)")} AS name,
+          ${masterlistProfileSql("mar.student_id", "mar.school_year_id", "year_level", "COALESCE(NULLIF(TRIM(s.year_level), ''), NULLIF(TRIM(mar.year_level), ''))")} AS year_level,
+          ${masterlistProfileSql("mar.student_id", "mar.school_year_id", "college", "COALESCE(NULLIF(TRIM(s.college), ''), NULLIF(TRIM(mar.college), ''))")} AS college,
+          ${masterlistProfileSql("mar.student_id", "mar.school_year_id", "program", "COALESCE(NULLIF(TRIM(s.program), ''), NULLIF(TRIM(mar.program), ''))")} AS program,
           COALESCE(NULLIF(TRIM(s.institution), ''), NULLIF(TRIM(mar.institution), '')) AS institution,
           ${getCanonicalCollegeKeySql("mar", "s")} AS college_key,
           CASE
@@ -10975,6 +11024,7 @@ export async function setStudentEventAttendance(
 
 export async function listAttendanceFinalResults(
   options: AttendanceFinalResultsFilter = {},
+  client?: PoolClient,
 ) {
   const clauses: string[] = [getAttendanceFinalResultVisibilitySql("afr")];
   const params: unknown[] = [];
@@ -11187,7 +11237,8 @@ export async function listAttendanceFinalResults(
       ) details ON TRUE`
     : "";
 
-  const result = await query<AttendanceFinalResultRecord>(
+  const runQuery = client ? client.query.bind(client) : query;
+  const result = await runQuery<AttendanceFinalResultRecord>(
     `
       ${rosterCteSql}
       SELECT

@@ -2,6 +2,8 @@ export const TABLES = {
   users: "users",
   authLoginThrottles: "auth_login_throttles",
   students: "students",
+  studentMasterlist: "student_masterlist",
+  studentMasterlistImports: "student_masterlist_imports",
   schoolYears: "school_years",
   attendanceEvents: "attendance_events",
   attendanceEventCollegeVerifications: "attendance_event_college_verifications",
@@ -368,7 +370,22 @@ export type AttendanceImportInput = {
   attendanceType?: ManualAttendanceType;
 };
 
+export type MasterlistStatus = "matched_by_id" | "matched_by_name" | "id_name_mismatch" | "unmatched" | "no_masterlist";
+
+export type StudentMasterlistRecord = {
+  id: string; school_year_id: string; import_id: string | null; student_number: string; student_number_key: string;
+  last_name: string; given_name: string; middle_initial: string | null; full_name: string; name_key: string;
+  program: string | null; year_level: string | null; year_level_key: string | null; college: string | null;
+  created_at: Date; updated_at: Date;
+};
+export type StudentMasterlistImportRecord = {
+  id: string; school_year_id: string; file_name: string; rows_total: number; rows_valid: number; rows_invalid: number;
+  summary: Record<string, unknown> | null; created_by: string | null; created_at: Date;
+};
+
 export type ParsedAttendanceRow = AttendanceImportInput & {
+  masterlist_status?: MasterlistStatus;
+  masterlist_original?: { studentId: string; name: string };
   // Derived by the server from reviewed row assignments; never trusted from the source workbook.
   eventForceCreate?: boolean;
   rowNumber: number;

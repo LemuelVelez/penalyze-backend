@@ -830,7 +830,7 @@ export async function previewImport(
       return;
     }
 
-    const previews = await previewAttendanceFiles(files, getEventPayload(req).college, undefined, true);
+    const previews = await previewAttendanceFiles(files, getEventPayload(req).college, undefined, true, getEventPayload(req).schoolYearId);
     res.json({ message: "Attendance preview completed.", data: previews });
   } catch (error) {
     next(error);
