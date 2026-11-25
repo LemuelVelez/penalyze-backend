@@ -10920,9 +10920,39 @@ export async function updateAttendanceFinalResultProfile(
 
     emit(45, "Updating selected profile fields and merging student IDs if needed.");
     if (normalizedIdChanged) {
+      const collidingRecords = await client.query<{ keep_id: string; drop_id: string }>(
+        `
+          SELECT
+            CASE WHEN d.deleted_at IS NOT NULL AND s.deleted_at IS NULL THEN s.id ELSE d.id END AS keep_id,
+            CASE WHEN d.deleted_at IS NOT NULL AND s.deleted_at IS NULL THEN d.id ELSE s.id END AS drop_id
+          FROM attendance_records s
+          JOIN attendance_records d
+            ON d.event_id = s.event_id AND d.id <> s.id
+           AND LOWER(TRIM(d.student_id)) = LOWER(TRIM($1))
+          WHERE LOWER(TRIM(s.student_id)) = LOWER(TRIM($2)) AND s.event_id IS NOT NULL
+        `,
+        [targetStudentId, originalStudentId],
+      );
+      if (collidingRecords.rows.length) {
+        const keepIds = collidingRecords.rows.map((row) => row.keep_id);
+        const dropIds = collidingRecords.rows.map((row) => row.drop_id);
+        await client.query(
+          `
+            UPDATE fines SET attendance_record_id = p.keep_id, updated_at = NOW()
+            FROM unnest($1::uuid[], $2::uuid[]) AS p(keep_id, drop_id)
+            WHERE fines.attendance_record_id = p.drop_id
+          `,
+          [keepIds, dropIds],
+        );
+        await client.query(
+          `DELETE FROM attendance_records WHERE id = ANY($1::uuid[])`,
+          [dropIds],
+        );
+      }
+
       // These are the original evidence and transaction rows. Preserve every
-      // source row and its primary key rather than collapsing event attendance,
-      // paid fine records, or separately submitted correction requests.
+      // non-conflicting source row and its primary key, paid fine record, and
+      // separately submitted correction request.
       for (const table of [
         "attendance_records",
         "manual_attendance_records",
@@ -11089,10 +11119,20 @@ export async function updateAttendanceFinalResultProfile(
       `,
       [id, finalResult.school_year_id, targetStudentId],
     );
-    const refreshedResult = refreshedResultQuery.rows[0];
+    let refreshedResult = refreshedResultQuery.rows[0];
 
     if (!refreshedResult) {
-      throw new Error("Updated final attendance result could not be reloaded.");
+      const fallbackResultQuery = await client.query<AttendanceFinalResultRecord>(
+        `
+          SELECT *
+          FROM attendance_final_results
+          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+          ORDER BY (import_id IS NULL) DESC, updated_at DESC
+          LIMIT 1
+        `,
+        [targetStudentId],
+      );
+      refreshedResult = fallbackResultQuery.rows[0] ?? finalResult;
     }
 
     emit(95, "Committing the student profile and recalculated results.");

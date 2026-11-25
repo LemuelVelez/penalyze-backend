@@ -14,6 +14,7 @@ import {
   reviewAttendanceRequestGroup,
   reviewAttendanceRequest,
 } from "../services/attendance-requests.service";
+import type { AttendanceRequestReviewProgress } from "../services/attendance-requests.service";
 import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
 
 const RECEIPT_AUDIENCE = "penalyze-attendance-request-receipt";
@@ -151,6 +152,9 @@ function sendReviewFailure(res: Response, error: unknown, fallback: string, stag
     message += ` Reference: ${requestId}.`;
   }
   res.locals.auditOutcome = "failed";
+  if (res.destroyed) {
+    console.error("Attendance review failed after the client connection closed:", error);
+  }
   if (res.destroyed || res.writableEnded) return;
   if (res.headersSent) {
     writeProgressStreamMessage(res, { type: "error", message });
@@ -162,11 +166,22 @@ function sendReviewFailure(res: Response, error: unknown, fallback: string, stag
 }
 
 // A database statement or advisory lock can run without progress events for
-// longer than a proxy's idle timeout. Blank NDJSON lines are ignored by clients.
-function startReviewHeartbeat(res: Response) {
+// longer than a proxy's idle timeout. Send the current stage as NDJSON.
+function startReviewHeartbeat(
+  res: Response,
+  getLastProgress: () => AttendanceRequestReviewProgress,
+  getStageStarted: () => number,
+) {
   const timer = setInterval(() => {
-    if (!res.destroyed && !res.writableEnded && !res.writableNeedDrain) res.write("\n");
-  }, 10000);
+    if (!res.destroyed && !res.writableEnded && !res.writableNeedDrain) {
+      const lastProgress = getLastProgress();
+      const seconds = Math.floor((Date.now() - getStageStarted()) / 1000);
+      writeProgressStreamMessage(res, {
+        type: "progress",
+        progress: { ...lastProgress, message: `${lastProgress.message} (${seconds}s in this stage)` },
+      });
+    }
+  }, 5000);
   timer.unref();
   const stop = () => {
     clearInterval(timer);
@@ -223,6 +238,8 @@ export async function reviewRequestWithProgress(
 ) {
   let stopHeartbeat: (() => void) | undefined;
   let stage = "validating";
+  let lastProgress: AttendanceRequestReviewProgress = { stage: "validating", percent: 0, message: "Preparing attendance request review." };
+  let stageStarted = Date.now();
   try {
     const preflight = await preflightAttendanceRequestReview(
       req.params.id,
@@ -232,13 +249,16 @@ export async function reviewRequestWithProgress(
     res.locals.auditAttendanceRequestType = preflight.request_type;
 
     prepareProgressStream(res, 200);
-    stopHeartbeat = startReviewHeartbeat(res);
+    stageStarted = Date.now();
+    stopHeartbeat = startReviewHeartbeat(res, () => lastProgress, () => stageStarted);
     const result = await reviewAttendanceRequest(
       req.params.id,
       req.user?.sub,
       req.body ?? {},
       (progress) => {
+        if (stage !== progress.stage) stageStarted = Date.now();
         stage = progress.stage;
+        lastProgress = progress;
         writeProgressStreamMessage(res, { type: "progress", progress });
       },
       () => res.destroyed || res.writableEnded,
@@ -300,6 +320,8 @@ export async function reviewRequestGroupWithProgress(
 ) {
   let stopHeartbeat: (() => void) | undefined;
   let stage = "validating";
+  let lastProgress: AttendanceRequestReviewProgress = { stage: "validating", percent: 0, message: "Preparing attendance request review." };
+  let stageStarted = Date.now();
   try {
     const preflight = await preflightAttendanceRequestGroupReview(
       req.user?.sub,
@@ -311,20 +333,34 @@ export async function reviewRequestGroupWithProgress(
       (request) => request.request_type === "zero_attendance",
     ) ? "zero_attendance" : "event_review";
     prepareProgressStream(res, 200);
-    stopHeartbeat = startReviewHeartbeat(res);
+    stageStarted = Date.now();
+    stopHeartbeat = startReviewHeartbeat(res, () => lastProgress, () => stageStarted);
     const result = await reviewAttendanceRequestGroup(
       req.user?.sub,
       req.body ?? {},
       (progress) => {
+        if (stage !== progress.stage) stageStarted = Date.now();
         stage = progress.stage;
+        lastProgress = progress;
         writeProgressStreamMessage(res, { type: "progress", progress });
       },
       () => res.destroyed || res.writableEnded,
     );
+    if (res.destroyed || res.writableEnded) {
+      console.warn("Group review committed after the client connection closed", { requestIds: req.body?.requestIds });
+    }
     writeProgressStreamMessage(res, {
       type: "success",
       message: getGroupReviewSuccessMessage(result, String(req.body.studentId).trim(), result.rejectedCount ? "rejected" : "approved"),
-      data: result,
+      data: {
+        approvedCount: result.approvedCount,
+        rejectedCount: result.rejectedCount,
+        autoClosedCount: result.autoClosedCount,
+        createdAttendanceCount: result.createdAttendanceCount,
+        updatedRowCount: result.updatedRowCount,
+        removedExemptedEventCount: result.removedExemptedEventCount,
+        requestIds: result.requests.map((r) => r.id),
+      },
     });
     res.end();
   } catch (error) {

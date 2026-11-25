@@ -537,7 +537,17 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   const requestId = crypto.randomUUID();
   const raw = error as { statusCode?: number; status?: number; message?: string; stack?: string; expose?: boolean; code?: string };
   const status = error instanceof multer.MulterError ? 400 : Number(raw?.statusCode ?? raw?.status ?? 500);
-  const safeStatus = status >= 400 && status < 500 ? status : 500;
+  const databaseStatuses: Record<string, number> = {
+    "23505": 409,
+    "23503": 409,
+    "40P01": 409,
+    "40001": 409,
+    "55P03": 503,
+    "57014": 503,
+  };
+  const safeStatus = raw?.code && Object.prototype.hasOwnProperty.call(databaseStatuses, raw.code)
+    ? databaseStatuses[raw.code]
+    : status >= 400 && status < 500 ? status : 500;
   console.error(`[${requestId}] request failed`, error);
   res.setHeader("X-Request-ID", requestId);
   const response: { message: string; requestId: string; stack?: string } = {
@@ -550,6 +560,7 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     "40P01": "The save conflicted with another update. Try again.",
     "40001": "The save conflicted with another update. Try again.",
     "23505": "A duplicate record blocked the save.",
+    "23503": "A related record blocked the save. No changes were saved.",
   };
   if (raw?.code && Object.prototype.hasOwnProperty.call(databaseMessages, raw.code)) {
     response.message = databaseMessages[raw.code];

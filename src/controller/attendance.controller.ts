@@ -1263,6 +1263,9 @@ export async function updateFinalResultProfile(
       data: result,
     });
   } catch (error) {
+    const requestId = randomUUID();
+    console.error(`[${requestId}] Attendance profile update failed:`, error);
+    res.locals.auditOutcome = "failed";
     next(error);
   }
 }
