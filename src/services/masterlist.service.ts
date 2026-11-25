@@ -551,8 +551,10 @@ function matchesSearch(studentNumber: string, name: string, search?: string) {
   const text = search?.trim();
   if (!text) return true;
   const fold = (value: string) => value.normalize("NFD").replace(/\p{M}/gu, "").toUpperCase();
+  const searchKey = normalizeNameKey(text);
+  const studentNameTokens = new Set(nameTokens(normalizeNameKey(name)));
   return fold(`${studentNumber} ${name}`).includes(fold(text)) ||
-    (normalizeNameKey(text) !== "" && contains(new Set(tokens(normalizeNameKey(name))), normalizeNameKey(text))) ||
+    (searchKey !== "" && nameTokens(searchKey).every(token => studentNameTokens.has(token))) ||
     (/^TC[-\s–—]*\d/i.test(text) && normalizeStudentNumberKey(studentNumber) === normalizeStudentNumberKey(text));
 }
 function filterRows<T extends {college: string|null; program: string|null; year_level: string|null; student_number: string; name?: string|null; full_name?: string}>(rows:T[],f:MasterlistFilters) {
