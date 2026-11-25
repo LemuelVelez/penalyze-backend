@@ -88,33 +88,40 @@ function isSupportedAttendanceUpload(
   return ACCEPTED_ATTENDANCE_EXTENSIONS.includes(extension as any);
 }
 
-export const attendanceUpload = multer({
-  storage: multer.memoryStorage(),
-  defParamCharset: "utf8",
-  limits: {
-    fileSize: MAX_FILE_SIZE,
-    files: 10,
-  },
-  fileFilter: (_req, file, callback) => {
-    const extension = getUploadFileExtension(file.originalname);
-    const mime = String(file.mimetype ?? "").toLowerCase();
-    const allowedMime = extension === ".xlsx"
-      ? ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream"]
-      : ["text/csv", "text/plain", "application/vnd.ms-excel", "application/octet-stream"];
-    if (isSupportedAttendanceUpload(file) && allowedMime.includes(mime) && file.originalname.length <= 180) {
-      file.originalname = file.originalname.split(/[\\/]/).pop()!.replace(/[^\p{L}\p{N}._() -]/gu, "_");
-      callback(null, true);
-      return;
-    }
+function createSpreadsheetUpload(validateMime: boolean) {
+  return multer({
+    storage: multer.memoryStorage(),
+    defParamCharset: "utf8",
+    limits: {
+      fileSize: MAX_FILE_SIZE,
+      files: 10,
+    },
+    fileFilter: (_req, file, callback) => {
+      const extension = getUploadFileExtension(file.originalname);
+      const mime = String(file.mimetype ?? "").toLowerCase();
+      const allowedMime = extension === ".xlsx"
+        ? ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/octet-stream"]
+        : ["text/csv", "text/plain", "application/vnd.ms-excel", "application/octet-stream"];
+      if (isSupportedAttendanceUpload(file) && (!validateMime || allowedMime.includes(mime)) && file.originalname.length <= 180) {
+        file.originalname = file.originalname.split(/[\\/]/).pop()!.replace(/[^\p{L}\p{N}._() -]/gu, "_");
+        callback(null, true);
+        return;
+      }
 
-    const error = new Error("Unsupported file. Please upload an .xlsx or .csv file.") as Error & {
-      statusCode?: number;
-    };
-    error.statusCode = 400;
-    (error as Error & { expose?: boolean }).expose = true;
-    callback(error);
-  },
-});
+      const error = new Error("Unsupported file. Please upload an .xlsx or .csv file.") as Error & {
+        statusCode?: number;
+      };
+      error.statusCode = 400;
+      (error as Error & { expose?: boolean }).expose = true;
+      callback(error);
+    },
+  });
+}
+
+export const attendanceUpload = createSpreadsheetUpload(true);
+// Masterlist uploads validate the workbook contents in masterlist.service.ts.
+// Browser/OS MIME guesses are not a reliable way to identify Excel files.
+export const masterlistUpload = createSpreadsheetUpload(false);
 
 function toPositiveInt(value: unknown, fallback: number) {
   const parsed = Number(value);

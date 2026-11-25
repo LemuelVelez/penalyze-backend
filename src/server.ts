@@ -34,6 +34,7 @@ import {
 } from "./controller/attendance-requests.controller";
 import {
   attendanceUpload,
+  masterlistUpload,
   calculationResults as attendanceCalculationResults,
   calculationPendingSummary as attendanceCalculationPendingSummary,
   calculationStatus as attendanceCalculationStatus,
@@ -314,7 +315,7 @@ app.delete(
   requireAuth, requireAdmin, removeAttendanceRequestEvent,
 );
 
-app.post("/api/masterlist/upload", requireAuth, requireAdmin, attendanceUpload.single("file"), masterlist.upload);
+app.post("/api/masterlist/upload", requireAuth, requireAdmin, masterlistUpload.single("file"), masterlist.upload);
 app.get("/api/masterlist", requireAuth, requireAdmin, masterlist.list);
 app.post("/api/masterlist/reconcile", requireAuth, requireAdmin, masterlist.reconcile);
 app.delete("/api/masterlist", requireAuth, requireAdmin, masterlist.remove);

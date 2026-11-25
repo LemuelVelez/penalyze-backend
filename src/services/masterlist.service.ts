@@ -6,7 +6,7 @@ import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelK
 import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
 import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram } from "./masterlist-normalize";
 
-const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400 });
+const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, expose: true });
 export function isMasterlistSchoolYear(year: SchoolYearRecord | undefined | null): boolean {
   return !!year && year.semester === "first_semester" && (getSchoolYearMetadataLabels(year).some(label => /2026\s*[-–—/]\s*2027/.test(label)) || (new Date(year.starts_at).getUTCFullYear() === 2026 && new Date(year.ends_at).getUTCFullYear() === 2027));
 }
@@ -208,12 +208,24 @@ export async function syncMasterlistAbsences(client: PoolClient, schoolYearId: s
 
 export async function uploadMasterlist(file: {originalname: string;buffer: Buffer}, actor?: string) {
   let workbook: XLSX.WorkBook;
-  try {
-    if (!file.buffer.length || file.buffer.length > 5 * 1024 * 1024) throw bad("Invalid masterlist size.");
-    if (/\.xlsx$/i.test(file.originalname)) validateXlsxContainer(file.buffer);
-    else if (file.buffer.includes(0)) throw bad("Invalid CSV text.");
-    workbook = XLSX.read(file.buffer, {type:"buffer", cellFormula:false,cellHTML:false,sheetRows:20001});
-  } catch { throw bad("Unable to read masterlist."); }
+  const extension = file.originalname.trim().toLowerCase().match(/\.[a-z0-9]+$/)?.[0];
+  if (!file.buffer.length || file.buffer.length > 5 * 1024 * 1024) throw bad("Invalid masterlist size. Upload a file no larger than 5 MB.");
+  if (extension !== ".xlsx" && extension !== ".csv") throw bad("Unsupported file. Please upload an .xlsx or .csv file.");
+  const options = { cellFormula: false, cellHTML: false, sheetRows: 20001 };
+  if (extension === ".xlsx") {
+    if (!file.buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) throw bad("Invalid XLSX file signature.");
+    try { validateXlsxContainer(file.buffer); }
+    catch { throw bad("Invalid or oversized XLSX workbook archive."); }
+    try { workbook = XLSX.read(file.buffer, { ...options, type: "buffer" }); }
+    catch { throw bad("Unable to read the XLSX masterlist."); }
+  } else {
+    if (file.buffer.some(byte => byte < 0x09 || (byte > 0x0d && byte < 0x20))) throw bad("Invalid CSV text data.");
+    let csv: string;
+    try { csv = new TextDecoder("utf-8", { fatal: true }).decode(file.buffer); }
+    catch { csv = new TextDecoder("windows-1252").decode(file.buffer); }
+    try { workbook = XLSX.read(csv, { ...options, type: "string", raw: true }); }
+    catch { throw bad("Unable to read the CSV masterlist."); }
+  }
   const sheet = workbook.Sheets.Sheet1 ?? (/\.csv$/i.test(file.originalname) ? workbook.Sheets[workbook.SheetNames[0]] : undefined);
   if (!sheet) throw bad("Masterlist must contain Sheet1.");
   if (!sheet["!ref"]) throw bad("Masterlist is empty.");
