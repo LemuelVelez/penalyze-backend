@@ -111,7 +111,7 @@ const poolOptions = {
 };
 
 export const pool = new Pool(poolOptions);
-export const jobPool = new Pool({ ...poolOptions, max: Number(process.env.DB_JOB_POOL_MAX ?? 2), statement_timeout: 180000 });
+export const jobPool = new Pool({ ...poolOptions, max: 2, statement_timeout: 180000 });
 jobPool.on("error", error => console.error("Unexpected PostgreSQL job pool error:", error));
 
 pool.on("error", (error) => {
