@@ -32,8 +32,6 @@ const NOISE_TOKENS = new Set([
   "copy",
   "file",
   "attendance",
-  "am",
-  "pm",
   "jan",
   "january",
   "feb",
@@ -80,12 +78,25 @@ function isNoiseToken(token: string) {
 
 export function normalizeAttendanceEventIdentityName(value: unknown) {
   const tokens = clean(value)
+    .replace(/\b(?:log|time)\s*(in|out)\b/g, " $1 ")
     .split(" ")
     .filter(Boolean)
     .flatMap((token) => TOKEN_EXPANSIONS[token] ?? [token])
     .filter((token) => !isNoiseToken(token));
 
   return tokens.join(" ");
+}
+
+export function haveConflictingAttendanceEventSessions(left: unknown, right: unknown): boolean {
+  const session = (value: unknown) => {
+    const name = clean(value).replace(/\b(?:log|time)\s*(in|out)\b/g, " $1 ");
+    const directions = [...new Set(name.match(/\b(?:in|out)\b/g) ?? [])].sort();
+    const direction = directions.join("/");
+    const period = /\b(morning|am)\b/.test(name) ? "am" : /\b(afternoon|pm)\b/.test(name) ? "pm" : null;
+    return { direction, period };
+  };
+  const a = session(left), b = session(right);
+  return a.direction !== b.direction || a.period !== b.period;
 }
 
 function levenshtein(left: string, right: string) {
@@ -246,6 +257,10 @@ export function scoreAttendanceEventIdentity(
 
   if (!incomingName || !existingName) {
     return { score: 0, confidence: "low", reasons: ["missing event name"] };
+  }
+
+  if (haveConflictingAttendanceEventSessions(incoming.name, existing.name)) {
+    return { score: 0, confidence: "low", reasons: ["event sessions are different; do not auto-merge"] };
   }
 
   if (haveConflictingAttendanceEventDates(incoming, existing)) {

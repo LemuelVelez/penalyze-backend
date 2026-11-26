@@ -5,7 +5,7 @@ import type { MasterlistStatus, SchoolYearRecord, StudentMasterlistRecord, Stude
 import { pool, withTransaction } from "../lib/db";
 import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelKey, normalizeCollegeKey, lockAttendanceAbsenceSync, refreshDerivedAttendanceResultsForSchoolYearsWithClient, listAttendanceFinalResults, listFinalAttendanceEventRoster, syncAbsencesForStudents, attendanceEventRosterScopeCteSql } from "./attendance.service";
 import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
-import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram, parseStudentNumberParts, isPlaceholderStudentNumber, nameTokens, nameTokensAgree, nameKeysAgree, sharedNameTokenCount, nameTokenSignatures } from "./masterlist-normalize";
+import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram, parseStudentNumberParts, isPlaceholderStudentNumber, nameTokens, nameTokensAgree, nameKeysAgree, sharedNameTokenCount, nameTokenSignatures, repairNameMojibake, surnameTokensOverlap, joinedGivenNamesAgree } from "./masterlist-normalize";
 
 const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, expose: true });
 export type MasterlistProgress = {
@@ -89,6 +89,7 @@ export async function loadMasterlist(client: PoolClient, schoolYearId: string, c
   const rows = isMasterlistSchoolYear(year) ? (await client.query<StudentMasterlistRecord>("SELECT * FROM student_masterlist WHERE school_year_id=$1", [schoolYearId])).rows : [];
   const index: MasterIndex = { rows, ids: new Map(), names: new Map(), tokens: new Map(), serials: new Map() };
   for (const row of rows) {
+    row.name_key = normalizeNameKey(`${row.given_name} ${row.last_name}`);
     const parts = parseStudentNumberParts(row.student_number_key);
     if (parts) {
       index.ids.set(row.student_number_key, row);
@@ -120,7 +121,21 @@ function resolve(index: MasterIndex, profile: Profile): Resolution {
   const nameKey = normalizeNameKey(profile.name);
   const placeholder = isPlaceholderStudentNumber(profile.studentId);
   const master = placeholder ? undefined : index.ids.get(id);
-  if (master) return { status: nameKeysAgree(nameKey, master.name_key) ? "matched_by_id" : "id_name_mismatch", master };
+  const agrees = (r: StudentMasterlistRecord) => nameKeysAgree(nameKey, r.name_key) ||
+    joinedGivenNamesAgree(profile.name, r.last_name, r.given_name);
+  const nameCandidates = () => narrowCandidates([...new Set(nameTokens(nameKey).flatMap(nameTokenSignatures)
+    .flatMap(signature => index.tokens.get(signature) ?? []))].filter(r =>
+      !isPlaceholderStudentNumber(r.student_number_key) && agrees(r)), profile);
+  if (master) {
+    if (!nameKey) return { status: "matched_by_id", master };
+    if (!surnameTokensOverlap(profile.name, master.last_name)) {
+      const candidates = nameCandidates();
+      if (candidates.length === 1 && candidates[0].id !== master.id) {
+        return { status: "matched_by_name", master: candidates[0] };
+      }
+    }
+    return { status: agrees(master) ? "matched_by_id" : "id_name_mismatch", master };
+  }
   const parts = placeholder ? null : parseStudentNumberParts(profile.studentId);
   if (parts) {
     let candidates = (index.serials.get(parts.serial) ?? []).filter(r => {
@@ -130,7 +145,7 @@ function resolve(index: MasterIndex, profile: Profile): Resolution {
     if (nameKey) {
       candidates = candidates.filter(r =>
         nameTokens(normalizeNameKey(r.last_name)).some(surname => nameTokens(nameKey).some(token => nameTokensAgree(token, surname))) ||
-        sharedNameTokenCount(nameKey, r.name_key) >= 2);
+        sharedNameTokenCount(nameKey, r.name_key) >= 2 || joinedGivenNamesAgree(profile.name, r.last_name, r.given_name));
     } else {
       const college = normalizeCollegeKey(profile.college);
       candidates = college ? candidates.filter(r => normalizeCollegeKey(r.college) === college) : [];
@@ -139,9 +154,7 @@ function resolve(index: MasterIndex, profile: Profile): Resolution {
     if (candidates.length === 1) return { status: "matched_by_partial_id", master: candidates[0] };
   }
   if (!nameKey) return { status: "unmatched" };
-  const candidates = narrowCandidates([...new Set(nameTokens(nameKey).flatMap(nameTokenSignatures)
-    .flatMap(signature => index.tokens.get(signature) ?? []))].filter(r =>
-      !isPlaceholderStudentNumber(r.student_number_key) && nameKeysAgree(nameKey, r.name_key)), profile);
+  const candidates = nameCandidates();
   return candidates.length === 1 ? { status: "matched_by_name", master: candidates[0] } : { status: "unmatched" };
 }
 export async function resolveStudentAgainstMasterlist(client: PoolClient, schoolYearId: string, profile: Profile, cache: MasterlistCache = new Map()): Promise<Resolution> {
@@ -201,7 +214,8 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
   const totals = new Map<string, number>();
   const resolutionCache = new Map<string, Resolution>();
   for (const table of scopedTables) {
-    const count = await client.query<{ count: string }>(`SELECT COUNT(*) AS count FROM ${table} WHERE school_year_id=$1`, [schoolYear.id]);
+    const visibility = table === "attendance_records" ? ` AND ${getAttendanceRecordVisibilitySql(table)}` : "";
+    const count = await client.query<{ count: string }>(`SELECT COUNT(*) AS count FROM ${table} WHERE school_year_id=$1${visibility}`, [schoolYear.id]);
     totals.set(table, Number(count.rows[0].count));
     await yieldChunk(isCancelled);
   }
@@ -209,6 +223,7 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
   let completed = 0;
   for (const table of scopedTables) {
     const full = profileTables.includes(table);
+    const visibility = table === "attendance_records" ? ` AND ${getAttendanceRecordVisibilitySql(table)}` : "";
     const total = totals.get(table) ?? 0;
     const chunkTotal = Math.ceil(total / MASTERLIST_CHUNK_SIZE);
     const tableProgress = (fraction: number) => 10 + 50 * (grandTotal ? (completed + total * fraction) / grandTotal : 1);
@@ -216,7 +231,7 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
     let cursor: string | null = null;
     let processed = 0;
     while (true) {
-      const rows: Existing[] = (await client.query<Existing>(`SELECT id,student_id,name,${full ? "program,college,year_level" : "NULL::text AS program,NULL::text AS college,NULL::text AS year_level"} FROM ${table} WHERE school_year_id=$1${cursor === null ? "" : " AND id > $2::uuid"} ORDER BY id LIMIT ${MASTERLIST_CHUNK_SIZE}`, cursor === null ? [schoolYear.id] : [schoolYear.id,cursor])).rows;
+      const rows: Existing[] = (await client.query<Existing>(`SELECT id,student_id,name,${full ? "program,college,year_level" : "NULL::text AS program,NULL::text AS college,NULL::text AS year_level"} FROM ${table} WHERE school_year_id=$1${visibility}${cursor === null ? "" : " AND id > $2::uuid"} ORDER BY id LIMIT ${MASTERLIST_CHUNK_SIZE}`, cursor === null ? [schoolYear.id] : [schoolYear.id,cursor])).rows;
       if (!rows.length) break;
       for (const row of rows) {
         const profileKey = JSON.stringify([row.student_id, row.name, row.program, row.college]);
@@ -249,9 +264,10 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
         matched.set(m.student_number, m);
         const alias = row.student_id.trim().toLowerCase();
         const targets = aliases.get(alias) ?? new Set<string>(); targets.add(m.student_number); aliases.set(alias, targets);
-        if (row.student_id === m.student_number && row.name === m.full_name && (!full || (row.program === m.program && row.college === m.college && row.year_level === m.year_level))) continue;
+        const resolvedName = table === "attendance_records" && resolution.status === "id_name_mismatch" ? row.name : m.full_name;
+        if (row.student_id === m.student_number && row.name === resolvedName && (!full || (row.program === m.program && row.college === m.college && row.year_level === m.year_level))) continue;
         changed.add(m.student_number);
-        updates.push({ id: row.id, student_id: m.student_number, name: m.full_name, year_level: m.year_level, program: m.program, college: m.college });
+        updates.push({ id: row.id, student_id: m.student_number, name: resolvedName, year_level: m.year_level, program: m.program, college: m.college });
       }
       processed += rows.length;
       cursor = rows[rows.length - 1].id;
@@ -295,7 +311,10 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
     const master = isPlaceholderStudentNumber(student_key) ? undefined : index.ids.get(key);
     if (master) aliases.set(student_key, new Set([master.student_number]));
   }
-  const mapping = [...aliases].filter(([, values]) => values.size === 1).filter(([old]) => !unresolvedAliases.has(old)).map(([old, values]) => ({ old, target: [...values][0].toLowerCase() }));
+  const mapping = [...aliases].filter(([old, values]) => {
+    const owner = index.ids.get(normalizeStudentNumberKey(old));
+    return !owner || values.has(owner.student_number);
+  }).filter(([, values]) => values.size === 1).filter(([old]) => !unresolvedAliases.has(old)).map(([old, values]) => ({ old, target: [...values][0].toLowerCase() }));
   if (mapping.length) {
     const data = JSON.stringify(mapping);
     const rank = `WITH mapping AS (SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(old text,target text)), ranked AS (SELECT o.id,ROW_NUMBER() OVER(PARTITION BY COALESCE(m.target,o.student_key),o.event_id ORDER BY o.updated_at DESC,o.id DESC) AS rn FROM attendance_student_event_overrides o LEFT JOIN mapping m ON m.old=o.student_key WHERE o.school_year_id=$1)`;
@@ -337,6 +356,31 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
     emit({ stage: "finalizing", percent: 98, message: "Finalizing reconciliation…" });
   }
   return summary;
+}
+
+// Migration 047 invokes the same resolver and full rebuild in its transaction.
+export async function repairUploadAttendanceMatchingWithClient(client: PoolClient) {
+  await lockAttendanceAbsenceSync(client);
+  const years = (await client.query<SchoolYearRecord>(`SELECT sy.* FROM school_years sy
+    WHERE public.is_masterlist_school_year(sy.id)
+      AND EXISTS (SELECT 1 FROM student_masterlist m WHERE m.school_year_id=sy.id)`)).rows;
+  for (const year of years) {
+    const index = await loadMasterlist(client, year.id);
+    for (let i = 0; i < index.rows.length; i += MASTERLIST_CHUNK_SIZE) {
+      const profiles = index.rows.slice(i, i + MASTERLIST_CHUNK_SIZE).map(row => ({
+        id: row.id, name_key: row.name_key,
+        last_name: repairNameMojibake(row.last_name), given_name: repairNameMojibake(row.given_name),
+        full_name: repairNameMojibake(row.full_name),
+      }));
+      await client.query(`UPDATE student_masterlist m SET name_key=x.name_key,last_name=x.last_name,
+        given_name=x.given_name,full_name=x.full_name,updated_at=NOW()
+        FROM jsonb_to_recordset($1::jsonb) AS x(id uuid,name_key text,last_name text,given_name text,full_name text)
+        WHERE m.id=x.id AND (m.name_key,m.last_name,m.given_name,m.full_name)
+          IS DISTINCT FROM (x.name_key,x.last_name,x.given_name,x.full_name)`, [JSON.stringify(profiles)]);
+    }
+    const summary = await reconcileWithClient(client, year);
+    await client.query(`UPDATE student_masterlist_imports SET summary=$2 WHERE id=(SELECT id FROM student_masterlist_imports WHERE school_year_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1)`, [year.id, JSON.stringify(summary)]);
+  }
 }
 
 // Called inside the existing upload transaction, after its raw rows are saved.
@@ -417,7 +461,7 @@ export async function uploadMasterlist(file: {originalname: string;buffer: Buffe
     if (r.every(v => !String(v ?? "").trim()) || (r.map(header).includes("studentnumber") && r.map(header).includes("lastname"))) continue;
     total++;
     const get = (f:string) => String(r[headers.indexOf(f)] ?? "").trim();
-    const student_number=normalizeStudentNumberKey(get("studentnumber")), student_number_key=student_number, last_name=get("lastname"), given_name=get("givenname"), middle_initial=get("middleinitial").replace(/\.+$/, "") || null;
+    const student_number=normalizeStudentNumberKey(get("studentnumber")), student_number_key=student_number, last_name=repairNameMojibake(get("lastname")), given_name=repairNameMojibake(get("givenname")), middle_initial=get("middleinitial").replace(/\.+$/, "") || null;
     const program=cleanProgram(get("degreeprogram")); const year_level_key=normalizeYearLevelKey(get("yearlevel"));
     const year_level=({"1":"1st Year","2":"2nd Year","3":"3rd Year","4":"4th Year"} as Record<string,string>)[year_level_key ?? ""];
     if (!/^TC-\d{2}-[A-Z]-\d{5}$/.test(student_number_key) || isPlaceholderStudentNumber(student_number_key) || !last_name || !given_name || !year_level || ids.has(student_number_key)) { invalid++; continue; }

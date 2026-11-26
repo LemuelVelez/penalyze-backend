@@ -31,9 +31,43 @@ export function parseStudentNumberParts(value: unknown): StudentNumberParts | nu
   return parts && parts.serial !== "00000" ? parts : null;
 }
 
+// Match the known Latin-1/Windows-1252 decoding errors repaired by migration 029.
+export function repairNameMojibake(value: unknown): string {
+  return String(value ?? "").replace(/Ã[±\u0091‘¡©\u00ad³º]/g, sequence => ({
+    "Ã±": "ñ", "Ã\u0091": "Ñ", "Ã‘": "Ñ", "Ã¡": "á", "Ã©": "é",
+    "Ã\u00ad": "í", "Ã³": "ó", "Ãº": "ú",
+  } as Record<string, string>)[sequence] ?? sequence);
+}
+
+function orderedNameTokens(value: unknown): string[] {
+  return repairNameMojibake(value).normalize("NFD").replace(/\p{M}/gu, "").toUpperCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/)
+    .filter(token => token.length > 1 && !["JR", "SR", "II", "III", "IV"].includes(token))
+    .map(token => token === "MA" ? "MARIA" : token);
+}
+
 export function normalizeNameKey(value: unknown): string {
-  return String(value ?? "").normalize("NFD").replace(/\p{M}/gu, "").toUpperCase()
-    .replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/).filter(token => token.length > 1).sort().join(" ");
+  return orderedNameTokens(value).sort().join(" ");
+}
+
+export function surnameTokensOverlap(name: unknown, surname: unknown): boolean {
+  const uploaded = new Set(orderedNameTokens(name));
+  return orderedNameTokens(surname).some(token => uploaded.has(token));
+}
+
+// Compare the given names in their original order, not the sorted name key.
+// Require every surname token before accepting a joined/split given name.
+export function joinedGivenNamesAgree(name: unknown, surname: unknown, givenName: unknown): boolean {
+  const remaining = orderedNameTokens(name);
+  const surnames = orderedNameTokens(surname);
+  const given = orderedNameTokens(givenName).join("");
+  if (!surnames.length || !given) return false;
+  for (const token of surnames) {
+    const index = remaining.indexOf(token);
+    if (index < 0) return false;
+    remaining.splice(index, 1);
+  }
+  return remaining.join("") === given;
 }
 
 export const nameTokens = (key: string) => [...new Set(key.split(" ").filter(Boolean))];

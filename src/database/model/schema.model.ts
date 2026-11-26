@@ -358,7 +358,7 @@ export type AttendanceImportInput = {
   eventName?: string;
   eventStartAt?: string;
   eventEndAt?: string;
-  scannedAt?: string;
+  scannedAt?: string | null;
   studentId: string;
   name: string;
   yearLevel?: string;
@@ -390,6 +390,7 @@ export type ParsedAttendanceRow = AttendanceImportInput & {
   eventForceCreate?: boolean;
   rowNumber: number;
   errors: string[];
+  warnings?: string[];
   raw: Record<string, unknown>;
 };
 

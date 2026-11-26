@@ -27,6 +27,7 @@ import {
 import { pool, query, withTransaction } from "../lib/db";
 import {
   haveConflictingAttendanceEventDates,
+  haveConflictingAttendanceEventSessions,
   normalizeAttendanceEventIdentityName,
   scoreAttendanceEventIdentity,
 } from "./attendance-event-identity";
@@ -56,6 +57,7 @@ function isProtectedSoeSessionMergeConflict(
   const left = normalizeAttendanceEventIdentityName(leftName);
   const right = normalizeAttendanceEventIdentityName(rightName);
 
+  if (haveConflictingAttendanceEventSessions(leftName, rightName)) return true;
   if (!left || !right || left === right) return false;
 
   return (
@@ -289,8 +291,8 @@ function getAttendanceRowSaveProgressPercent(
 
 const HEADER_ALIASES = {
   eventName: [
-    "event",
     "event name",
+    "event",
     "event_name",
     "activity",
     "activity name",
@@ -330,17 +332,10 @@ const HEADER_ALIASES = {
     "last_scan_at",
   ],
   studentId: [
-    "studentid",
-    "student number",
-    "student id",
-    "student_id",
-    "student no",
-    "student no.",
-    "id number",
-    "id",
-    "school id",
+    "student id", "student number", "student no", "student no.", "studentid",
+    "id number", "id no", "id no.", "tc number", "tc no", "tc no.", "school id", "id",
   ],
-  name: ["name", "full name", "student name", "learner name"],
+  name: ["student name", "full name", "learner name", "name"],
   yearLevel: [
     "yearlevel",
     "year level",
@@ -772,21 +767,19 @@ function loadRequiredModule<T = any>(packageName: string): T {
 }
 
 function hasAttendanceStudentHeaders(headers: string[]) {
-  return (
-    headers.some((header) =>
-      HEADER_ALIASES.studentId.includes(header as any),
-    ) && headers.some((header) => HEADER_ALIASES.name.includes(header as any))
-  );
+  const hasId = headers.some(header => HEADER_ALIASES.studentId.some(alias => normalizeHeader(alias) === header));
+  const hasName = headers.some(header => HEADER_ALIASES.name.some(alias => normalizeHeader(alias) === header));
+  return hasId || hasName || (headers.includes("barcode") && headers.includes("format") && headers.includes("scan date"));
 }
 
 function getByAliases(row: RawImportRow, aliases: readonly string[]) {
-  const entries = Object.entries(row ?? {});
-
-  for (const [key, value] of entries) {
-    const normalizedKey = normalizeHeader(key);
-    if (aliases.includes(normalizedKey as any)) return value;
+  const entries = Object.entries(row ?? {}).map(([key, value]) => [normalizeHeader(key), value] as const);
+  for (const alias of aliases) {
+    const normalizedAlias = normalizeHeader(alias);
+    for (const [key, value] of entries) {
+      if (key === normalizedAlias && cleanText(value) !== "") return value;
+    }
   }
-
   return "";
 }
 
@@ -838,11 +831,11 @@ function normalizeImportRows(
       (inputRow as ParsedAttendanceRow).scannedAt ??
       getByAliases(raw, HEADER_ALIASES.scannedAt);
     const studentId = cleanText(
-      (inputRow as ParsedAttendanceRow).studentId ??
+      (inputRow as ParsedAttendanceRow).masterlist_original?.studentId ?? (inputRow as ParsedAttendanceRow).studentId ??
         getByAliases(raw, HEADER_ALIASES.studentId),
     );
     const name = cleanText(
-      (inputRow as ParsedAttendanceRow).name ??
+      (inputRow as ParsedAttendanceRow).masterlist_original?.name ?? (inputRow as ParsedAttendanceRow).name ??
         getByAliases(raw, HEADER_ALIASES.name),
     );
     const yearLevel = cleanText(
@@ -880,13 +873,16 @@ function normalizeImportRows(
     const scannedAt = normalizeOptionalTimestamp(scannedAtInput, "Scanned at");
 
     const errors: string[] = [];
-    if (!studentId) errors.push("Student ID is required.");
-    if (!name) errors.push("Name is required.");
-    if (noOfAbsences === null)
-      errors.push("No. of Absences must be a whole number.");
+    const previousWarnings = (inputRow as ParsedAttendanceRow).warnings;
+    const warnings: string[] = Array.isArray(previousWarnings) ? previousWarnings.filter((warning): warning is string => typeof warning === "string") : [];
+    if ((!normalizeStudentNumberKey(studentId) || isPlaceholderStudentNumber(studentId)) && !name)
+      errors.push("A usable Student ID or Name is required.");
+    const hasAbsencesColumn = Object.keys(raw).some(key => HEADER_ALIASES.noOfAbsences.some(alias => normalizeHeader(alias) === normalizeHeader(key)));
+    if (noOfAbsences === null || (hasAbsencesColumn && !cleanText(absencesInput)))
+      warnings.push("No. of Absences was not a whole number; using 0.");
     if (eventStartAt.error) errors.push(eventStartAt.error);
     if (eventEndAt.error) errors.push(eventEndAt.error);
-    if (scannedAt.error) errors.push(scannedAt.error);
+    if (scannedAt.error) warnings.push(`${scannedAt.error} Attendance retained without a scan timestamp.`);
     if (
       eventStartAt.value &&
       eventEndAt.value &&
@@ -901,7 +897,7 @@ function normalizeImportRows(
       eventName,
       eventStartAt: eventStartAt.value ?? undefined,
       eventEndAt: eventEndAt.value ?? undefined,
-      scannedAt: scannedAt.value ?? undefined,
+      scannedAt: scannedAt.value,
       studentId,
       name,
       yearLevel,
@@ -911,6 +907,7 @@ function normalizeImportRows(
       noOfAbsences: noOfAbsences ?? 0,
       remarks,
       errors,
+      warnings: [...new Set(warnings)],
       raw,
     };
   });
@@ -1180,32 +1177,49 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
   const selectedRows = selectedSheets.flatMap(
     (sheet: { rows: RawImportRow[] }) => sheet.rows,
   );
+  const supplementalStudentKey = (row: ParsedAttendanceRow) => {
+    const id = normalizeStudentNumberKey(row.studentId);
+    // No masterlist is available at parsing time. Distinct names sharing even a
+    // well-formed ID must survive until the authoritative reconciliation step.
+    return `${id}:${normalizeNameKey(row.name)}`;
+  };
+  const normalizeSupplementalRows = (rows: RawImportRow[]) => normalizeImportRows(rows.map(row => {
+    const payload = parseScannerBarcodePayload(getByAliases(row, ["barcode", "name"]));
+    return payload ? { ...row, ...payload } : row;
+  }));
   const representedStudentIds = new Set(
-    normalizeImportRows(selectedRows)
+    normalizeSupplementalRows(selectedRows)
       .filter((row) => row.errors.length === 0)
-      .map((row) => cleanText(row.studentId).toLowerCase())
-      .filter(Boolean),
+      .map(supplementalStudentKey),
   );
   const supplementalRows: RawImportRow[] = [];
 
   parsedSheets
     .filter((sheet: { priority: number }) => sheet.priority !== bestPriority)
     .forEach((sheet: { rows: RawImportRow[] }) => {
-      const normalizedRows = normalizeImportRows(sheet.rows);
+      const normalizedRows = normalizeSupplementalRows(sheet.rows);
 
       sheet.rows.forEach((row, index) => {
         const normalizedRow = normalizedRows[index];
-        const studentId = cleanText(normalizedRow?.studentId).toLowerCase();
+        const studentId = supplementalStudentKey(normalizedRow);
 
-        if (!studentId || representedStudentIds.has(studentId)) return;
+        if (normalizedRow.errors.length || representedStudentIds.has(studentId)) return;
 
         supplementalRows.push(row);
         if (!normalizedRow.errors.length) representedStudentIds.add(studentId);
       });
     });
 
+  const combinedRows = [...selectedRows, ...supplementalRows];
+  const usedRowNumbers = new Set<number>();
+  let nextRowNumber = combinedRows.reduce((max, row) => Math.max(max, Number(row.__rowNumber) || 0), 1) + 1;
+  for (const row of combinedRows) {
+    const number = Number(row.__rowNumber);
+    if (!Number.isInteger(number) || usedRowNumbers.has(number)) row.__rowNumber = nextRowNumber++;
+    usedRowNumbers.add(Number(row.__rowNumber));
+  }
   return {
-    rawRows: [...selectedRows, ...supplementalRows],
+    rawRows: combinedRows,
     detectedEvent: parsedSheets.reduce(
       (
         metadata: AttendanceDetectedEventMetadata,
@@ -1218,7 +1232,7 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
 
 function parseScannerBarcodePayload(value: unknown) {
   const text = String(value ?? "").replace(/\r/g, "").trim();
-  if (!text || !/student\s*id\s*:/i.test(text)) return null;
+  if (!text) return null;
 
   const fields = new Map<string, string>();
   text.split("\n").forEach((line) => {
@@ -1227,9 +1241,9 @@ function parseScannerBarcodePayload(value: unknown) {
     fields.set(normalizeHeader(match[1]), cleanText(match[2]));
   });
 
-  const studentId = fields.get("student id") ?? "";
-  const name = fields.get("name") ?? "";
-  if (!studentId || !name) return null;
+  const studentId = cleanText(getByAliases(Object.fromEntries(fields), HEADER_ALIASES.studentId));
+  const name = cleanText(getByAliases(Object.fromEntries(fields), HEADER_ALIASES.name));
+  if (!studentId && !name) return null;
 
   return {
     "Student ID": studentId,
@@ -1243,7 +1257,11 @@ function parseScannerBarcodePayload(value: unknown) {
 
 function getScannerEventNameFromFileName(fileName: string) {
   const baseName = getFileNameWithoutExtension(fileName)
-    .replace(/\([^)]*\)/g, " ")
+    .replace(/\(([^)]*)\)/g, (_match, contents: string) => {
+      const label = contents.trim();
+      if (/^(?:in|out|log[ _-]*in|log[ _-]*out|time[ _-]*in|time[ _-]*out|morning|afternoon|am|pm)$/i.test(label)) return ` ${label} `;
+      return /^[A-Z]{2,6}$/.test(label) ? " " : ` ${label} `;
+    })
     .replace(/\battendance\b/gi, " ")
     .replace(/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/gi, " ")
     .replace(/\b20\d{2}\b/g, " ")
@@ -1263,7 +1281,6 @@ function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
     headers.includes("scan date");
   const isCheckInScannerExport =
     headers.includes("name") &&
-    (headers.includes("check in date") || headers.includes("arrival date")) &&
     (headers.includes("check in time") || headers.includes("arrival time"));
 
   if (!isBarcodeScannerExport && !isCheckInScannerExport) return null;
@@ -1278,8 +1295,8 @@ function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
     if (isBarcodeScannerExport) {
       const format = cleanText(getByAliases(row, ["format"]));
       const type = cleanText(getByAliases(row, ["type"]));
-      if (format && format.toLowerCase() !== "qr_code") return;
-      if (type && type.toLowerCase() !== "text") return;
+      if (format && format.toLowerCase().replace(/[\s_]+/g, "") !== "qrcode") return;
+      if (type && type.toLowerCase().replace(/[\s_]+/g, "") !== "text") return;
 
       payload = getByAliases(row, ["barcode"]);
       scannedAtInput = getByAliases(row, ["scan date"]);
@@ -1294,7 +1311,14 @@ function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
       scannedAtInput = [scanDate, scanTime].filter(Boolean).join(" ");
     }
 
-    const parsedPayload = parseScannerBarcodePayload(payload);
+    const parsedPayload = parseScannerBarcodePayload(payload) ?? (!isBarcodeScannerExport && (cleanText(payload) || cleanText(getByAliases(row, HEADER_ALIASES.studentId))) ? {
+      "Student ID": getByAliases(row, HEADER_ALIASES.studentId),
+      Name: payload,
+      "Year Level": getByAliases(row, HEADER_ALIASES.yearLevel),
+      College: getByAliases(row, HEADER_ALIASES.college),
+      Program: getByAliases(row, HEADER_ALIASES.program),
+      Institution: getByAliases(row, HEADER_ALIASES.institution),
+    } : null);
     if (!parsedPayload) return;
 
     const scannedAt = normalizeOptionalTimestamp(scannedAtInput, "Scanned at");
@@ -1302,6 +1326,9 @@ function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
 
     transformedRows.push({
       ...parsedPayload,
+      "Student ID": cleanText(getByAliases(parsedPayload, HEADER_ALIASES.studentId)) || getByAliases(row, HEADER_ALIASES.studentId),
+      Name: cleanText(getByAliases(parsedPayload, HEADER_ALIASES.name)) || (isBarcodeScannerExport ? getByAliases(row, HEADER_ALIASES.name) : ""),
+      __rowNumber: row.__rowNumber,
       // Use the normalized scan time, including any future-date correction.
       "Scanned At": scannedAt.value ?? scannedAtInput ?? "",
     });
@@ -1328,18 +1355,9 @@ function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
 }
 
 async function parseFileToRawRows(file: UploadedAttendanceFile) {
-  const extension = ensureSupportedFile(file.originalname);
+  ensureSupportedFile(file.originalname);
   const parsed = await parseExcelFile(file);
-
-  if (extension === ".csv") {
-    const scannerExport = transformScannerExportRows(
-      file.originalname,
-      parsed.rawRows,
-    );
-    if (scannerExport) return scannerExport;
-  }
-
-  return parsed;
+  return transformScannerExportRows(file.originalname, parsed.rawRows) ?? parsed;
 }
 
 function getParsedAttendanceRowTime(row: ParsedAttendanceRow) {
@@ -1368,8 +1386,8 @@ function getAttendanceRowMergeKey(
 
   const studentKey = normalizeStudentNumberKey(row.studentId).toLowerCase();
   const base = `${normalizeHeader(eventKey)}:${normalizeHeader(collegeKey)}:${studentKey}`;
-  return isPlaceholderStudentNumber(row.studentId) || row.masterlist_status === "unmatched" || (!row.masterlist_status && !/^tc-\d{2}-[a-z]-\d{5}$/.test(studentKey))
-    ? `${base}:${normalizeNameKey(row.name)}` : base;
+  return isPlaceholderStudentNumber(row.studentId) || row.masterlist_status === "unmatched" || row.masterlist_status === "id_name_mismatch" || (!row.masterlist_status && !/^tc-\d{2}-[a-z]-\d{5}$/.test(studentKey))
+    ? `${base}:${normalizeNameKey(row.masterlist_status === "id_name_mismatch" ? row.masterlist_original?.name ?? row.name : row.name)}` : base;
 }
 
 type AttendanceRowMergeResult = {
@@ -1423,7 +1441,7 @@ export function mergeAttendanceImportRowsByStudentAndEvent(
         eventName: latestRow.eventName || oldestRow.eventName || merged.eventName,
         eventStartAt: latestRow.eventStartAt || oldestRow.eventStartAt,
         eventEndAt: latestRow.eventEndAt || oldestRow.eventEndAt,
-        scannedAt: latestRow.scannedAt || oldestRow.scannedAt,
+        scannedAt: latestRow.scannedAt || oldestRow.scannedAt || null,
         studentId: latestRow.studentId || oldestRow.studentId,
         name: latestRow.name || oldestRow.name,
         yearLevel: latestRow.yearLevel || oldestRow.yearLevel,
@@ -1434,6 +1452,7 @@ export function mergeAttendanceImportRowsByStudentAndEvent(
         remarks,
         raw: { ...merged.raw, ...row.raw },
         errors: [],
+        warnings: [...new Set([...(merged.warnings ?? []), ...(row.warnings ?? [])])],
       };
     });
 
@@ -1460,6 +1479,13 @@ function parseAttendanceDateTime(text: string) {
     return new Date(`${isoLocal[1]}T${isoLocal[2] ?? "00:00"}+08:00`);
   }
 
+  const dayFirst = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})(.*)$/);
+  if (dayFirst && Number(dayFirst[1]) > 12) {
+    const day = Number(dayFirst[1]), month = Number(dayFirst[2]), year = Number(dayFirst[3]);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    if (date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day || month < 1 || month > 12) return new Date(NaN);
+    text = `${month}/${day}/${year}${dayFirst[4]}`;
+  }
   const parsed = new Date(text);
   if (Number.isNaN(parsed.getTime())) return parsed;
   if (/(?:Z|[+-]\d{2}:?\d{2}|\bUTC|\bGMT)$/i.test(text)) return parsed;
@@ -2153,6 +2179,10 @@ async function insertAttendanceRecord(
   schoolYearId: string | null,
   row: ParsedAttendanceRow,
 ) {
+  const normalizedId = normalizeStudentNumberKey(row.studentId);
+  const matched = row.masterlist_status === "matched_by_id" || row.masterlist_status === "matched_by_partial_id" ||
+    row.masterlist_status === "matched_by_name" || row.masterlist_status === "id_name_mismatch";
+  const studentId = matched ? row.studentId : /^TC-\d{2}-[A-Z]-\d{5}$/.test(normalizedId) ? normalizedId : row.studentId;
   const result = await client.query<AttendanceRecord>(
     `
       INSERT INTO attendance_records (
@@ -2176,8 +2206,8 @@ async function insertAttendanceRecord(
       schoolYearId,
       importId,
       eventId,
-      row.studentId,
-      row.name,
+      studentId,
+      row.masterlist_status === "id_name_mismatch" ? row.masterlist_original?.name || row.name : row.name,
       row.yearLevel ?? "",
       row.college ?? "",
       row.program ?? "",
@@ -2200,6 +2230,11 @@ function validateAttendanceInput(input: RawImportRow, reconciledRow?: ParsedAtte
     );
   }
 
+  if (!row.studentId || !row.name) throw createValidationError("Student ID and Name are required.");
+  const scannedAt = normalizeOptionalTimestamp(input.scannedAt ?? getByAliases(input, HEADER_ALIASES.scannedAt), "Scanned at");
+  if (scannedAt.error) throw createValidationError(scannedAt.error);
+  if (parseOptionalAbsences(input.noOfAbsences ?? getByAliases(input, HEADER_ALIASES.noOfAbsences)) === null)
+    throw createValidationError("No. of Absences must be a whole number.");
   const canonical = normalizeStudentNumberKey(row.studentId);
   return /^TC-\d{2}-[A-Z]-\d{5}$/.test(canonical) ? { ...row, studentId: canonical } : row;
 }
@@ -2499,6 +2534,20 @@ const ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL =
   getAttendanceRecordEventRosterCollegeSql("ar");
 const MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL =
   getCanonicalCollegeKeySql("mar");
+// TC identifiers use the same expression as migration 044's functional indexes.
+// Other identifiers keep their original case-insensitive, trimmed semantics.
+function attendanceStudentKeySql(value: string) {
+  return `(CASE WHEN public.masterlist_student_number_key(${value}) ~ '^TC-[0-9]{2}-[A-Z]-[0-9]{5}$'
+    THEN LOWER(public.masterlist_student_number_key(${value})) ELSE LOWER(TRIM(${value})) END)`;
+}
+
+function attendanceStudentIdsEqualSql(left: string, right: string) {
+  return `((public.masterlist_student_number_key(${right}) ~ '^TC-[0-9]{2}-[A-Z]-[0-9]{5}$'
+    AND public.masterlist_student_number_key(${left}) = public.masterlist_student_number_key(${right}))
+    OR (public.masterlist_student_number_key(${right}) !~ '^TC-[0-9]{2}-[A-Z]-[0-9]{5}$'
+    AND LOWER(TRIM(${left})) = LOWER(TRIM(${right}))))`;
+}
+
 // Remove only this participant's presence; leave the original event roster intact.
 export function getStudentEventOverrideExclusionSql(
   schoolYearSql: string,
@@ -2509,7 +2558,7 @@ export function getStudentEventOverrideExclusionSql(
     SELECT 1
     FROM attendance_student_event_overrides excluded_override
     WHERE excluded_override.school_year_id IS NOT DISTINCT FROM ${schoolYearSql}
-      AND excluded_override.student_key = LOWER(TRIM(${studentIdSql}))
+      AND ${attendanceStudentIdsEqualSql("excluded_override.student_key", studentIdSql)}
       AND excluded_override.event_id = ${eventIdSql}
       AND excluded_override.attended = FALSE
   )`;
@@ -2524,15 +2573,15 @@ function attendanceEventParticipationCteSql(scoped = false) {
     SELECT DISTINCT
       ar.school_year_id,
       COALESCE(ar.event_id, ai.event_id) AS event_id,
-      LOWER(TRIM(ar.student_id)) AS normalized_student_id
+      ${attendanceStudentKeySql("ar.student_id")} AS normalized_student_id
     FROM attendance_records ar
     LEFT JOIN attendance_imports ai
       ON ai.id = ar.import_id
      AND ai.deleted_at IS NULL
     LEFT JOIN students participation_student
-      ON LOWER(TRIM(participation_student.student_id)) = LOWER(TRIM(ar.student_id))
+      ON ${attendanceStudentIdsEqualSql("participation_student.student_id", "ar.student_id")}
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
-      ${scope("ar", "LOWER(TRIM(ar.student_id))")}
+      ${scope("ar", attendanceStudentKeySql("ar.student_id"))}
       AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
       AND NULLIF(TRIM(ar.student_id), '') IS NOT NULL
       AND ${getStudentEventOverrideExclusionSql(
@@ -2549,12 +2598,12 @@ function attendanceEventParticipationCteSql(scoped = false) {
     SELECT DISTINCT
       mar.school_year_id,
       mar.event_id,
-      LOWER(TRIM(mar.student_id)) AS normalized_student_id
+      ${attendanceStudentKeySql("mar.student_id")} AS normalized_student_id
     FROM manual_attendance_records mar
     LEFT JOIN students participation_manual_student
-      ON LOWER(TRIM(participation_manual_student.student_id)) = LOWER(TRIM(mar.student_id))
+      ON ${attendanceStudentIdsEqualSql("participation_manual_student.student_id", "mar.student_id")}
     WHERE mar.event_id IS NOT NULL
-      ${scope("mar", "LOWER(TRIM(mar.student_id))")}
+      ${scope("mar", attendanceStudentKeySql("mar.student_id"))}
       AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
       AND NULLIF(TRIM(mar.student_id), '') IS NOT NULL
@@ -2572,10 +2621,10 @@ function attendanceEventParticipationCteSql(scoped = false) {
     SELECT DISTINCT
       correction.school_year_id,
       correction.event_id,
-      correction.student_key AS normalized_student_id
+      ${attendanceStudentKeySql("correction.student_key")} AS normalized_student_id
     FROM attendance_student_event_overrides correction
     WHERE correction.attended = TRUE
-      ${scope("correction", "correction.student_key")}
+      ${scope("correction", attendanceStudentKeySql("correction.student_key"))}
   )
 `;
 }
@@ -2953,7 +3002,10 @@ export async function syncAbsencesForStudents(
   const uniqueStudentIds = Array.from(
     new Set(
       studentIds
-        .map((studentId) => cleanText(studentId).toLowerCase())
+        .map((studentId) => {
+          const key = normalizeStudentNumberKey(studentId);
+          return /^TC-\d{2}-[A-Z]-\d{5}$/.test(key) ? key.toLowerCase() : cleanText(studentId).toLowerCase();
+        })
         .filter(Boolean),
     ),
   );
@@ -2985,14 +3037,14 @@ export async function syncAbsencesForStudents(
       ${rosterCte},
       student_scope AS ${scoped ? "MATERIALIZED " : ""}(
         SELECT DISTINCT
-          LOWER(TRIM(ar.student_id)) AS student_key,
+          ${attendanceStudentKeySql("ar.student_id")} AS student_key,
           ar.school_year_id,
           ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key,
           ${getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id")} AS year_level_key
         FROM attendance_records ar
         WHERE ar.deleted_at IS NULL
           AND ar.event_id IS NOT NULL
-          AND LOWER(TRIM(ar.student_id)) = ANY($1::TEXT[])
+          AND ${attendanceStudentKeySql("ar.student_id")} = ANY($1::TEXT[])
           AND ${scoped ? "ar.school_year_id = $2::uuid" : "($2::uuid IS NULL OR ar.school_year_id = $2::uuid)"}
       ),
       student_absences AS ${scoped ? "MATERIALIZED " : ""}(
@@ -3016,7 +3068,7 @@ export async function syncAbsencesForStudents(
            "ss.college_key",
          )}
         LEFT JOIN event_participation attended
-          ON attended.normalized_student_id = ss.student_key
+          ON ${attendanceStudentIdsEqualSql("attended.normalized_student_id", "ss.student_key")}
           AND attended.event_id = roster.event_id
           AND attended.school_year_id ${scoped ? "=" : "IS NOT DISTINCT FROM"} ss.school_year_id
         GROUP BY ss.student_key, ss.college_key, ss.year_level_key, ss.school_year_id
@@ -3029,12 +3081,12 @@ export async function syncAbsencesForStudents(
           sa.school_year_id
         FROM attendance_records ar
         JOIN student_absences sa
-          ON LOWER(TRIM(ar.student_id)) = sa.student_key
+          ON ${attendanceStudentIdsEqualSql("ar.student_id", "sa.student_key")}
          AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} = sa.college_key
          AND ar.school_year_id ${scoped ? "=" : "IS NOT DISTINCT FROM"} sa.school_year_id
         WHERE ar.deleted_at IS NULL
           AND ar.event_id IS NOT NULL
-          ${scoped ? "AND ar.school_year_id = $2::uuid AND LOWER(TRIM(ar.student_id)) = ANY($1::text[])" : ""}
+          ${scoped ? `AND ar.school_year_id = $2::uuid AND ${attendanceStudentKeySql("ar.student_id")} = ANY($1::text[])` : ""}
         ORDER BY ar.id
         FOR UPDATE OF ar
       )
@@ -3946,9 +3998,9 @@ async function saveAttendanceRowsWithClient(
       continue;
     }
 
-    if (row.masterlist_status === "unmatched") {
+    if (row.studentId && row.name && row.masterlist_status === "unmatched") {
       await upsertMasterlistStudent(client, event.school_year_id ?? resolvedSchoolYearId, row);
-    } else if (!row.masterlist_status || row.masterlist_status === "no_masterlist") {
+    } else if (row.studentId && row.name && (!row.masterlist_status || row.masterlist_status === "no_masterlist")) {
       await upsertStudent(client, row);
     }
     const record = await insertAttendanceRecord(
@@ -7756,16 +7808,16 @@ export function getDenominatorEventScopeCtesSql() {
         SELECT DISTINCT
           ar.school_year_id,
           COALESCE(ar.event_id, ai.event_id) AS event_id,
-          LOWER(TRIM(ar.student_id)) AS normalized_student_id
+          ${attendanceStudentKeySql("ar.student_id")} AS normalized_student_id
         FROM attendance_records ar
         LEFT JOIN attendance_imports ai
           ON ai.id = ar.import_id
          AND ai.deleted_at IS NULL
         LEFT JOIN canonical_students participation_student
-          ON LOWER(TRIM(participation_student.student_id)) = LOWER(TRIM(ar.student_id))
+          ON ${attendanceStudentIdsEqualSql("participation_student.student_id", "ar.student_id")}
         LEFT JOIN calculation_resolved_year_levels participation_year_level
           ON participation_year_level.school_year_id IS NOT DISTINCT FROM ar.school_year_id
-         AND participation_year_level.normalized_student_id = LOWER(TRIM(ar.student_id))
+         AND participation_year_level.normalized_student_id = ${attendanceStudentKeySql("ar.student_id")}
         WHERE ${getAttendanceRecordVisibilitySql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
           AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
@@ -7784,13 +7836,13 @@ export function getDenominatorEventScopeCtesSql() {
         SELECT DISTINCT
           mar.school_year_id,
           mar.event_id,
-          LOWER(TRIM(mar.student_id)) AS normalized_student_id
+          ${attendanceStudentKeySql("mar.student_id")} AS normalized_student_id
         FROM manual_attendance_records mar
         LEFT JOIN canonical_students participation_manual_student
-          ON LOWER(TRIM(participation_manual_student.student_id)) = LOWER(TRIM(mar.student_id))
+          ON ${attendanceStudentIdsEqualSql("participation_manual_student.student_id", "mar.student_id")}
         LEFT JOIN calculation_resolved_year_levels participation_manual_year_level
           ON participation_manual_year_level.school_year_id IS NOT DISTINCT FROM mar.school_year_id
-         AND participation_manual_year_level.normalized_student_id = LOWER(TRIM(mar.student_id))
+         AND participation_manual_year_level.normalized_student_id = ${attendanceStudentKeySql("mar.student_id")}
         WHERE mar.event_id IS NOT NULL
           AND ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
           AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
@@ -7810,7 +7862,7 @@ export function getDenominatorEventScopeCtesSql() {
         SELECT DISTINCT
           correction.school_year_id,
           correction.event_id,
-          correction.student_key AS normalized_student_id
+          ${attendanceStudentKeySql("correction.student_key")} AS normalized_student_id
         FROM attendance_student_event_overrides correction
         WHERE correction.attended = TRUE
           AND ($1::uuid IS NULL OR correction.school_year_id = $1::uuid)
@@ -8217,7 +8269,7 @@ async function refreshCalculationResultsWithClient(
          )}
         LEFT JOIN event_participation participation
           ON participation.school_year_id IS NOT DISTINCT FROM student.school_year_id
-         AND participation.normalized_student_id = student.normalized_student_id
+         AND ${attendanceStudentIdsEqualSql("participation.normalized_student_id", "student.normalized_student_id")}
          AND participation.event_id = roster.event_id
         GROUP BY student.school_year_id, student.normalized_student_id
       ), selected_import_ids AS (
@@ -10220,7 +10272,7 @@ async function refreshAttendanceFinalResultsWithClient(
          )}
         LEFT JOIN event_participation participation
           ON participation.school_year_id IS NOT DISTINCT FROM student.school_year_id
-         AND participation.normalized_student_id = student.normalized_student_id
+         AND ${attendanceStudentIdsEqualSql("participation.normalized_student_id", "student.normalized_student_id")}
          AND participation.event_id = roster.event_id
         GROUP BY student.school_year_id, student.normalized_student_id
       ), uncorrected_merged AS (
@@ -11589,7 +11641,7 @@ export async function listAttendanceFinalResults(
         JOIN attendance_events expected_event ON expected_event.id = roster.event_id
         LEFT JOIN attendance_student_event_overrides correction
           ON correction.school_year_id IS NOT DISTINCT FROM afr.school_year_id
-         AND correction.student_key = LOWER(TRIM(afr.student_id))
+         AND ${attendanceStudentIdsEqualSql("correction.student_key", "afr.student_id")}
          AND correction.event_id = roster.event_id
         WHERE roster.school_year_id IS NOT DISTINCT FROM afr.school_year_id
           AND roster.college_key = afr.college_key
@@ -11611,14 +11663,14 @@ export async function listAttendanceFinalResults(
                  AND attended_import.deleted_at IS NULL
                 WHERE ${getAttendanceRecordVisibilitySql("attended_record")}
                   AND attended_record.school_year_id IS NOT DISTINCT FROM afr.school_year_id
-                  AND LOWER(TRIM(attended_record.student_id)) = LOWER(TRIM(afr.student_id))
+                  AND ${attendanceStudentIdsEqualSql("attended_record.student_id", "afr.student_id")}
                   AND COALESCE(attended_record.event_id, attended_import.event_id) = roster.event_id
               )
               AND NOT EXISTS (
                 SELECT 1
                 FROM manual_attendance_records attended_manual
                 WHERE attended_manual.school_year_id IS NOT DISTINCT FROM afr.school_year_id
-                  AND LOWER(TRIM(attended_manual.student_id)) = LOWER(TRIM(afr.student_id))
+                  AND ${attendanceStudentIdsEqualSql("attended_manual.student_id", "afr.student_id")}
                   AND attended_manual.event_id = roster.event_id
                   AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
                   AND LOWER(TRIM(COALESCE(attended_manual.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
@@ -11699,7 +11751,7 @@ export async function listAttendanceFinalResults(
           )}
         LEFT JOIN attendance_student_event_overrides correction
           ON correction.school_year_id ${eventRosterParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
-         AND correction.student_key = LOWER(TRIM(afr.student_id))
+         AND ${attendanceStudentIdsEqualSql("correction.student_key", "afr.student_id")}
          AND correction.event_id = roster.event_id
         LEFT JOIN LATERAL (
           SELECT source_record.source,
@@ -11718,7 +11770,7 @@ export async function listAttendanceFinalResults(
              AND attended_import.deleted_at IS NULL
             WHERE ${getAttendanceRecordVisibilitySql("attended_record")}
               AND attended_record.school_year_id ${eventRosterParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
-              AND LOWER(TRIM(attended_record.student_id)) = LOWER(TRIM(afr.student_id))
+              AND ${attendanceStudentIdsEqualSql("attended_record.student_id", "afr.student_id")}
               AND COALESCE(attended_record.event_id, attended_import.event_id) = roster.event_id
 
             UNION ALL
@@ -11730,7 +11782,7 @@ export async function listAttendanceFinalResults(
               attended_manual.remarks
             FROM manual_attendance_records attended_manual
             WHERE attended_manual.school_year_id ${eventRosterParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
-              AND LOWER(TRIM(attended_manual.student_id)) = LOWER(TRIM(afr.student_id))
+              AND ${attendanceStudentIdsEqualSql("attended_manual.student_id", "afr.student_id")}
               AND attended_manual.event_id = roster.event_id
               AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
               AND LOWER(TRIM(COALESCE(attended_manual.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')

@@ -152,6 +152,10 @@ async function runMigrations() {
       await withTransaction(async (client) => {
         migrationTask.update(file, "Executing SQL changes");
         await client.query(sql);
+        if (file === "047_repair_upload_attendance_matching.sql") {
+          const { repairUploadAttendanceMatchingWithClient } = await import("../../services/masterlist.service");
+          await repairUploadAttendanceMatchingWithClient(client);
+        }
 
         migrationTask.update(file, "Recording migration in schema_migrations");
         await registerMigration(file, client);
