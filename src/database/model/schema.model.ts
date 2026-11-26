@@ -165,6 +165,8 @@ export type AttendanceRecord = {
   delete_reason: string | null;
   created_at: Date;
   updated_at: Date;
+  masterlist_status?: MasterlistStatus | null;
+  masterlist_original?: ParsedAttendanceRow["masterlist_original"] | null;
 };
 
 export type AttendanceRequestEventRecord = {
@@ -222,6 +224,8 @@ export type ManualAttendanceRecord = {
   scanned_at: Date | string | null;
   created_at: Date;
   updated_at: Date;
+  masterlist_status?: MasterlistStatus | null;
+  masterlist_original?: ParsedAttendanceRow["masterlist_original"] | null;
 };
 
 export type AttendanceFinalResultRecord = {
@@ -385,7 +389,7 @@ export type StudentMasterlistImportRecord = {
 
 export type ParsedAttendanceRow = AttendanceImportInput & {
   masterlist_status?: MasterlistStatus;
-  masterlist_original?: { studentId: string; name: string };
+  masterlist_original?: { studentId: string; name: string; college?: string; program?: string; yearLevel?: string };
   // Derived by the server from reviewed row assignments; never trusted from the source workbook.
   eventForceCreate?: boolean;
   rowNumber: number;

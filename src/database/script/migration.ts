@@ -152,7 +152,9 @@ async function runMigrations() {
       await withTransaction(async (client) => {
         migrationTask.update(file, "Executing SQL changes");
         await client.query(sql);
-        if (file === "047_repair_upload_attendance_matching.sql") {
+        // The current repair requires the audit columns added in 048. On a
+        // fresh installation 048 supersedes the earlier TypeScript repair.
+        if (file === "048_reconcile_attendance_presence.sql") {
           const { repairUploadAttendanceMatchingWithClient } = await import("../../services/masterlist.service");
           await repairUploadAttendanceMatchingWithClient(client, (progress) => {
             migrationTask.update(file, `${Math.floor(progress.percent)}% • ${progress.message}`);

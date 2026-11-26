@@ -4,17 +4,17 @@ const fullStudentNumber = /^(?:TC-?)?([0-9O]{2})-?([A-Z])-?([0-9O]+)$/;
 
 export function normalizeStudentNumberKey(value: unknown): string {
   const text = cleanStudentNumber(value);
-  const match = /^[0-9O]{1,5}$/.test(text) ? null : fullStudentNumber.exec(text);
-  return match && match[3].length <= 5
-    ? `TC-${digits(match[1])}-${match[2]}-${digits(match[3]).padStart(5, "0")}`
+  const match = /^[0-9O]+$/.test(text) ? null : fullStudentNumber.exec(text);
+  return match && digits(match[3]).replace(/^0+(?=\d)/, "").length <= 5
+    ? `TC-${digits(match[1])}-${match[2]}-${digits(match[3]).replace(/^0+(?=\d)/, "").padStart(5, "0")}`
     : text.replace(/[^A-Z0-9-]/g, "");
 }
 
 export type StudentNumberParts = { year?: string; letter?: string; serial: string };
 function rawStudentNumberParts(value: unknown): StudentNumberParts | null {
   const text = cleanStudentNumber(value);
-  const full = /^[0-9O]{1,5}$/.test(text) ? null : fullStudentNumber.exec(text);
-  const serial = (value: string) => digits(value).slice(-5).padStart(5, "0");
+  const full = /^[0-9O]+$/.test(text) ? null : fullStudentNumber.exec(text);
+  const serial = (value: string) => digits(value).replace(/^0+(?=\d)/, "").padStart(5, "0");
   if (full) return { year: digits(full[1]), letter: full[2], serial: serial(full[3]) };
   const partial = /^(?:TC-?([0-9O]{2})-?|([0-9O]{2})-)([0-9O]+)$/.exec(text);
   if (partial) return { year: digits(partial[1] ?? partial[2]), serial: serial(partial[3]) };
@@ -75,7 +75,7 @@ export const nameTokens = (key: string) => [...new Set(key.split(" ").filter(Boo
 // At most one insertion, deletion or substitution; short tokens must match exactly.
 export function nameTokensAgree(a: string, b: string): boolean {
   if (a === b) return true;
-  if (Math.min(a.length, b.length) < 4 || Math.abs(a.length - b.length) > 1) return false;
+  if (Math.min(a.length, b.length) < 3 || Math.abs(a.length - b.length) > 1) return false;
   if (a.length > b.length) [a, b] = [b, a];
   let i = 0, j = 0, edits = 0;
   while (i < a.length && j < b.length) {
@@ -111,20 +111,58 @@ export function nameKeysAgree(left: string, right: string): boolean {
 
 // Deletion signatures index exact and one-edit candidates; verify with nameKeysAgree.
 export function nameTokenSignatures(token: string): string[] {
-  return token.length < 4 ? [token] : [token, ...Array.from({ length: token.length }, (_, i) => token.slice(0, i) + token.slice(i + 1))];
+  return token.length < 3 ? [token] : [token, ...Array.from({ length: token.length }, (_, i) => token.slice(0, i) + token.slice(i + 1))];
+}
+
+export function masterlistNameSignatures(value: unknown): string[] {
+  const tokens = orderedNameTokens(value);
+  const signatures = new Set<string>();
+  for (let i = 0; i < tokens.length; i++) {
+    for (let end = i + 1; end <= tokens.length; end++) {
+      for (const signature of nameTokenSignatures(tokens.slice(i, end).join(""))) signatures.add(signature);
+    }
+  }
+  return [...signatures];
+}
+
+// A surname must be present, together with at least one given name. Compare
+// both exact and single-edit forms, without trusting QR college/program fields.
+export function masterlistNameMatchRank(name: unknown, surname: unknown, givenName: unknown): number {
+  const uploaded = orderedNameTokens(name);
+  const family = orderedNameTokens(surname);
+  const given = orderedNameTokens(givenName);
+  if (!family.length || !given.length || uploaded.length < 2) return 0;
+  const familyKey = family.join("");
+  let best = 0;
+  for (let start = 0; start < uploaded.length; start++) {
+    for (let end = start + 1; end <= uploaded.length; end++) {
+      const candidate = uploaded.slice(start, end).join("");
+      const familyExact = candidate === familyKey;
+      if (!familyExact && !nameTokensAgree(candidate, familyKey)) continue;
+      const rest = [...uploaded.slice(0, start), ...uploaded.slice(end)];
+      if (!rest.length) continue;
+      const left = rest.join(" "), right = given.join(" ");
+      const shorter = Math.min(rest.length, given.length);
+      const exact = rest.join("") === given.join("") ||
+        rest.every(t => given.includes(t)) || given.every(t => rest.includes(t));
+      const fuzzy = sharedNameTokenCount(left, right) === shorter;
+      if (familyExact && exact) best = Math.max(best, 2);
+      else if ((familyExact && fuzzy) || (!familyExact && exact)) best = Math.max(best, 1);
+    }
+  }
+  return best;
 }
 
 export const cleanProgram = (value: unknown) => String(value ?? "").trim().replace(/[-\s]+$/, "");
 export const normalizeProgram = (value: unknown) => cleanProgram(value).toUpperCase().replace(/\s+/g, " ").replace(/\s*-\s*/g, "-");
 export function collegeForProgram(value: unknown): string | null {
-  const p = normalizeProgram(value);
-  const bs = "BACHELOR OF SCIENCE IN ";
-  if (p === bs + "AGRICULTURAL AND BIOSYSTEMS ENGINEERING") return "School of Engineering";
-  if (["BUSINESS ADMINISTRATION-FINANCIAL MANAGEMENT", "AGRIBUSINESS", "AGRIBUSINESS MANAGEMENT", "HOSPITALITY MANAGEMENT"].some(x => p === bs + x)) return "College of Business Administration";
-  if (["BACHELOR OF ELEMENTARY EDUCATION", "BACHELOR OF PHYSICAL EDUCATION", ...["ENGLISH", "FILIPINO", "MATHEMATICS", "SOCIAL STUDIES"].map(x => `BACHELOR OF SECONDARY EDUCATION-${x}`)].includes(p)) return "College of Teacher Education";
-  if (["COMPUTER SCIENCE", "INFORMATION SYSTEMS"].some(x => p === bs + x)) return "College of Computing Studies";
-  if (p.startsWith(bs + "AGRICULTURE") || p === bs + "FORESTRY") return "College of Agriculture and Forestry";
-  if (p === "BACHELOR OF ARTS IN ENGLISH LANGUAGE STUDIES") return "College of Liberal Arts, Mathematics and Sciences";
-  if (p === bs + "CRIMINOLOGY") return "School of Criminal Justice Education";
+  const p = normalizeProgram(value).replace(/[^A-Z0-9]/g, "");
+  if (/^(?:BS)?(?:AGRICULTURAL(?:AND)?BIOSYSTEMSENGINEERING|AGRICULTURALENGINEERING|ABE)$/.test(p) || /^(?:BACHELOROFSCIENCEIN)AGRICULTURAL(?:AND)?BIOSYSTEMSENGINEERING$/.test(p) || p === "BSABE") return "School of Engineering";
+  if (/^(?:BSBA|BSAB|BSHM|BSABM)(?:FINANCIALMANAGEMENT)?$/.test(p) || /^(?:BACHELOROFSCIENCEIN|BS)(?:BUSINESSADMINISTRATION|AGRIBUSINESS|HOSPITALITYMANAGEMENT)/.test(p)) return "College of Business Administration";
+  if (/^(?:BSED|BEED|BPED|BPE|BACHELOROFSECONDARYEDUCATION|BACHELOROFELEMENTARYEDUCATION|BACHELOROFPHYSICALEDUCATION)/.test(p)) return "College of Teacher Education";
+  if (/^(?:BSCS|BSIS|BSIT|(?:BACHELOROFSCIENCEIN|BS)(?:COMPUTERSCIENCE|INFORMATIONSYSTEMS|INFORMATIONTECHNOLOGY))$/.test(p)) return "College of Computing Studies";
+  if (/^(?:BSA|BSF|(?:BACHELOROFSCIENCEIN|BS)(?:AGRICULTURE|FORESTRY))/.test(p)) return "College of Agriculture and Forestry";
+  if (/^(?:BAELS|BAENGLISHLANGUAGESTUDIES|BACHELOROFARTSINENGLISHLANGUAGESTUDIES)$/.test(p)) return "College of Liberal Arts, Mathematics and Sciences";
+  if (/^(?:BSCrim|BSCRIM|BSCRIMINOLOGY|BACHELOROFSCIENCEINCRIMINOLOGY)$/.test(p)) return "School of Criminal Justice Education";
   return null;
 }
