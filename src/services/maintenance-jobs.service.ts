@@ -1,4 +1,4 @@
-import { attendanceMaintenanceHandler } from "./attendance-maintenance.service";
+import { attendanceMaintenanceHandler, smallerEventRefreshCursor } from "./attendance-maintenance.service";
 import { randomUUID } from "node:crypto";
 import { setImmediate, setTimeout } from "node:timers/promises";
 import type { PoolClient } from "pg";
@@ -91,7 +91,7 @@ export async function runJob(id: string, onProgress?: (progress: MasterlistProgr
         });
       } catch (error) {
         const code = (error as {code?:string})?.code;
-        const smaller = code === "57014" ? smallerMasterlistRefreshCursor(job) : null;
+        const smaller = code === "57014" ? (smallerMasterlistRefreshCursor(job) ?? smallerEventRefreshCursor(job)) : null;
         if (smaller && !isCancelled()) {
           const message = `Database query timed out. Retrying this checkpoint with ${smaller.refreshBatchSize} student keys per batch.`;
           // The failed transaction was rolled back. Only save the reduced batch

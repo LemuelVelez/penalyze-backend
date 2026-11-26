@@ -192,7 +192,13 @@ async function runAttendanceMaintenance<T>(req:Request,res:Response,kind:string,
   const timer=setInterval(()=>{if(!res.destroyed&&!res.writableEnded)res.write("\n");},15000);timer.unref();
   try {
     return await runSubmittedJob<T>(kind,schoolYearId,{operation,body,finalResultId},actor,progress=>{
-      const stage=progress.stage === "finalizing" && progress.percent<50 ? operation === "remove" ? "removing_exemptions" : kind === "manual_batch" ? "saving_events" : kind === "final_result_event_batch" ? "saving_override" : "saving_exemptions" : progress.stage;
+      const stage=kind === "final_result_event_batch"
+        ? progress.message.startsWith("Waiting for another") ? "waiting_for_lock"
+          : progress.stage === "parsing" ? "validating"
+          : progress.stage === "reconciling_records" ? "saving_override"
+          : progress.stage === "syncing_absences" ? "saving_override"
+          : progress.stage === "finalizing" ? "committing" : progress.stage
+        : progress.stage === "finalizing" && progress.percent<50 ? operation === "remove" ? "removing_exemptions" : kind === "manual_batch" ? "saving_events" : "saving_exemptions" : progress.stage;
       writeProgressStreamMessage(res,{type:"progress",progress:{...progress,stage,completed:progress.processed}});
     },()=>req.aborted||res.destroyed||res.writableEnded);
   } finally {clearInterval(timer);}
@@ -1113,7 +1119,14 @@ export async function finalResults(
   try {
     const limit = Math.min(200, toPositiveInt(req.query.limit, 100));
     const offset = toPositiveInt(req.query.offset, 0);
+    const eventDetailsCursor = typeof req.query.eventDetailsCursor === "string" ? req.query.eventDetailsCursor : undefined;
+    if (eventDetailsCursor && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(eventDetailsCursor)) {
+      res.status(400).json({message:"Invalid event details cursor."});
+      return;
+    }
     const records = await listAttendanceFinalResults({
+      eventDetailsCursor,
+      eventDetailsPageSize: req.query.eventDetailsPageSize === undefined ? undefined : Math.min(25, Math.max(1, toPositiveInt(req.query.eventDetailsPageSize,8))),
       schoolYearId: req.query.schoolYearId
         ? String(req.query.schoolYearId).trim()
         : undefined,

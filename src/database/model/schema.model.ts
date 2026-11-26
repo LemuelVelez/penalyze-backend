@@ -257,6 +257,7 @@ export type AttendanceFinalResultRecord = {
     event_start_at: Date | string | null;
     event_end_at: Date | string | null;
   }>;
+  event_details_page?: { nextCursor: string | null; scanned: number; total: number };
   event_details?: Array<{
     id: string;
     name: string;

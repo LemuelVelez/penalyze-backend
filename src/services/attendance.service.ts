@@ -2742,7 +2742,18 @@ const ATTENDANCE_EVENT_PARTICIPATION_CTE_SQL = attendanceEventParticipationCteSq
 export function attendanceEventRosterScopeCteSql(schoolYearParam?: string, eventIdsParam?: string) {
   const scope = (alias: string) => schoolYearParam ? `AND ${alias}.school_year_id = ${schoolYearParam}::uuid` : "";
   const eventScope = (eventSql: string) => eventIdsParam ? `AND ${eventSql} = ANY(${eventIdsParam}::uuid[])` : "";
+  // A constant scope gate lets PostgreSQL skip the legacy correlated profile
+  // lookups entirely for an authoritative masterlist school year.
+  const active = "(SELECT active FROM roster_scope_mode)";
+  const legacyGate = schoolYearParam ? `AND NOT ${active}` : "";
+  const prefix = schoolYearParam ? `roster_scope_mode AS MATERIALIZED (
+    SELECT ${hasMasterlistScopeSql(`${schoolYearParam}::uuid`)} AS active
+  ), ${masterlistRosterSourcesSql(schoolYearParam, eventIdsParam, active)},` : "";
+  const fastRoster = schoolYearParam ? `
+    UNION SELECT school_year_id, event_id, college_key FROM masterlist_event_sources WHERE college_key IS NOT NULL
+    UNION SELECT school_year_id, event_id, college_key FROM masterlist_override_events WHERE college_key IS NOT NULL` : "";
   return `
+  ${prefix}
   event_roster_scope AS ${schoolYearParam ? "MATERIALIZED " : ""}(
     SELECT DISTINCT
       ar.school_year_id,
@@ -2753,7 +2764,7 @@ export function attendanceEventRosterScopeCteSql(schoolYearParam?: string, event
       ON ai.id = ar.import_id
      AND ai.deleted_at IS NULL
     WHERE ${getAttendanceRecordVisibilitySql("ar")} AND ${resolvedAttendanceSourceSql("ar")}
-      ${scope("ar")}
+      ${scope("ar")} ${legacyGate}
       ${eventScope("COALESCE(ar.event_id, ai.event_id)")}
       AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
       AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} IS NOT NULL
@@ -2771,7 +2782,7 @@ export function attendanceEventRosterScopeCteSql(schoolYearParam?: string, event
       ${MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL} AS college_key
     FROM manual_attendance_records mar
     WHERE ${resolvedAttendanceSourceSql("mar")} AND mar.event_id IS NOT NULL
-      ${scope("mar")}
+      ${scope("mar")} ${legacyGate}
       ${eventScope("mar.event_id")}
       AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
@@ -2791,8 +2802,9 @@ export function attendanceEventRosterScopeCteSql(schoolYearParam?: string, event
     WHERE correction.attended = TRUE AND ${hasMasterlistScopeSql("correction.school_year_id")}
       AND ${getCanonicalCollegeKeySql("override_ml", "override_ml")} IS NOT NULL
       AND ${getEventStudentExemptionFilterSql("correction.event_id", "override_ml.year_level_key", getCanonicalCollegeKeySql("override_ml", "override_ml"))}
-      ${scope("correction")}
+      ${scope("correction")} ${legacyGate}
       ${eventScope("correction.event_id")}
+    ${fastRoster}
   )
 `;
 }
@@ -8163,7 +8175,8 @@ function masterlistRefreshYearLevels(parameter: string) {
   )`;
 }
 
-function masterlistRefreshDenominator(parameter: string) {
+function masterlistRosterSourcesSql(schoolYearParam: string, eventIdsParam?: string, activeGate = "TRUE") {
+  const eventFilter = (event: string) => eventIdsParam ? `AND ${event} = ANY(${eventIdsParam}::uuid[])` : "";
   const college = getCanonicalCollegeKeySql("ml", "ml");
   const matched = (alias: string) => `${alias}.masterlist_status IN ('matched_by_id', 'matched_by_partial_id', 'matched_by_name', 'id_name_mismatch')`;
   return `masterlist_event_sources AS MATERIALIZED (
@@ -8173,7 +8186,7 @@ function masterlistRefreshDenominator(parameter: string) {
     JOIN student_masterlist ml ON ml.school_year_id = ar.school_year_id
       AND ml.student_number_key = public.masterlist_student_number_key(ar.student_id)
     LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
-    WHERE ar.school_year_id = $1::uuid AND ${matched("ar")}
+    WHERE ${activeGate} AND ar.school_year_id = ${schoolYearParam}::uuid ${eventFilter("COALESCE(ar.event_id, ai.event_id)")} AND ${matched("ar")}
       AND ${getAttendanceRecordVisibilitySql("ar")}
       AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
       AND ${getEventStudentExemptionFilterSql("COALESCE(ar.event_id, ai.event_id)", "ml.year_level_key", college)}
@@ -8182,7 +8195,7 @@ function masterlistRefreshDenominator(parameter: string) {
     FROM manual_attendance_records mar
     JOIN student_masterlist ml ON ml.school_year_id = mar.school_year_id
       AND ml.student_number_key = public.masterlist_student_number_key(mar.student_id)
-    WHERE mar.school_year_id = $1::uuid AND ${matched("mar")} AND mar.event_id IS NOT NULL
+    WHERE ${activeGate} AND mar.school_year_id = ${schoolYearParam}::uuid ${eventFilter("mar.event_id")} AND ${matched("mar")} AND mar.event_id IS NOT NULL
       AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
       AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
       AND ${getEventStudentExemptionFilterSql("mar.event_id", "ml.year_level_key", college)}
@@ -8191,9 +8204,13 @@ function masterlistRefreshDenominator(parameter: string) {
     FROM attendance_student_event_overrides correction
     JOIN student_masterlist ml ON ml.school_year_id = correction.school_year_id
       AND ml.student_number_key = public.masterlist_student_number_key(correction.student_key)
-    WHERE correction.school_year_id = $1::uuid AND correction.attended = TRUE
+    WHERE ${activeGate} AND correction.school_year_id = ${schoolYearParam}::uuid ${eventFilter("correction.event_id")} AND correction.attended = TRUE
       AND ${getEventStudentExemptionFilterSql("correction.event_id", "ml.year_level_key", college)}
-  ), event_roster_scope AS MATERIALIZED (
+  )`;
+}
+
+function masterlistRefreshDenominator(parameter: string) {
+  return `${masterlistRosterSourcesSql("$1")}, event_roster_scope AS MATERIALIZED (
     SELECT school_year_id, event_id, college_key FROM masterlist_event_sources WHERE college_key IS NOT NULL
     UNION
     SELECT school_year_id, event_id, college_key FROM masterlist_override_events WHERE college_key IS NOT NULL
@@ -10382,6 +10399,8 @@ type AttendanceFinalResultsFilter = {
   college?: string;
   includeMissedEvents?: boolean;
   includeEventDetails?: boolean;
+  eventDetailsCursor?: string;
+  eventDetailsPageSize?: number;
   eventRosterScope?: { college_key: string; event_id: string }[];
   consolidatedOnly?: boolean;
   limit?: number;
@@ -11743,6 +11762,40 @@ export async function writeStudentEventAttendancesWithClient(
   };
 }
 
+// Attendance adjustments cannot introduce a new college event: eligibility was
+// checked before saving. A removed override can, however, remove the last source
+// for an event. In that case refresh all keys in resumable batches.
+export async function planStudentEventRefreshKeys(
+  client: PoolClient,
+  schoolYearId: string,
+  studentId: string,
+  changes: StudentEventAttendanceChange[],
+): Promise<string[] | null> {
+  const scope = await client.query<{ active: boolean }>(`SELECT ${hasMasterlistScopeSql("$1::uuid")} AS active`, [schoolYearId]);
+  if (!scope.rows[0]?.active) return null;
+  const removed = changes.filter(change => !change.attended).map(change => change.eventId);
+  if (removed.length) {
+    const { rows } = await client.query<{ unchanged: boolean }>(`
+      WITH ${attendanceEventRosterScopeCteSql("$1", "$3")}
+      SELECT NOT EXISTS (
+        SELECT 1 FROM unnest($3::uuid[]) AS removed(event_id)
+        WHERE NOT EXISTS (
+          SELECT 1 FROM event_roster_scope roster
+          JOIN student_masterlist ml ON ml.school_year_id = $1::uuid
+            AND ml.student_number_key = public.masterlist_student_number_key($2::text)
+          WHERE roster.event_id = removed.event_id AND roster.college_key = ${getCanonicalCollegeKeySql("ml", "ml")}
+        )
+      ) AS unchanged`, [schoolYearId, studentId, removed]);
+    if (!rows[0]?.unchanged) return prepareMasterlistDerivedRefresh(client, schoolYearId, false);
+  }
+  return [normalizeStudentNumberKey(studentId)];
+}
+
+export async function isMasterlistDerivedRefreshScope(client: PoolClient, schoolYearId: string) {
+  const { rows } = await client.query<{ active: boolean }>(`SELECT ${hasMasterlistScopeSql("$1::uuid")} AS active`, [schoolYearId]);
+  return rows[0]?.active === true;
+}
+
 export async function setStudentEventAttendances(
   finalResultId: string,
   changes: StudentEventAttendanceChange[],
@@ -11942,6 +11995,36 @@ export async function listAttendanceFinalResults(
     eventRosterParam = `$${params.length}`;
   }
 
+  // Candidate IDs are cheap to enumerate, even for old event references whose
+  // school year differs from the source. Page by UUID, not by unstable offset.
+  let detailPageCtes = "";
+  let detailPageSelect = "";
+  let detailPageEventIds: string | undefined;
+  if (options.eventDetailsPageSize !== undefined && options.includeEventDetails && schoolYearParam && options.studentId && options.consolidatedOnly && !eventRosterParam && !options.includeMissedEvents) {
+    const pageSize = Math.min(25, Math.max(1, Math.floor(options.eventDetailsPageSize)));
+    params.push(options.eventDetailsCursor || null);
+    const cursorParam = `$${params.length}`;
+    params.push(pageSize);
+    const sizeParam = `$${params.length}`;
+    detailPageCtes = `detail_event_candidates AS MATERIALIZED (
+      SELECT COALESCE(ar.event_id, ai.event_id) AS id FROM attendance_records ar
+      LEFT JOIN attendance_imports ai ON ai.id=ar.import_id AND ai.deleted_at IS NULL
+      WHERE ar.school_year_id=${schoolYearParam}::uuid AND ar.deleted_at IS NULL AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
+      UNION SELECT mar.event_id FROM manual_attendance_records mar WHERE mar.school_year_id=${schoolYearParam}::uuid AND mar.event_id IS NOT NULL
+      UNION SELECT correction.event_id FROM attendance_student_event_overrides correction WHERE correction.school_year_id=${schoolYearParam}::uuid AND correction.attended=TRUE
+    ), detail_event_window AS MATERIALIZED (
+      SELECT id FROM detail_event_candidates WHERE (${cursorParam}::uuid IS NULL OR id>${cursorParam}::uuid) ORDER BY id LIMIT (${sizeParam}::int+1)
+    ), detail_event_page AS MATERIALIZED (
+      SELECT id FROM detail_event_window ORDER BY id LIMIT ${sizeParam}::int
+    ),`;
+    detailPageEventIds = "(ARRAY(SELECT id FROM detail_event_page))";
+    detailPageSelect = `, JSONB_BUILD_OBJECT(
+      'nextCursor', CASE WHEN (SELECT count(*) FROM detail_event_window)>${sizeParam}::int THEN (SELECT id FROM detail_event_page ORDER BY id DESC LIMIT 1) ELSE NULL END,
+      'scanned', (SELECT count(*) FROM detail_event_page),
+      'total', (SELECT count(*) FROM detail_event_candidates)
+    ) AS event_details_page`;
+  }
+
   params.push(options.limit ?? 100);
   const limitPosition = params.length;
 
@@ -11950,8 +12033,9 @@ export async function listAttendanceFinalResults(
 
   const includeMissedEvents = options.includeMissedEvents === true;
   const includeEventDetails = options.includeEventDetails === true;
-  const rosterCteSql = includeMissedEvents
-    ? `WITH ${ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}`
+  const useScopedRoster = Boolean(includeEventDetails && schoolYearParam && !eventRosterParam);
+  const rosterCteSql = includeMissedEvents || useScopedRoster
+    ? `WITH ${detailPageCtes} ${schoolYearParam ? attendanceEventRosterScopeCteSql(schoolYearParam, detailPageEventIds) : ATTENDANCE_EVENT_ROSTER_SCOPE_CTE_SQL}`
     : "";
   const missedEventsSelectSql = includeMissedEvents
     ? `, COALESCE(missed.missed_events, '[]'::jsonb) AS missed_events`
@@ -12040,6 +12124,8 @@ export async function listAttendanceFinalResults(
           ? `(SELECT event_id FROM jsonb_to_recordset(${eventRosterParam}::jsonb)
                AS scope(college_key text, event_id uuid)
              WHERE scope.college_key = afr.college_key)`
+          : useScopedRoster
+          ? `(SELECT event_id FROM event_roster_scope scope WHERE scope.college_key = afr.college_key)`
           : `(
           SELECT DISTINCT
             COALESCE(detail_record.event_id, detail_import.event_id) AS event_id
@@ -12092,7 +12178,7 @@ export async function listAttendanceFinalResults(
             "afr.college_key",
           )}
         LEFT JOIN attendance_student_event_overrides correction
-          ON correction.school_year_id ${eventRosterParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
+          ON correction.school_year_id ${schoolYearParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
          AND ${attendanceStudentIdsEqualSql("correction.student_key", "afr.student_id")}
          AND correction.event_id = roster.event_id
         LEFT JOIN LATERAL (
@@ -12111,7 +12197,7 @@ export async function listAttendanceFinalResults(
               ON attended_import.id = attended_record.import_id
              AND attended_import.deleted_at IS NULL
             WHERE ${getAttendanceRecordVisibilitySql("attended_record")} AND ${resolvedAttendanceSourceSql("attended_record")}
-              AND attended_record.school_year_id ${eventRosterParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
+              AND attended_record.school_year_id ${schoolYearParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
               AND ${attendanceStudentIdsEqualSql("attended_record.student_id", "afr.student_id")}
               AND COALESCE(attended_record.event_id, attended_import.event_id) = roster.event_id
 
@@ -12123,7 +12209,7 @@ export async function listAttendanceFinalResults(
               COALESCE(attended_manual.scanned_at, attended_manual.created_at) AS scanned_at,
               attended_manual.remarks
             FROM manual_attendance_records attended_manual
-            WHERE ${resolvedAttendanceSourceSql("attended_manual")} AND attended_manual.school_year_id ${eventRosterParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
+            WHERE ${resolvedAttendanceSourceSql("attended_manual")} AND attended_manual.school_year_id ${schoolYearParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
               AND ${attendanceStudentIdsEqualSql("attended_manual.student_id", "afr.student_id")}
               AND attended_manual.event_id = roster.event_id
               AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
@@ -12152,6 +12238,7 @@ export async function listAttendanceFinalResults(
         ae.event_end_at
         ${missedEventsSelectSql}
         ${eventDetailsSelectSql}
+        ${detailPageSelect}
       FROM attendance_final_results afr
       LEFT JOIN attendance_imports ai ON ai.id = afr.import_id AND ai.deleted_at IS NULL
       LEFT JOIN attendance_events ae ON ae.id = ai.event_id

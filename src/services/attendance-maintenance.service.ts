@@ -3,13 +3,25 @@ import type { SavedAttendanceImportResult, FineRecord } from "../database/model/
 import { reviewAttendanceRequest, reviewAttendanceRequestGroup } from "./attendance-requests.service";
 import type { PoolClient } from "pg";
 import type { MaintenanceJob } from "../database/model/schema.model";
-import { createEventCollegeExemptions, createEventYearLevelExemptions, deleteEventExemptionsByIds, saveManualAttendanceRecords, writeStudentEventAttendancesWithClient, refreshAttendanceFinalResultsWithClient, refreshCalculationResultsWithClient, refreshPenaltyResultsForSchoolYearWithClient, repairCalculationConsistency, acknowledgeCalculationInputChangesWithClient, resolveUnattachedAttendanceEventIdsWithClient, getCalculationStatus, syncAbsencesForStudents, type MaintenanceRefreshScope, type StudentEventAttendanceChange } from "./attendance.service";
+import { createEventCollegeExemptions, createEventYearLevelExemptions, deleteEventExemptionsByIds, saveManualAttendanceRecords, writeStudentEventAttendancesWithClient, planStudentEventRefreshKeys, isMasterlistDerivedRefreshScope, prepareMasterlistDerivedRefresh, finishMasterlistDerivedRefresh, refreshAttendanceFinalResultsWithClient, refreshCalculationResultsWithClient, refreshPenaltyResultsForSchoolYearWithClient, repairCalculationConsistency, acknowledgeCalculationInputChangesWithClient, resolveUnattachedAttendanceEventIdsWithClient, getCalculationStatus, syncAbsencesForStudents, type MaintenanceRefreshScope, type StudentEventAttendanceChange } from "./attendance.service";
 import type { JobHandler } from "./maintenance-jobs.service";
 
 type DerivedOptions = Parameters<typeof refreshCalculationResultsWithClient>[1] & {importId?:string};
 type RepairOptions = Parameters<typeof repairCalculationConsistency>[0];
 type Input = {operation:string;body:Record<string,unknown>;actor?:RepairOptions["actor"]; finalResultId?:string;requestId?:string};
-type State = { fines?:FineRecord[]; scopes:MaintenanceRefreshScope[]; result?:unknown; scopeIndex:number; offset:number };
+type State = { fines?:FineRecord[]; scopes:MaintenanceRefreshScope[]; result?:unknown; scopeIndex:number; offset:number; refreshKeys?:string[] | null; refreshOffset?:number; refreshPlanPending?:boolean };
+const EVENT_REFRESH_BATCH_SIZE = 50;
+const EVENT_REFRESH_PHASES = ["refresh_final_results", "refresh_calculations", "refresh_penalties"];
+type EventRefreshCursor = { scopeIndex?:number; offset?:number; refreshBatchSize?:number };
+export function smallerEventRefreshCursor(job: MaintenanceJob) {
+  if (job.kind !== "final_result_event_batch" || !EVENT_REFRESH_PHASES.includes(job.phase)) return null;
+  const state = job.state as State;
+  const cursor = job.cursor as EventRefreshCursor;
+  const remaining = (state.refreshKeys?.length ?? 0) - (state.refreshOffset ?? 0);
+  const size = Math.min(cursor.refreshBatchSize ?? EVENT_REFRESH_BATCH_SIZE, remaining);
+  if (size <= 1) return null;
+  return {...cursor,refreshBatchSize:Math.max(1,Math.floor(size/2))};
+}
 const validation = (message:string) => Object.assign(new Error(message),{statusCode:400,expose:true});
 export function attendanceMaintenanceHandler(kind:string):JobHandler {
   return {kind, async plan(_client,job) {
@@ -30,7 +42,12 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
       } else if(kind === "manual_batch") state.result=await saveManualAttendanceRecords(input.body,undefined,primary);
       else if(kind === "final_result_event_batch") {
         const {schoolYearId,...result}=await writeStudentEventAttendancesWithClient(client,input.finalResultId ?? "",input.body.changes as StudentEventAttendanceChange[],job.created_by ?? undefined);
-        state.result=result;if(result.updatedCount)state.scopes.push({schoolYearId});
+        state.result=result;
+        if(result.updatedCount) {
+          state.scopes.push({schoolYearId});
+          state.refreshPlanPending=true;
+          state.refreshOffset=0;
+        }
       } else if(kind === "attendance_import_save") {
         if(input.operation === "files")state.result=await savePreparedAttendanceFilesWithClient(client,input.body as unknown as PreparedAttendanceFiles,undefined,true);
         else {
@@ -64,6 +81,9 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
         if(input.operation==="files"){const batch=state.result as AttendanceBatchSaveResult;batch.finesCreated=imports.reduce((sum,item)=>sum+item.createdFines.length,0);batch.syncWarnings=[];}
         else (state.result as SavedAttendanceImportResult).syncWarnings=[];
       }
+      if(kind === "final_result_event_batch" && state.result && typeof state.result === "object") {
+        state.result={...state.result,requiresTableRefresh:state.scopes.length>0 && (state.refreshKeys === null || (state.refreshKeys?.length??0)>1)};
+      }
       done=true;percent=100;message="Attendance operation completed.";
     }
     else {
@@ -76,6 +96,46 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
         state.offset+=chunk.length;
         percent=25+25*(ids.length ? state.offset/ids.length : 1);message=`Absences synchronized: ${state.offset} / ${ids.length}`;
         if(state.offset>=ids.length){if(scope.skipRefresh){state.scopeIndex++;state.offset=0;phase=state.scopeIndex<state.scopes.length?"sync_absences":"finalize";}else phase="refresh_final_results";}
+      } else if(kind === "final_result_event_batch" && schoolYearId && EVENT_REFRESH_PHASES.includes(phase) && state.refreshKeys !== null) {
+        const final=phase === "refresh_final_results";
+        const calculations=phase === "refresh_calculations";
+        const start=final?50:calculations?65:80;
+        const end=final?65:calculations?80:95;
+        const label=final?"final attendance results":calculations?"calculations":"penalties";
+        if(state.refreshKeys === undefined) {
+          // Existing paused jobs already committed their overrides. Prepare a
+          // full key list without reapplying the primary write.
+          if(state.refreshPlanPending) {
+            const saved=state.result as Awaited<ReturnType<typeof writeStudentEventAttendancesWithClient>>;
+            state.refreshKeys=await planStudentEventRefreshKeys(client,schoolYearId,saved.studentId,saved.changes.filter(change=>change.updated));
+            delete state.refreshPlanPending;
+          } else {
+            state.refreshKeys=await isMasterlistDerivedRefreshScope(client,schoolYearId)
+              ? await prepareMasterlistDerivedRefresh(client,schoolYearId,false) : null;
+          }
+          state.refreshOffset=0;
+          message=state.refreshKeys === null ? "Preparing legacy attendance refresh." : `Preparing ${label}: ${state.refreshKeys.length} students.`;
+          percent=start;
+        } else {
+          const keys=state.refreshKeys;
+          const offset=state.refreshOffset??0;
+          const batchSize=(job.cursor as EventRefreshCursor).refreshBatchSize??EVENT_REFRESH_BATCH_SIZE;
+          const chunk=keys.slice(offset,offset+batchSize);
+          if(chunk.length) {
+            const opts={schoolYearId,masterlistStudentKeys:chunk,resolveUnattachedEvents:false,logConsistencyViolation:false};
+            if(final) await refreshAttendanceFinalResultsWithClient(client,opts);
+            else if(calculations) await refreshCalculationResultsWithClient(client,opts);
+            else await refreshPenaltyResultsForSchoolYearWithClient(client,schoolYearId,undefined,chunk);
+            state.refreshOffset=offset+chunk.length;
+            percent=start+(end-start)*state.refreshOffset/Math.max(keys.length,1);
+            message=`Refreshed ${label}: ${state.refreshOffset} / ${keys.length} students.`;
+          } else {
+            if(final || calculations) await finishMasterlistDerivedRefresh(client,schoolYearId,final?"attendance_final_results":"calculation_results");
+            phase=final?"refresh_calculations":calculations?"refresh_penalties":"finalize";
+            state.refreshOffset=0;
+            percent=end;message=`Finished ${label}.`;
+          }
+        }
       } else if(phase === "refresh_final_results") {
         const rows=await refreshAttendanceFinalResultsWithClient(client,kind==="derived_refresh"&&input.operation==="final"?{...options,schoolYearId}:{schoolYearId});
         if(kind==="derived_refresh"&&input.operation==="final")state.result=rows;
@@ -88,6 +148,7 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
         state.scopeIndex++;state.offset=0;phase=state.scopeIndex<state.scopes.length?"sync_absences":"finalize";percent=95;message="Penalties refreshed.";
       } else throw validation("Invalid maintenance checkpoint.");
     }
-    return {done,phase,cursor:{scopeIndex:state.scopeIndex,offset:state.offset},state,processed:state.offset,total:state.scopes[state.scopeIndex]?.studentIds?.length ?? 0,percent,message,result:done?state.result:undefined};
+    const refreshCursor=kind === "final_result_event_batch" && phase===job.phase ? {refreshBatchSize:(job.cursor as EventRefreshCursor).refreshBatchSize} : {};
+    return {done,phase,cursor:{scopeIndex:state.scopeIndex,offset:state.offset,...refreshCursor},state,processed:state.refreshOffset??state.offset,total:state.refreshKeys?.length??state.scopes[state.scopeIndex]?.studentIds?.length??0,percent,message,result:done?state.result:undefined};
   }};
 }
