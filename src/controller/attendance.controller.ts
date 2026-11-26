@@ -1,3 +1,4 @@
+import { runSubmittedJob } from "../services/maintenance-jobs.service";
 import { pool } from "../lib/db";
 import { isMasterlistActiveForSchoolYear, masterlistActiveError, MANUAL_ATTENDANCE_MASTERLIST_MESSAGE, ZERO_ATTENDANCE_MASTERLIST_MESSAGE } from "../services/masterlist.service";
 import { NextFunction, Request, Response } from "express";
@@ -46,6 +47,8 @@ import {
   listAttendanceRecords,
   listManualAttendanceRecords,
   previewAttendanceFiles,
+  prepareAttendanceFilesForSave,
+  prepareAttendanceRowsForSave,
   isValidAttendanceUploadCollege,
   previewCalculationResults,
   refreshAttendanceFinalResults,
@@ -67,7 +70,6 @@ import {
 } from "../services/attendance.service";
 import {
   ACCEPTED_ATTENDANCE_EXTENSIONS,
-  AttendanceImportProgress,
 } from "../database/model/schema.model";
 import type { AuthenticatedRequest } from "./auth.controller";
 import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
@@ -76,6 +78,10 @@ const MAX_FILE_SIZE = Number(
   Math.max(1024, Math.min(Number(process.env.ATTENDANCE_UPLOAD_MAX_BYTES ?? 5 * 1024 * 1024) || 5 * 1024 * 1024, 5 * 1024 * 1024)),
 );
 
+function getMaintenanceActor(req: Request) {
+  const user=(req as AuthenticatedRequest).user;
+  return user ? {sub:user.sub,name:user.name,email:user.email,role:user.role} : undefined;
+}
 function getUploadFileExtension(fileName: string) {
   const extension = String(fileName ?? "")
     .trim()
@@ -179,6 +185,18 @@ function getRequestSchoolYearId(req: Request) {
   ).trim();
 }
 
+async function runAttendanceMaintenance<T>(req:Request,res:Response,kind:string,operation:string,body:Record<string,unknown>,finalResultId?:string) {
+  const rawYear=body.schoolYearId ?? body.school_year_id;
+  const schoolYearId=typeof rawYear==="string" && rawYear ? rawYear : null;
+  const actor=getAuthenticatedUserId(req);
+  const timer=setInterval(()=>{if(!res.destroyed&&!res.writableEnded)res.write("\n");},15000);timer.unref();
+  try {
+    return await runSubmittedJob<T>(kind,schoolYearId,{operation,body,finalResultId},actor,progress=>{
+      const stage=progress.stage === "finalizing" && progress.percent<50 ? operation === "remove" ? "removing_exemptions" : kind === "manual_batch" ? "saving_events" : kind === "final_result_event_batch" ? "saving_override" : "saving_exemptions" : progress.stage;
+      writeProgressStreamMessage(res,{type:"progress",progress:{...progress,stage,completed:progress.processed}});
+    },()=>req.aborted||res.destroyed||res.writableEnded);
+  } finally {clearInterval(timer);}
+}
 function getAuthenticatedUserId(req: Request) {
   return (req as AuthenticatedRequest).user?.sub;
 }
@@ -414,13 +432,7 @@ export async function saveEventExemptionsWithProgress(
 ) {
   try {
     prepareProgressStream(res, 201);
-    const data = await createEventCollegeExemptions({
-      ...(req.body ?? {}),
-      createdBy: getAuthenticatedUserId(req),
-      onProgress: (progress) => {
-        writeProgressStreamMessage(res, { type: "progress", progress });
-      },
-    });
+    const data = await runAttendanceMaintenance<Awaited<ReturnType<typeof createEventCollegeExemptions>>>(req,res,"event_exemptions","college",{...(req.body??{}),createdBy:getAuthenticatedUserId(req)});
 
     writeProgressStreamMessage(res, {
       type: "success",
@@ -472,12 +484,7 @@ export async function removeSelectedEventExemptionsWithProgress(
 ) {
   try {
     prepareProgressStream(res, 200);
-    const data = await deleteEventExemptionsByIds({
-      ...(req.body ?? {}),
-      onProgress: (progress) => {
-        writeProgressStreamMessage(res, { type: "progress", progress });
-      },
-    });
+    const data = await runAttendanceMaintenance<Awaited<ReturnType<typeof deleteEventExemptionsByIds>>>(req,res,"event_exemptions","remove",req.body??{});
 
     writeProgressStreamMessage(res, {
       type: "success",
@@ -542,13 +549,7 @@ export async function saveEventYearLevelExemptionsWithProgress(
 ) {
   try {
     prepareProgressStream(res, 201);
-    const data = await createEventYearLevelExemptions({
-      ...(req.body ?? {}),
-      createdBy: getAuthenticatedUserId(req),
-      onProgress: (progress) => {
-        writeProgressStreamMessage(res, { type: "progress", progress });
-      },
-    });
+    const data = await runAttendanceMaintenance<Awaited<ReturnType<typeof createEventYearLevelExemptions>>>(req,res,"event_exemptions","year_level",{...(req.body??{}),createdBy:getAuthenticatedUserId(req)});
 
     writeProgressStreamMessage(res, {
       type: "success",
@@ -785,9 +786,7 @@ export async function manualBatchSaveWithProgress(req: Request, res: Response, n
     prepareProgressStream(res, 200);
     keepAlive = setInterval(() => { if (!res.destroyed && !res.writableEnded) res.write("\n"); }, 15_000);
     keepAlive.unref();
-    const result = await saveManualAttendanceRecords(req.body ?? {}, (stage, percent, message) => {
-      writeProgressStreamMessage(res, { type: "progress", progress: { stage, percent, message } });
-    });
+    const result = await runAttendanceMaintenance<Awaited<ReturnType<typeof saveManualAttendanceRecords>>>(req,res,"manual_batch","save",req.body??{});
     writeProgressStreamMessage(res, { type: "success", message: "Manual attendance saved successfully.", data: result });
     if (!res.destroyed && !res.writableEnded) res.end();
   } catch (error) {
@@ -1008,18 +1007,8 @@ export async function saveImportWithProgress(
         uploadedBy: getAuthenticatedUserId(req),
         isCancelled,
       }));
-      const result = await saveAttendanceFiles(
-        files,
-        fileOptions,
-        (progress) => {
-          if (isCancelled()) {
-            throw Object.assign(new Error("Attendance import was cancelled."), {
-              statusCode: 499,
-            });
-          }
-          writeProgressStreamMessage(res, { type: "progress", progress });
-        },
-      );
+      const prepared=await prepareAttendanceFilesForSave(files,fileOptions.map(({isCancelled:_cancel,...option})=>option));
+      const result=await runSubmittedJob<Awaited<ReturnType<typeof saveAttendanceFiles>>>("attendance_import_save",null,{operation:"files",body:prepared},getAuthenticatedUserId(req),progress=>writeProgressStreamMessage(res,{type:"progress",progress:{stage:progress.percent<25?"saving":"syncing",percent:progress.percent,message:progress.message,processedRows:progress.processed??0,totalRows:progress.total??0,savedRecords:0,createdFines:0}}),isCancelled);
 
       writeProgressStreamMessage(res, {
         type: "success",
@@ -1031,29 +1020,12 @@ export async function saveImportWithProgress(
     }
 
     const eventPayload = getEventPayload(req);
-    const onProgress = (progress: AttendanceImportProgress) => {
-      if (isCancelled()) {
-        throw Object.assign(new Error("Attendance import was cancelled."), {
-          statusCode: 499,
-        });
-      }
-
-      writeProgressStreamMessage(res, { type: "progress", progress });
-    };
-
     if (!isValidAttendanceUploadCollege(eventPayload.college)) {
       res.status(400).json({ message: "Select a college before uploading." });
       return;
     }
-    const result = await saveAttendanceRows({
-      ...eventPayload,
-      uploadedBy: getAuthenticatedUserId(req),
-      fileName: req.body?.fileName ?? "preview-import",
-      fileType: req.body?.fileType ?? "json",
-      rows,
-      onProgress,
-      isCancelled,
-    });
+    const prepared=prepareAttendanceRowsForSave({...eventPayload,uploadedBy:getAuthenticatedUserId(req),fileName:req.body?.fileName??"preview-import",fileType:req.body?.fileType??"json",rows});
+    const result=await runSubmittedJob<Awaited<ReturnType<typeof saveAttendanceRows>>>("attendance_import_save",eventPayload.schoolYearId??null,{operation:"rows",body:prepared},getAuthenticatedUserId(req),progress=>writeProgressStreamMessage(res,{type:"progress",progress:{stage:progress.percent<25?"saving":"syncing",percent:progress.percent,message:progress.message,processedRows:progress.processed??0,totalRows:progress.total??0,savedRecords:0,createdFines:0}}),isCancelled);
 
     writeProgressStreamMessage(res, {
       type: "success",
@@ -1259,12 +1231,7 @@ export async function updateStudentEventAttendancesWithProgress(
     }
 
     prepareProgressStream(res);
-    const result = await setStudentEventAttendances(
-      id,
-      req.body.changes,
-      getAuthenticatedUserId(req),
-      (progress) => writeProgressStreamMessage(res, { type: "progress", progress }),
-    );
+    const result = await runAttendanceMaintenance<Awaited<ReturnType<typeof setStudentEventAttendances>>>(req,res,"final_result_event_batch","save",req.body??{},id);
     writeProgressStreamMessage(res, {
       type: "success",
       message: "Selected student event attendance updated successfully.",
@@ -1372,10 +1339,10 @@ export async function refreshFinalResults(
   next: NextFunction,
 ) {
   try {
-    const records = await refreshAttendanceFinalResults({
+    const records = await runSubmittedJob<Awaited<ReturnType<typeof refreshAttendanceFinalResults>>>("derived_refresh",req.body?.schoolYearId ?? req.body?.school_year_id ?? null,{operation:"final",body:{
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
       importId: req.body?.importId ?? req.body?.import_id,
-    });
+    },actor:getMaintenanceActor(req)},getAuthenticatedUserId(req),undefined,()=>req.aborted||res.destroyed||res.writableEnded);
 
     res.json({ message: "Final attendance results refreshed.", data: records });
   } catch (error) {
@@ -1427,14 +1394,13 @@ export async function repairCalculationConsistencyRows(
   next: NextFunction,
 ) {
   try {
-    const result = await repairCalculationConsistency({
-      actor: req.user,
+    const result = await runSubmittedJob<Awaited<ReturnType<typeof repairCalculationConsistency>>>("derived_refresh",req.body?.schoolYearId ?? req.body?.school_year_id ?? null,{operation:"repair",body:{
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
       importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
       sourceTypes: parseCalculationSourceTypes(
         req.body?.sourceTypes ?? req.body?.source_types,
       ),
-    });
+    },actor:getMaintenanceActor(req)},getAuthenticatedUserId(req),undefined,()=>req.aborted||res.destroyed||res.writableEnded);
     res.json({
       message: result.repaired
         ? "Inconsistent attendance totals were automatically corrected for all affected groups."
@@ -1500,13 +1466,13 @@ export async function refreshCalculationResultRows(
   next: NextFunction,
 ) {
   try {
-    const records = await refreshCalculationResults({
+    const records = await runSubmittedJob<Awaited<ReturnType<typeof refreshCalculationResults>>>("derived_refresh",req.body?.schoolYearId ?? req.body?.school_year_id ?? null,{operation:"calculations",body:{
       schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
       importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
       sourceTypes: parseCalculationSourceTypes(
         req.body?.sourceTypes ?? req.body?.source_types,
       ),
-    });
+    },actor:getMaintenanceActor(req)},getAuthenticatedUserId(req),undefined,()=>req.aborted||res.destroyed||res.writableEnded);
 
     res.json({ message: "Calculation results refreshed.", data: records });
   } catch (error) {

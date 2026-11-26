@@ -1,3 +1,5 @@
+import * as maintenanceJobs from "./controller/maintenance-jobs.controller";
+import { recoverMaintenanceJobs } from "./services/maintenance-jobs.service";
 import * as masterlist from "./controller/masterlist.controller";
 import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
@@ -185,7 +187,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   if (allowed) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader("Access-Control-Expose-Headers", "Retry-After, Content-Disposition");
+    res.setHeader("Access-Control-Expose-Headers", "Retry-After, Content-Disposition, X-Request-ID");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-Penalyze-Request");
@@ -318,6 +320,11 @@ app.delete(
   requireAuth, requireAdmin, removeAttendanceRequestEvent,
 );
 
+app.get("/api/maintenance/jobs", requireAuth, requireAdmin, maintenanceJobs.list);
+app.get("/api/maintenance/jobs/:id", requireAuth, requireAdmin, maintenanceJobs.get);
+app.post("/api/maintenance/jobs", requireAuth, requireAdmin, maintenanceJobs.create);
+app.post("/api/maintenance/jobs/:id/run/progress", requireAuth, requireAdmin, maintenanceJobs.run);
+app.post("/api/maintenance/jobs/:id/cancel", requireAuth, requireAdmin, maintenanceJobs.cancel);
 app.post("/api/masterlist/upload", requireAuth, requireAdmin, masterlistUpload.single("file"), masterlist.upload);
 app.post("/api/masterlist/upload/progress", requireAuth, requireAdmin, masterlistUpload.single("file"), masterlist.uploadWithProgress);
 app.post("/api/masterlist/upload/resume/progress", requireAuth, requireAdmin, masterlist.resumeUploadWithProgress);
@@ -549,9 +556,10 @@ app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
     "55P03": 503,
     "57014": 503,
   };
-  const safeStatus = raw?.code && Object.prototype.hasOwnProperty.call(databaseStatuses, raw.code)
+  const transientDatabaseError = new Set(["53300", "57P01", "57P03", "08000", "08003", "08006", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT"]).has(raw?.code ?? "") || /timeout exceeded when trying to connect|connection terminated/i.test(raw?.message ?? "");
+  const safeStatus = transientDatabaseError ? 503 : raw?.code && Object.prototype.hasOwnProperty.call(databaseStatuses, raw.code)
     ? databaseStatuses[raw.code]
-    : status >= 400 && status < 500 ? status : 500;
+    : status >= 400 && status < 500 ? status : status === 503 && raw?.expose ? 503 : 500;
   console.error(`[${requestId}] ${req.method} ${req.path} failed`, error);
   if (safeStatus === 503) res.setHeader("Retry-After", "15");
   res.setHeader("X-Request-ID", requestId);
@@ -569,7 +577,9 @@ app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
     "23505": "A duplicate record blocked the save.",
     "23503": "A related record blocked the save. No changes were saved.",
   };
-  if (raw?.code === "MASTERLIST_ACTIVE" && safeStatus === 409 && raw.expose) {
+  if (transientDatabaseError) {
+    response.message = "The database is busy. Attendance data may be rebuilding. Try again shortly.";
+  } else if (raw?.code === "MASTERLIST_ACTIVE" && safeStatus === 409 && raw.expose) {
     response.message = raw.message || response.message;
     response.code = raw.code;
   } else if (raw?.code && Object.prototype.hasOwnProperty.call(databaseMessages, raw.code)) {
@@ -580,7 +590,7 @@ app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
       : error.code === "LIMIT_FILE_COUNT" || error.code === "LIMIT_UNEXPECTED_FILE"
         ? "Select at most 10 attendance files in one import."
         : "Invalid attendance upload.";
-  } else if (safeStatus < 500 && raw?.expose === true && !raw?.code) {
+  } else if ((safeStatus < 500 || safeStatus === 503) && raw?.expose === true && !raw?.code) {
     response.message = raw.message || response.message;
   }
   // Internal stacks belong exclusively in server-side logs. Never send them to clients.
@@ -596,4 +606,5 @@ if (
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  void recoverMaintenanceJobs().catch(error => console.error("Maintenance job recovery failed:",error));
 });

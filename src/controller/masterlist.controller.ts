@@ -1,3 +1,4 @@
+import { pool } from "../lib/db";
 import type { Request, Response, NextFunction } from "express";
 import type { AuthenticatedRequest } from "./auth.controller";
 import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
@@ -11,7 +12,7 @@ function filters(req:Request):MasterlistFilters {
 }
 export async function upload(req:AuthenticatedRequest,res:Response) { if(!req.file){res.status(400).json({message:"Choose a masterlist file."});return;} res.json(await uploadMasterlist(req.file,req.user?.sub)); }
 export async function list(req:Request,res:Response) {res.json(await listMasterlist(filters(req)));}
-export async function reconcile(_req:Request,res:Response) {res.json(await reconcileMasterlist());}
+export async function reconcile(req:AuthenticatedRequest,res:Response) {res.json(await reconcileMasterlist(undefined,undefined,req.user?.sub));}
 export async function remove(req:Request,res:Response) {
   const confirmation=typeof req.body?.confirmation === "string" ? req.body.confirmation.trim().toUpperCase() : "";
   if(confirmation!=="DELETE MASTERLIST") {res.status(400).json({message:"Type DELETE MASTERLIST to confirm deletion."});return;}
@@ -73,12 +74,16 @@ export async function discardUpload(req:Request,res:Response) {
   const jobId=typeof req.body?.jobId === "string" ? req.body.jobId : "";
   res.json(await discardMasterlistUpload(jobId));
 }
-export async function reconcileWithProgress(req:Request,res:Response,next:NextFunction) {
-  await streamMasterlist(req,res,next,reconcileMasterlist);
+export async function reconcileWithProgress(req:AuthenticatedRequest,res:Response,next:NextFunction) {
+  await streamMasterlist(req,res,next,(progress,cancelled)=>reconcileMasterlist(progress,cancelled,req.user?.sub));
 }
 export async function finalAttendance(req:Request,res:Response) {res.json(await getFinalAttendance(filters(req)));}
 export async function finalAttendanceUnmatched(req:Request,res:Response) {res.json(await getFinalAttendanceUnmatched(filters(req)));}
 export async function download(req:Request,res:Response) {const result=await exportFinalAttendance(filters(req));res.setHeader("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");res.setHeader("Content-Disposition",`attachment; filename="${result.filename}"`);res.send(result.buffer);}
 
-export async function status(_req: Request, res: Response) { res.json(await getMasterlistStatus()); }
+export async function status(req: AuthenticatedRequest, res: Response) {
+  const status = await getMasterlistStatus();
+  const rebuildJob = req.user?.role === "admin" ? (await pool.query(`SELECT id,CASE WHEN status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '2 minutes' THEN 'paused' ELSE status END AS status,phase,percent::float8 AS percent,message,last_error FROM maintenance_jobs WHERE kind='masterlist_presence_rebuild' AND school_year_id=$1 AND status IN ('pending','running','paused','failed') ORDER BY updated_at DESC LIMIT 1`,[status.schoolYearId])).rows[0] ?? null : null;
+  res.json({...status,rebuildJob});
+}
 export async function publicStatus(_req: Request, res: Response) { const { active } = await getMasterlistStatus(); res.json({ active }); }

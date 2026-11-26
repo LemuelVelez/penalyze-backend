@@ -1,7 +1,5 @@
--- Executed in the migration runner's transaction, followed by the TypeScript
--- masterlist repair/reconciliation and derived-results rebuild before registration.
--- This one-time offline rebuild may exceed the normal API statement budget.
--- Keep the lock timeout and transaction rollback behavior unchanged.
+-- SQL normalization only; authoritative matching and derived rebuilding
+-- are performed by the frontend-triggered maintenance job.
 SET LOCAL statement_timeout = '0';
 SET LOCAL lock_timeout = '60000ms';
 SELECT pg_advisory_xact_lock(hashtext('penalyze.attendance_absence_sync'));

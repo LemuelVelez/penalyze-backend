@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import * as XLSX from "xlsx";
-import type { MasterlistStatus, SchoolYearRecord, StudentMasterlistRecord, StudentMasterlistImportRecord, ParsedAttendanceRow } from "../database/model/schema.model";
+import type { MasterlistStatus, SchoolYearRecord, StudentMasterlistRecord, StudentMasterlistImportRecord, ParsedAttendanceRow, MaintenanceJob } from "../database/model/schema.model";
 import { pool, withTransaction } from "../lib/db";
-import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelKey, normalizeCollegeKey, lockAttendanceAbsenceSync, refreshDerivedAttendanceResultsForSchoolYearsWithClient, listAttendanceFinalResults, listFinalAttendanceEventRoster, syncAbsencesForStudents, attendanceEventRosterScopeCteSql, attendanceEventParticipationCteSql } from "./attendance.service";
+import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelKey, normalizeCollegeKey, lockAttendanceAbsenceSync, refreshDerivedAttendanceResultsForSchoolYearsWithClient, refreshAttendanceFinalResultsWithClient, refreshCalculationResultsWithClient, refreshPenaltyResultsForSchoolYearWithClient, listAttendanceFinalResults, listFinalAttendanceEventRoster, syncAbsencesForStudents, attendanceEventRosterScopeCteSql, attendanceEventParticipationCteSql } from "./attendance.service";
 import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
 import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram, parseStudentNumberParts, isPlaceholderStudentNumber, nameTokens, nameTokensAgree, nameKeysAgree, sharedNameTokenCount, nameTokenSignatures, repairNameMojibake, surnameTokensOverlap, joinedGivenNamesAgree, masterlistNameMatchRank, masterlistNameSignatures } from "./masterlist-normalize";
 
@@ -177,43 +177,113 @@ export async function upsertMasterlistStudent(client: PoolClient, year: string, 
   await client.query("SELECT set_config('penalyze.masterlist_school_year','',true)");
 }
 type Existing = { masterlist_original?: ParsedAttendanceRow["masterlist_original"] | null; masterlist_status?: MasterlistStatus | null; id: string; student_id: string; name: string; program: string | null; college: string | null; year_level: string | null };
-async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRecord, rebuild = true, cache: MasterlistCache = new Map(), onProgress?: ProgressCallback, isCancelled?: () => boolean, offlineRepair = false) {
-  const emit = progressReporter(onProgress, isCancelled);
-  emit({ stage: "reconciling_records", percent: 10, message: "Counting attendance records…" });
-  await client.query("SELECT set_config('statement_timeout',$1,true)", [offlineRepair ? "0" : "180000ms"]);
-  await client.query("SELECT set_config('lock_timeout','60000ms',true)");
+type ReconcileUpdate = Array<{ id: string; student_id: string; name: string; year_level: string | null; program: string | null; college: string | null; masterlist_original?: ParsedAttendanceRow["masterlist_original"]; masterlist_status?: MasterlistStatus }>;
+const derivedTables = ["attendance_final_results", "calculation_results", "penalty_results"] as const;
+function initialSummary(schoolYear: SchoolYearRecord, index: MasterIndex) {
+  return { schoolYear, masterlistRows: index.rows.length, matchedById: 0, matchedByPartialId: 0, matchedByName: 0, idNameMismatches: 0, unmatched: 0, studentsUpdated: 0, recordsUpdated: 0, unmappedPrograms: [...new Set(index.rows.filter(r => !r.college).map(r => r.program ?? ""))] };
+}
+type ReconcileState = {
+  summary: ReturnType<typeof initialSummary>;
+  seen: string[];
+  aliases: Record<string, string[]>;
+  changed: string[];
+  unresolvedAliases: string[];
+  sourceProfiles: Record<string, string[]>;
+  matched: string[];
+  totals: number[];
+  derivedUpdates: ReconcileUpdate;
+  mapping: { old: string; target: string }[];
+  studentIds: string[];
+};
+type ReconcileCursor = { id?: string; tableIndex: number; offset?: number };
+async function planReconciliation(client: PoolClient, schoolYear: SchoolYearRecord, cache: MasterlistCache = new Map()): Promise<ReconcileState> {
   const index = await loadMasterlist(client, schoolYear.id, cache);
   if (!index.rows.length) throw bad("Upload a masterlist before reconciling.");
-  const summary = { schoolYear, masterlistRows: index.rows.length, matchedById: 0, matchedByPartialId: 0, matchedByName: 0, idNameMismatches: 0, unmatched: 0, studentsUpdated: 0, recordsUpdated: 0, unmappedPrograms: [...new Set(index.rows.filter(r => !r.college).map(r => r.program ?? ""))] };
-  const seen = new Set<string>();
-  const aliases = new Map<string, Set<string>>();
-  const changed = new Set<string>();
-  const unresolvedAliases = new Set<string>();
-  const sourceProfiles = new Map<string, Set<StudentMasterlistRecord>>();
-  const matched = new Map<string, StudentMasterlistRecord>();
-  const totals = new Map<string, number>();
-  const resolutionCache = new Map<string, Resolution>();
+  const totals: number[] = [];
   for (const table of scopedTables) {
     const visibility = table === "attendance_records" ? ` AND ${getAttendanceRecordVisibilitySql(table)}` : "";
     const count = await client.query<{ count: string }>(`SELECT COUNT(*) AS count FROM ${table} WHERE school_year_id=$1${visibility}`, [schoolYear.id]);
-    totals.set(table, Number(count.rows[0].count));
-    await yieldChunk(isCancelled);
+    totals.push(Number(count.rows[0].count));
   }
-  const grandTotal = [...totals.values()].reduce((sum, count) => sum + count, 0);
-  let completed = 0;
-  for (const table of scopedTables) {
+  return { summary: initialSummary(schoolYear,index), seen: [], aliases: {}, changed: [], unresolvedAliases: [], sourceProfiles: {}, matched: [], totals, derivedUpdates: [], mapping: [], studentIds: [] };
+}
+async function absenceStudentIds(client: PoolClient, schoolYearId: string) {
+  const rows = (await client.query<{ student_id: string }>(`SELECT student_number AS student_id FROM student_masterlist WHERE school_year_id=$1 UNION SELECT DISTINCT ar.student_id FROM attendance_records ar WHERE school_year_id=$1 AND ${getAttendanceRecordVisibilitySql("ar")} AND ar.masterlist_status IS DISTINCT FROM 'unmatched'`, [schoolYearId])).rows;
+  const ids = [...new Set<string>(rows.map(row => normalizeStudentNumberKey(row.student_id).toLowerCase()).filter(Boolean))];
+  return ids.sort();
+}
+function reconciliationStage(phase: string): MasterlistProgress["stage"] {
+  if (phase === "queued") return "parsing";
+  if (phase === "primary") return "reconciling_records";
+  if (phase === "normalize_masterlist") return "saving_masterlist";
+  if (phase.startsWith("reconcile:") || phase.startsWith("dedupe:")) return "reconciling_records";
+  if (phase === "remap_overrides") return "remapping_overrides";
+  if (phase === "update_students") return "updating_students";
+  if (phase === "sync_absences") return "syncing_absences";
+  if (phase === "refresh_final_results") return "refreshing_final_results";
+  if (phase === "refresh_calculations") return "refreshing_calculations";
+  if (phase === "refresh_penalties") return "refreshing_penalties";
+  return "finalizing";
+}
+export { reconciliationStage };
+async function reconcileStep(client: PoolClient, schoolYear: SchoolYearRecord, phase: string, cursor: ReconcileCursor, state: ReconcileState, rebuild: boolean, cache: MasterlistCache = new Map()) {
+  const summary = state.summary;
+  const index = await loadMasterlist(client, schoolYear.id, cache);
+  if (!index.rows.length) throw bad("Upload a masterlist before reconciling.");
+  const seen = new Set(state.seen), changed = new Set(state.changed), unresolvedAliases = new Set(state.unresolvedAliases), matched = new Set(state.matched);
+  const aliases = new Map(Object.entries(state.aliases).map(([key, values]) => [key, new Set(values)]));
+  const sourceProfiles = new Map(Object.entries(state.sourceProfiles).map(([key, values]) => [key, new Set(values)]));
+  const byId = new Map(index.rows.map(row => [row.id,row]));
+  const resolutionCache = new Map<string, Resolution>();
+  let nextPhase = phase, nextCursor = {...cursor}, processed = 0, total = 0, percent = 0, message = "", done = false;
+  const nextTable = () => { nextCursor = {tableIndex:cursor.tableIndex+1}; nextPhase = scopedTables[nextCursor.tableIndex] ? `reconcile:${scopedTables[nextCursor.tableIndex]}` : "remap_overrides"; };
+  if (phase === "normalize_masterlist") {
+    const rows = (await client.query<StudentMasterlistRecord>(`SELECT * FROM student_masterlist WHERE school_year_id=$1 AND ($2::uuid IS NULL OR id>$2) ORDER BY id LIMIT ${MASTERLIST_CHUNK_SIZE}`, [schoolYear.id,cursor.id ?? null])).rows;
+      const profiles = rows.map(row => ({
+        id: row.id, name_key: normalizeNameKey(`${row.given_name} ${row.last_name}`), college: row.college ?? collegeForProgram(row.program),
+        last_name: repairNameMojibake(row.last_name), given_name: repairNameMojibake(row.given_name),
+        full_name: repairNameMojibake(row.full_name),
+      }));
+      await client.query(`UPDATE student_masterlist m SET name_key=x.name_key,last_name=x.last_name,
+        given_name=x.given_name,full_name=x.full_name,college=x.college,updated_at=NOW()
+        FROM jsonb_to_recordset($1::jsonb) AS x(id uuid,name_key text,last_name text,given_name text,full_name text,college text)
+        WHERE m.id=x.id AND (m.name_key,m.last_name,m.given_name,m.full_name,m.college)
+          IS DISTINCT FROM (x.name_key,x.last_name,x.given_name,x.full_name,x.college)`, [JSON.stringify(profiles)]);
+    processed = (cursor.offset ?? 0) + rows.length; total = index.rows.length;
+    percent = 10 * Math.min(1,processed / Math.max(1,total)); message = `Normalizing masterlist: ${processed} / ${total}`;
+    if (rows.length < MASTERLIST_CHUNK_SIZE) { const normalized = await loadMasterlist(client,schoolYear.id,new Map()); summary.unmappedPrograms = [...new Set(normalized.rows.filter(r=>!r.college).map(r=>r.program ?? ""))]; nextPhase = `reconcile:${scopedTables[0]}`; nextCursor = {tableIndex:0}; }
+    else nextCursor = {tableIndex:0,id:rows[rows.length-1].id,offset:processed};
+  } else if (phase.startsWith("reconcile:") || phase.startsWith("dedupe:")) {
+    const table = scopedTables[cursor.tableIndex];
+    if (!table) throw new Error("Invalid reconciliation table checkpoint.");
     const full = profileTables.includes(table);
     const isSource = table === "attendance_records" || table === "manual_attendance_records";
+    const isDerived = derivedTables.some(value => value === table);
     const visibility = table === "attendance_records" ? ` AND ${getAttendanceRecordVisibilitySql(table)}` : "";
-    const total = totals.get(table) ?? 0;
-    const chunkTotal = Math.ceil(total / MASTERLIST_CHUNK_SIZE);
-    const tableProgress = (fraction: number) => 10 + 50 * (grandTotal ? (completed + total * fraction) / grandTotal : 1);
-    const updates: Array<{ id: string; student_id: string; name: string; year_level: string | null; program: string | null; college: string | null; masterlist_original?: ParsedAttendanceRow["masterlist_original"]; masterlist_status?: MasterlistStatus }> = [];
-    let cursor: string | null = null;
-    let processed = 0;
-    while (true) {
-      const rows: Existing[] = (await client.query<Existing>(`SELECT id,student_id,name,${isSource ? "masterlist_original,masterlist_status," : ""}${full ? "program,college,year_level" : "NULL::text AS program,NULL::text AS college,NULL::text AS year_level"} FROM ${table} WHERE school_year_id=$1${visibility}${cursor === null ? "" : " AND id > $2::uuid"} ORDER BY id LIMIT ${MASTERLIST_CHUNK_SIZE}`, cursor === null ? [schoolYear.id] : [schoolYear.id,cursor])).rows;
-      if (!rows.length) break;
+    total = state.totals[cursor.tableIndex];
+    const grandTotal = state.totals.reduce((sum,count)=>sum+count,0);
+    const completed = state.totals.slice(0,cursor.tableIndex).reduce((sum,count)=>sum+count,0);
+    const updates: ReconcileUpdate = phase.startsWith("dedupe:") ? state.derivedUpdates : [];
+    if (phase.startsWith("dedupe:")) {
+    const scope = table === "attendance_final_results" ? ", t.import_id" : table === "calculation_results" ? ", t.calculation_scope_key" : "";
+    if (["attendance_final_results", "calculation_results", "penalty_results"].includes(table)) {
+      const data = JSON.stringify(updates);
+      // Retain one derived record per unique key before updating IDs, prioritizing settled penalties.
+      const ranking = `WITH changes AS (SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(id uuid,student_id text)), ranked AS (SELECT t.id, first_value(t.id) OVER w AS keep_id,row_number() OVER w AS rn FROM ${table} t LEFT JOIN changes c ON c.id=t.id WHERE t.school_year_id=$1 WINDOW w AS (PARTITION BY LOWER(public.masterlist_student_number_key(COALESCE(c.student_id,t.student_id)))${scope} ORDER BY ${table === "penalty_results" ? "CASE t.status WHEN 'paid' THEN 0 WHEN 'waived' THEN 1 ELSE 2 END," : ""} t.updated_at DESC,t.id DESC))`;
+      if (table !== "penalty_results") await client.query(`${ranking} UPDATE penalty_results p SET source_record_id=r.keep_id FROM ranked r WHERE r.rn>1 AND p.school_year_id=$1 AND p.source_table='${table}' AND p.source_record_id=r.id`, [schoolYear.id,data]);
+      const merged = await client.query(`${ranking} DELETE FROM ${table} t USING ranked r WHERE r.rn>1 AND t.id=r.id AND t.school_year_id=$1`, [schoolYear.id,data]);
+      summary.recordsUpdated += merged.rowCount ?? 0;
+    }
+      // Deduplicate before changing unique derived keys; keep ranking and its updates atomic.
+      for (let i=0; i<updates.length; i+=MASTERLIST_CHUNK_SIZE) {
+        const chunk = updates.slice(i,i+MASTERLIST_CHUNK_SIZE);
+      const result = await client.query(`UPDATE ${table} t SET student_id=x.student_id,name=x.name${full ? ",year_level=x.year_level,program=x.program,college=x.college" : ""}${isSource ? ",masterlist_original=x.masterlist_original,masterlist_status=x.masterlist_status" : ""},updated_at=NOW() FROM jsonb_to_recordset($2::jsonb) AS x(id uuid,student_id text,name text,year_level text,program text,college text,masterlist_original jsonb,masterlist_status text) WHERE t.id=x.id AND t.school_year_id=$1`, [schoolYear.id,JSON.stringify(chunk)]);
+      summary.recordsUpdated += result.rowCount ?? 0;
+      }
+      state.derivedUpdates = [];
+      processed = total; nextTable();
+    } else {
+      const rows: Existing[] = (await client.query<Existing>(`SELECT id,student_id,name,${isSource ? "masterlist_original,masterlist_status," : ""}${full ? "program,college,year_level" : "NULL::text AS program,NULL::text AS college,NULL::text AS year_level"} FROM ${table} WHERE school_year_id=$1${visibility} AND ($2::uuid IS NULL OR id>$2) ORDER BY id LIMIT ${MASTERLIST_CHUNK_SIZE}`, [schoolYear.id,cursor.id ?? null])).rows;
       for (const row of rows) {
         const original = row.masterlist_original ?? { studentId: row.student_id, name: row.name, program: row.program ?? undefined, college: row.college ?? undefined, yearLevel: row.year_level ?? undefined };
         const profileKey = JSON.stringify([original.studentId, original.name]);
@@ -227,7 +297,7 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
         // the scoped source rows, but never guess between conflicting people.
         const prior = sourceProfiles.get(key);
         if (resolution.status === "unmatched" && !full && prior?.size === 1) {
-          resolution = { status: "matched_by_name", master: [...prior][0] };
+          resolution = { status: "matched_by_name", master: byId.get([...prior][0]) };
         }
         if (!seen.has(key)) { seen.add(key); if (resolution.status === "matched_by_id") summary.matchedById++; else if (resolution.status === "matched_by_partial_id") summary.matchedByPartialId++; else if (resolution.status === "matched_by_name") summary.matchedByName++; else if (resolution.status === "id_name_mismatch") summary.idNameMismatches++; else summary.unmatched++; }
         const m = resolution.master;
@@ -239,10 +309,10 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
           continue;
         }
         if (isSource) {
-          const profiles = sourceProfiles.get(key) ?? new Set<StudentMasterlistRecord>();
-          profiles.add(m); sourceProfiles.set(key, profiles);
+          const profiles = sourceProfiles.get(key) ?? new Set<string>();
+          profiles.add(m.id); sourceProfiles.set(key, profiles);
         }
-        matched.set(m.student_number, m);
+        matched.add(m.student_number);
         if (isSource) {
           const alias = normalizeStudentNumberKey(original.studentId).toLowerCase();
           const targets = aliases.get(alias) ?? new Set<string>(); targets.add(m.student_number); aliases.set(alias, targets);
@@ -252,43 +322,25 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
         changed.add(m.student_number);
         updates.push({ id: row.id, student_id: m.student_number, name: resolvedName, year_level: m.year_level, program: m.program, college: m.college, ...(isSource ? { masterlist_original: original, masterlist_status: resolution.status } : {}) });
       }
-      processed += rows.length;
-      cursor = rows[rows.length - 1].id;
-      emit({ stage: "reconciling_records", percent: tableProgress(0.5 * Math.min(1,processed / Math.max(1,total))), message: `Reconciling ${table}: ${processed.toLocaleString("en-US")} / ${total.toLocaleString("en-US")} rows`, table, processed, total, chunkIndex: Math.ceil(processed / MASTERLIST_CHUNK_SIZE), chunkTotal });
-      await yieldChunk(isCancelled);
-    }
-    if (!updates.length && !["attendance_final_results", "calculation_results", "penalty_results"].includes(table)) {
-      emit({ stage: "reconciling_records", percent: tableProgress(1), message: `Reconciled ${table}: ${processed} / ${total} rows`, table, processed, total });
-      completed += total;
-      continue;
-    }
-    const scope = table === "attendance_final_results" ? ", t.import_id" : table === "calculation_results" ? ", t.calculation_scope_key" : "";
-    if (["attendance_final_results", "calculation_results", "penalty_results"].includes(table)) {
-      checkCancelled(isCancelled);
-      const data = JSON.stringify(updates);
-      // Retain one derived record per unique key before updating IDs, prioritizing settled penalties.
-      const ranking = `WITH changes AS (SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(id uuid,student_id text)), ranked AS (SELECT t.id, first_value(t.id) OVER w AS keep_id,row_number() OVER w AS rn FROM ${table} t LEFT JOIN changes c ON c.id=t.id WHERE t.school_year_id=$1 WINDOW w AS (PARTITION BY LOWER(public.masterlist_student_number_key(COALESCE(c.student_id,t.student_id)))${scope} ORDER BY ${table === "penalty_results" ? "CASE t.status WHEN 'paid' THEN 0 WHEN 'waived' THEN 1 ELSE 2 END," : ""} t.updated_at DESC,t.id DESC))`;
-      if (table !== "penalty_results") await client.query(`${ranking} UPDATE penalty_results p SET source_record_id=r.keep_id FROM ranked r WHERE r.rn>1 AND p.school_year_id=$1 AND p.source_table='${table}' AND p.source_record_id=r.id`, [schoolYear.id,data]);
-      const merged = await client.query(`${ranking} DELETE FROM ${table} t USING ranked r WHERE r.rn>1 AND t.id=r.id AND t.school_year_id=$1`, [schoolYear.id,data]);
-      summary.recordsUpdated += merged.rowCount ?? 0;
-    }
-    await yieldChunk(isCancelled);
-    for (let i = 0; i < updates.length; i += MASTERLIST_CHUNK_SIZE) {
-      const chunk = updates.slice(i,i + MASTERLIST_CHUNK_SIZE);
+      if (isDerived) state.derivedUpdates.push(...updates);
+      else if (updates.length) {
+        const chunk = updates;
       const result = await client.query(`UPDATE ${table} t SET student_id=x.student_id,name=x.name${full ? ",year_level=x.year_level,program=x.program,college=x.college" : ""}${isSource ? ",masterlist_original=x.masterlist_original,masterlist_status=x.masterlist_status" : ""},updated_at=NOW() FROM jsonb_to_recordset($2::jsonb) AS x(id uuid,student_id text,name text,year_level text,program text,college text,masterlist_original jsonb,masterlist_status text) WHERE t.id=x.id AND t.school_year_id=$1`, [schoolYear.id,JSON.stringify(chunk)]);
       summary.recordsUpdated += result.rowCount ?? 0;
-      const applied = i + chunk.length;
-      emit({ stage: "reconciling_records", percent: tableProgress(0.5 + 0.5 * applied / updates.length), message: `Updating ${table}: ${applied.toLocaleString("en-US")} / ${updates.length.toLocaleString("en-US")} rows`, table, processed: applied, total: updates.length, chunkIndex: Math.floor(i / MASTERLIST_CHUNK_SIZE) + 1, chunkTotal: Math.ceil(updates.length / MASTERLIST_CHUNK_SIZE) });
-      await yieldChunk(isCancelled);
+      }
+      processed = (cursor.offset ?? 0) + rows.length;
+      if (rows.length < MASTERLIST_CHUNK_SIZE) {
+        if (isDerived) {nextPhase = `dedupe:${table}`; nextCursor = {tableIndex:cursor.tableIndex};}
+        else nextTable();
+      } else nextCursor = {tableIndex:cursor.tableIndex,id:rows[rows.length-1].id,offset:processed};
     }
-    completed += total;
-  }
+    percent = 10 + 50 * (grandTotal ? Math.min(1,(completed + Math.min(total,processed))/grandTotal) : 1);
+    message = `Reconciling ${table}: ${processed} / ${total} rows`;
+  } else if (phase === "remap_overrides") {
   await client.query(`DELETE FROM fines f USING attendance_records ar WHERE f.attendance_record_id=ar.id
     AND f.school_year_id=$1 AND ar.school_year_id=$1 AND ar.masterlist_status='unmatched' AND ${getAttendanceRecordVisibilitySql("ar")}`, [schoolYear.id]);
   await client.query(`UPDATE attendance_records ar SET no_of_absences=0,updated_at=NOW()
     WHERE ar.school_year_id=$1 AND ar.masterlist_status='unmatched' AND ar.no_of_absences<>0 AND ${getAttendanceRecordVisibilitySql("ar")}`, [schoolYear.id]);
-  emit({ stage: "remapping_overrides", percent: 60, message: "Remapping attendance overrides…" });
-  await yieldChunk(isCancelled);
   const overrideKeys = (await client.query<{ student_key: string }>(
     "SELECT DISTINCT student_key FROM attendance_student_event_overrides WHERE school_year_id=$1", [schoolYear.id],
   )).rows;
@@ -311,12 +363,14 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
     const result = await client.query(`UPDATE attendance_student_event_overrides o SET student_key=m.target FROM jsonb_to_recordset($2::jsonb) AS m(old text,target text) WHERE o.school_year_id=$1 AND LOWER(public.masterlist_student_number_key(o.student_key))=m.old AND o.student_key<>m.target`, [schoolYear.id,data]);
     summary.recordsUpdated += result.rowCount ?? 0;
   }
-  emit({ stage: "updating_students", percent: 63, message: "Updating student profiles…" });
-  await yieldChunk(isCancelled);
+    state.mapping = mapping;
+    nextPhase = "update_students"; percent = 63; message = "Attendance overrides remapped.";
+  } else if (phase === "update_students") {
+    const mapping = state.mapping;
   // Batch global profiles; old identifiers are retained whenever another school year references them.
   if (matched.size) {
     await client.query("SELECT set_config('penalyze.masterlist_school_year',$1,true)",[schoolYear.id]);
-    const values = JSON.stringify([...matched.values()]);
+    const values = JSON.stringify(index.rows.filter(row => matched.has(row.student_number)));
     const inserted = await client.query<{student_id:string}>(`INSERT INTO students(student_id,name,year_level,program,college)
       SELECT m.student_number,m.full_name,m.year_level,m.program,m.college
       FROM jsonb_to_recordset($1::jsonb) AS m(student_number text,full_name text,year_level text,program text,college text)
@@ -332,43 +386,58 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
   }
   await client.query("SELECT set_config('penalyze.masterlist_school_year','',true)");
   summary.studentsUpdated = changed.size;
-  if (rebuild) {
-    await syncMasterlistAbsences(client, schoolYear.id, emit, isCancelled, offlineRepair);
-    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client,[schoolYear.id], progress => {
-      const stages = ["refreshing_final_results", "refreshing_calculations", "refreshing_penalties"] as const;
-      const messages = ["Refreshing final attendance results…", "Refreshing calculations…", "Refreshing penalties…"];
-      const step = stages.indexOf(progress.stage);
-      emit({ stage: progress.stage, percent: 80 + 18 * ((progress.scopeIndex - 1) * 3 + step) / (progress.scopeTotal * 3), message: messages[step] });
-    });
-    await yieldChunk(isCancelled);
-    emit({ stage: "finalizing", percent: 98, message: "Finalizing reconciliation…" });
-  }
-  return summary;
+    if (rebuild) { state.studentIds = await absenceStudentIds(client,schoolYear.id); nextPhase = "sync_absences"; nextCursor = {tableIndex:0,offset:0}; }
+    else {done = true; nextPhase = "finalize";}
+    percent = 68; message = "Student profiles updated.";
+  } else if (phase === "sync_absences") {
+    const offset = cursor.offset ?? 0;
+    const chunk = state.studentIds.slice(offset,offset+RESUMABLE_ABSENCE_CHUNK_SIZE);
+    if (chunk.length) await syncAbsencesForStudents(client,chunk,schoolYear.id,true,true);
+    processed = offset+chunk.length; total = state.studentIds.length;
+    percent = 68+12*(total ? processed/total : 1); message = `Synced absences: ${processed} / ${total} students`;
+    nextCursor = {tableIndex:0,offset:processed};
+    if (processed>=total) nextPhase = "refresh_final_results";
+  } else if (phase === "refresh_final_results") {
+    await refreshAttendanceFinalResultsWithClient(client,{schoolYearId:schoolYear.id});
+    nextPhase = "refresh_calculations"; percent = 86; message = "Final attendance results refreshed.";
+  } else if (phase === "refresh_calculations") {
+    await refreshCalculationResultsWithClient(client,{schoolYearId:schoolYear.id});
+    nextPhase = "refresh_penalties"; percent = 92; message = "Calculations refreshed.";
+  } else if (phase === "refresh_penalties") {
+    await refreshPenaltyResultsForSchoolYearWithClient(client,schoolYear.id);
+    nextPhase = "finalize"; percent = 98; message = "Penalties refreshed.";
+  } else if (phase === "finalize") {
+    await client.query(`UPDATE student_masterlist_imports SET summary=$2 WHERE id=(SELECT id FROM student_masterlist_imports WHERE school_year_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1)`, [schoolYear.id,JSON.stringify(summary)]);
+    done = true; percent = 100; message = "Masterlist reconciled.";
+  } else throw new Error("Invalid reconciliation phase.");
+  state.seen = [...seen]; state.changed = [...changed]; state.unresolvedAliases = [...unresolvedAliases]; state.matched = [...matched];
+  state.aliases = Object.fromEntries([...aliases].map(([key,values])=>[key,[...values]]));
+  state.sourceProfiles = Object.fromEntries([...sourceProfiles].map(([key,values])=>[key,[...values]]));
+  return {done,phase:nextPhase,cursor:nextCursor,state,processed,total,percent,message,result:done ? summary : undefined};
 }
-
-// Migration 047 invokes the same resolver and full rebuild in its transaction.
-export async function repairUploadAttendanceMatchingWithClient(client: PoolClient, onProgress?: ProgressCallback) {
-  await lockAttendanceAbsenceSync(client);
-  const years = (await client.query<SchoolYearRecord>(`SELECT sy.* FROM school_years sy
-    WHERE public.is_masterlist_school_year(sy.id)
-      AND EXISTS (SELECT 1 FROM student_masterlist m WHERE m.school_year_id=sy.id)`)).rows;
-  for (const year of years) {
-    const index = await loadMasterlist(client, year.id);
-    for (let i = 0; i < index.rows.length; i += MASTERLIST_CHUNK_SIZE) {
-      const profiles = index.rows.slice(i, i + MASTERLIST_CHUNK_SIZE).map(row => ({
-        id: row.id, name_key: row.name_key, college: row.college ?? collegeForProgram(row.program),
-        last_name: repairNameMojibake(row.last_name), given_name: repairNameMojibake(row.given_name),
-        full_name: repairNameMojibake(row.full_name),
-      }));
-      await client.query(`UPDATE student_masterlist m SET name_key=x.name_key,last_name=x.last_name,
-        given_name=x.given_name,full_name=x.full_name,college=x.college,updated_at=NOW()
-        FROM jsonb_to_recordset($1::jsonb) AS x(id uuid,name_key text,last_name text,given_name text,full_name text,college text)
-        WHERE m.id=x.id AND (m.name_key,m.last_name,m.given_name,m.full_name,m.college)
-          IS DISTINCT FROM (x.name_key,x.last_name,x.given_name,x.full_name,x.college)`, [JSON.stringify(profiles)]);
-    }
-    const summary = await reconcileWithClient(client, year, true, new Map(), onProgress, undefined, true);
-    await client.query(`UPDATE student_masterlist_imports SET summary=$2 WHERE id=(SELECT id FROM student_masterlist_imports WHERE school_year_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1)`, [year.id, JSON.stringify(summary)]);
+export async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRecord, rebuild = true, cache: MasterlistCache = new Map(), onProgress?: ProgressCallback, isCancelled?: () => boolean) {
+  const emit = progressReporter(onProgress,isCancelled);
+  await client.query("SET LOCAL statement_timeout = '180s'");
+  let state = await planReconciliation(client,schoolYear,cache), phase = `reconcile:${scopedTables[0]}`, cursor: ReconcileCursor = {tableIndex:0};
+  while (true) {
+    checkCancelled(isCancelled);
+    const step = await reconcileStep(client,schoolYear,phase,cursor,state,rebuild,cache);
+    emit({stage:reconciliationStage(phase),percent:step.percent,message:step.message,processed:step.processed,total:step.total});
+    if (step.done) return state.summary;
+    ({state,phase,cursor}=step);
+    await yieldChunk(isCancelled);
   }
+}
+export async function planMasterlistMaintenance(client: PoolClient, job: MaintenanceJob) {
+  const year = (await client.query<SchoolYearRecord>("SELECT * FROM school_years WHERE id=$1",[job.school_year_id])).rows[0];
+  if (!isMasterlistSchoolYear(year)) throw bad("Invalid masterlist school year.");
+  if (await getUploadCheckpoint(client,year.id)) throw bad("Resume or discard the unfinished masterlist upload first.");
+  const state = await planReconciliation(client,year);
+  return {total:state.totals.reduce((sum,count)=>sum+count,0),phase:job.kind === "masterlist_presence_rebuild" ? "normalize_masterlist" : `reconcile:${scopedTables[0]}`,cursor:{tableIndex:0},state};
+}
+export async function stepMasterlistMaintenance(client: PoolClient, job: MaintenanceJob) {
+  const state = job.state as ReconcileState;
+  return reconcileStep(client,state.summary.schoolYear,job.phase,job.cursor as ReconcileCursor,state,true);
 }
 
 // Called inside the existing upload transaction, after its raw rows are saved.
@@ -382,7 +451,7 @@ export async function reconcileMasterlistForAttendanceUpload(client: PoolClient,
   return true;
 }
 
-export async function syncMasterlistAbsences(client: PoolClient, schoolYearId: string, onProgress?: ProgressCallback, isCancelled?: () => boolean, offlineRepair = false) {
+export async function syncMasterlistAbsences(client: PoolClient, schoolYearId: string, onProgress?: ProgressCallback, isCancelled?: () => boolean) {
   const emit = progressReporter(onProgress, isCancelled);
   emit({ stage: "syncing_absences", percent: 68, message: "Preparing absence synchronization…" });
   const rows = (await client.query<{ student_id: string }>(`SELECT student_number AS student_id FROM student_masterlist WHERE school_year_id=$1 UNION SELECT DISTINCT ar.student_id FROM attendance_records ar WHERE school_year_id=$1 AND ${getAttendanceRecordVisibilitySql("ar")} AND ar.masterlist_status IS DISTINCT FROM 'unmatched'`, [schoolYearId])).rows;
@@ -390,10 +459,7 @@ export async function syncMasterlistAbsences(client: PoolClient, schoolYearId: s
   type SyncResult = Awaited<ReturnType<typeof syncAbsencesForStudents>>;
   const records = new Map<string, SyncResult["records"][number]>();
   const fines = new Map<string, SyncResult["fines"][number]>();
-  // The migration is offline and atomic: synchronize the whole school year
-  // in one set-based pass rather than rebuilding its roster for every batch.
-  // Interactive reconciliation keeps its existing chunking and cancellation.
-  const chunkSize = offlineRepair ? Math.max(ids.length, 1) : 250;
+  const chunkSize = 250;
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i,i + chunkSize);
     const chunkIndex = Math.floor(i / chunkSize) + 1;
@@ -589,23 +655,13 @@ export const discardMasterlistUpload=(jobId:string)=>withTransaction(async clien
   return {schoolYear:year,discardedRows:job.rows_valid};
 });
 
-export async function reconcileMasterlist(onProgress?: ProgressCallback, isCancelled?: () => boolean) {
-  const emit = progressReporter(onProgress, isCancelled);
-  const result = await withTransaction(async client => {
-    await client.query("SELECT set_config('statement_timeout','180000ms',true)");
-    await client.query("SELECT set_config('lock_timeout','60000ms',true)");
-    emit({ stage: "reconciling_records", percent: 0, message: "Waiting for the attendance database lock…" });
-    await lockAttendanceAbsenceSync(client);
-    emit({ stage: "reconciling_records", percent: 2, message: "Lock acquired. Checking active school year and upload state…" });
-    const year = await activeYear(client);
-    if (await getUploadCheckpoint(client,year.id)) throw bad("Resume or discard the unfinished masterlist upload first.");
-    const summary = await reconcileWithClient(client, year, true, new Map(), emit, isCancelled);
-    await client.query(`UPDATE student_masterlist_imports SET summary=$2 WHERE id=(SELECT id FROM student_masterlist_imports WHERE school_year_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1)`, [year.id, JSON.stringify(summary)]);
-    await yieldChunk(isCancelled);
-    return summary;
-  });
-  onProgress?.({ stage: "finalizing", percent: 100, message: "Masterlist reconciled." });
-  return result;
+export async function reconcileMasterlist(onProgress?: ProgressCallback, isCancelled?: () => boolean, actor?: string) {
+  const year = await withTransaction(activeYear);
+  const { createOrGetJob, runJob } = await import("./maintenance-jobs.service");
+  const job = await createOrGetJob("masterlist_reconcile",year.id,null,actor);
+  const finished = await runJob(job.id,onProgress,isCancelled);
+  if (finished.status !== "completed") throw bad("Reconciliation paused. Resume the saved job.");
+  return finished.result as MasterlistSummary;
 }
 export const deleteMasterlist = (importId: string) => withTransaction(async client => {
   await lockAttendanceAbsenceSync(client);

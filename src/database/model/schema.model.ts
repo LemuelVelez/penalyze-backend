@@ -493,3 +493,28 @@ export const ACCEPTED_ATTENDANCE_EXTENSIONS = [
   ".csv",
 ] as const;
 export const REQUIRED_ATTENDANCE_FIELDS = ["studentId", "name"] as const;
+
+export type MaintenanceJob = {
+  id: string;
+  kind: string;
+  school_year_id: string | null;
+  status: "pending" | "running" | "paused" | "failed" | "completed" | "cancelled";
+  phase: string;
+  cursor: object;
+  state: object;
+  input: unknown;
+  result: unknown;
+  processed: number;
+  total: number;
+  percent: string | number;
+  message: string | null;
+  last_error: string | null;
+  attempts: number;
+  runner_token: string | null;
+  heartbeat_at: Date | null;
+  created_by: string | null;
+  started_at: Date | null;
+  completed_at: Date | null;
+  created_at: Date;
+  updated_at: Date;
+};

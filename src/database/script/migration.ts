@@ -150,19 +150,9 @@ async function runMigrations() {
 
       migrationTask.update(file, `Opening transaction • ~${statementCount} SQL statement${statementCount === 1 ? "" : "s"}`);
       await withTransaction(async (client) => {
+        await client.query("SET LOCAL lock_timeout = '10s'");
         migrationTask.update(file, "Executing SQL changes");
         await client.query(sql);
-        // Commit 048's ALTER TABLE and REINDEX changes before the data repair.
-        // Running the full rebuild while those locks are held blocks ordinary
-        // SELECT requests on attendance tables for the entire migration.
-        // 049 performs the same authoritative repair in its own transaction.
-        if (file === "049_rebuild_masterlist_event_presence.sql") {
-          const { repairUploadAttendanceMatchingWithClient } = await import("../../services/masterlist.service");
-          await repairUploadAttendanceMatchingWithClient(client, (progress) => {
-            migrationTask.update(file, `${Math.floor(progress.percent)}% • ${progress.message}`);
-          });
-        }
-
         migrationTask.update(file, "Recording migration in schema_migrations");
         await registerMigration(file, client);
 

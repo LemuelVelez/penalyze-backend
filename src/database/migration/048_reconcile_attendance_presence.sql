@@ -1,4 +1,4 @@
--- Rebuild the masterlist semester in the migration runner's transaction.
+-- Update schema and indexes for masterlist matching.
 SET LOCAL statement_timeout = '0';
 SET LOCAL lock_timeout = '60000ms';
 SELECT pg_advisory_xact_lock(hashtext('penalyze.attendance_absence_sync'));
@@ -44,4 +44,4 @@ REINDEX INDEX public.idx_manual_attendance_records_comparison_key;
 REINDEX INDEX public.idx_attendance_overrides_comparison_key;
 REINDEX INDEX public.idx_students_comparison_key;
 
--- The runner calls the TypeScript resolver before recording this migration.
+-- The frontend-triggered maintenance job runs the TypeScript resolver.

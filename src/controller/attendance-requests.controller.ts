@@ -1,3 +1,4 @@
+import { runSubmittedJob } from "../services/maintenance-jobs.service";
 import { randomUUID } from "crypto";
 import type { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
@@ -260,18 +261,11 @@ export async function reviewRequestWithProgress(
     prepareProgressStream(res, 200);
     stageStarted = Date.now();
     stopHeartbeat = startReviewHeartbeat(res, () => lastProgress, () => stageStarted);
-    const result = await reviewAttendanceRequest(
-      req.params.id,
-      req.user?.sub,
-      req.body ?? {},
-      (progress) => {
-        if (stage !== progress.stage) stageStarted = Date.now();
-        stage = progress.stage;
-        lastProgress = progress;
-        writeProgressStreamMessage(res, { type: "progress", progress });
-      },
-      () => res.destroyed || res.writableEnded,
-    );
+    const result = await runSubmittedJob<Awaited<ReturnType<typeof reviewAttendanceRequest>>>("request_group_review",null,{operation:"single",body:req.body??{},requestId:req.params.id},req.user?.sub,progress=>{
+        const mapped={...progress,stage:progress.stage === "finalizing" && progress.percent<50 ? "validating" : progress.stage} as AttendanceRequestReviewProgress;
+        if(stage!==mapped.stage)stageStarted=Date.now();stage=mapped.stage;lastProgress=mapped;
+        writeProgressStreamMessage(res,{type:"progress",progress:mapped});
+      },()=>req.aborted||res.destroyed||res.writableEnded);
 
     if (result.request) {
       res.locals.auditAttendanceRequestType = result.request.request_type;
@@ -344,17 +338,11 @@ export async function reviewRequestGroupWithProgress(
     prepareProgressStream(res, 200);
     stageStarted = Date.now();
     stopHeartbeat = startReviewHeartbeat(res, () => lastProgress, () => stageStarted);
-    const result = await reviewAttendanceRequestGroup(
-      req.user?.sub,
-      req.body ?? {},
-      (progress) => {
-        if (stage !== progress.stage) stageStarted = Date.now();
-        stage = progress.stage;
-        lastProgress = progress;
-        writeProgressStreamMessage(res, { type: "progress", progress });
-      },
-      () => res.destroyed || res.writableEnded,
-    );
+    const result = await runSubmittedJob<Awaited<ReturnType<typeof reviewAttendanceRequestGroup>>>("request_group_review",null,{operation:"group",body:req.body??{},requestId:req.params.id},req.user?.sub,progress=>{
+        const mapped={...progress,stage:progress.stage === "finalizing" && progress.percent<50 ? "validating" : progress.stage} as AttendanceRequestReviewProgress;
+        if(stage!==mapped.stage)stageStarted=Date.now();stage=mapped.stage;lastProgress=mapped;
+        writeProgressStreamMessage(res,{type:"progress",progress:mapped});
+      },()=>req.aborted||res.destroyed||res.writableEnded);
     if (res.destroyed || res.writableEnded) {
       console.warn("Group review committed after the client connection closed", { requestIds: req.body?.requestIds });
     }

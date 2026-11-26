@@ -101,14 +101,18 @@ if (sslMode === "disable") {
   poolConnectionString = url.toString();
 }
 
-export const pool = new Pool({
+const poolOptions = {
   connectionString: poolConnectionString,
-  ssl: sslMode === "verify-full" ? { rejectUnauthorized: true } : false,
+  ssl: sslMode === "verify-full" ? { rejectUnauthorized: true } : false as const,
   statement_timeout: Number(process.env.DB_QUERY_TIMEOUT_MS ?? 30000),
   max: Number(process.env.DB_POOL_MAX ?? 10),
   idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS ?? 30000),
   connectionTimeoutMillis: Number(process.env.DB_CONNECTION_TIMEOUT_MS ?? 10000),
-});
+};
+
+export const pool = new Pool(poolOptions);
+export const jobPool = new Pool({ ...poolOptions, max: Number(process.env.DB_JOB_POOL_MAX ?? 2), statement_timeout: 180000 });
+jobPool.on("error", error => console.error("Unexpected PostgreSQL job pool error:", error));
 
 pool.on("error", (error) => {
   console.error("Unexpected PostgreSQL pool error:", error);
@@ -203,18 +207,19 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
   return retryTemporaryDnsFailure(() => pool.query<T>(text, params));
 }
 
-export async function withTransaction<T>(
-  handler: (client: PoolClient) => Promise<T>,
-): Promise<T> {
+async function transaction<T>(handler: (client: PoolClient) => Promise<T>, dedicated = false): Promise<T> {
   let lastError: unknown;
 
   for (let attempt = 0; attempt < transactionRetryAttempts; attempt += 1) {
     let client: PoolClient | null = null;
 
     try {
-      client = await retryTemporaryDnsFailure(() => pool.connect());
+      client = await retryTemporaryDnsFailure(() => (dedicated ? jobPool : pool).connect());
       await client.query("BEGIN");
-      await applyTransactionTimeouts(client);
+      if (dedicated) {
+        await client.query("SET LOCAL statement_timeout = '180s'");
+        await client.query("SET LOCAL lock_timeout = '5s'");
+      } else await applyTransactionTimeouts(client);
 
       const result = await handler(client);
 
@@ -248,8 +253,16 @@ export async function withTransaction<T>(
   throw lastError;
 }
 
+export function withTransaction<T>(handler: (client: PoolClient) => Promise<T>): Promise<T> {
+  return transaction(handler);
+}
+
+export function withJobTransaction<T>(handler: (client: PoolClient) => Promise<T>): Promise<T> {
+  return transaction(handler, true);
+}
+
 export async function closeDatabasePool() {
-  await pool.end();
+  await Promise.all([pool.end(), jobPool.end()]);
 }
 
 export function getDatabaseUrl() {

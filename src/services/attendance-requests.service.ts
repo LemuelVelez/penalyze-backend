@@ -20,6 +20,7 @@ import {
   listAttendanceAbsenceSyncLockHolders,
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
   syncAbsencesForStudents,
+  type MaintenancePrimaryContext,
 } from "./attendance.service";
 import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
 
@@ -1779,6 +1780,7 @@ export async function reviewAttendanceRequest(
   input: AttendanceRequestReviewInput,
   onProgress?: AttendanceRequestReviewProgressCallback,
   isDisconnected?: () => boolean,
+  context?: MaintenancePrimaryContext,
 ) {
   const requestId = cleanText(requestIdValue);
   const reviewerId = cleanText(reviewerIdValue);
@@ -1808,7 +1810,7 @@ export async function reviewAttendanceRequest(
     message: "Validating the attendance request and reviewer.",
   });
 
-  const result = await withTransaction(async (client) => {
+  const work = async (client:PoolClient) => {
     const reviewerResult = await client.query<{ id: string }>(
       `SELECT id FROM users WHERE id = $1 LIMIT 1`,
       [reviewerId],
@@ -1817,7 +1819,7 @@ export async function reviewAttendanceRequest(
       throw createHttpError("Authenticated reviewer account was not found.", 401);
     }
 
-    await prepareAttendanceReviewTransaction(client, status, emit, isDisconnected);
+    if(!context) await prepareAttendanceReviewTransaction(client, status, emit, isDisconnected);
     const requestResult = await client.query<AttendanceRequestRecord>(
       `SELECT * FROM attendance_requests WHERE id = $1 FOR UPDATE`,
       [requestId],
@@ -1833,11 +1835,13 @@ export async function reviewAttendanceRequest(
     let removedExemptedEventCount = 0;
     if (status === "approved") {
       if (request.request_type === "details_correction") {
+        const deferredYears = context ? new Set<string>() : undefined;
         updatedRowCount = await applyApprovedDetailsCorrection(
           client,
           request,
-          emit,
+          emit,deferredYears,
         );
+        if(deferredYears) for(const schoolYearId of deferredYears) context?.defer({schoolYearId,studentIds:[request.student_id],scopeFines:true});
         await applyExemptionsToPendingAttendanceRequests(client, {
           schoolYearId: request.school_year_id,
           studentId: request.student_id,
@@ -1852,6 +1856,8 @@ export async function reviewAttendanceRequest(
           stage: "syncing_absences", percent: 45,
           message: "Calculating the student's missed events and fines.",
         });
+        if(context)context.defer({schoolYearId:request.school_year_id,studentIds:[request.student_id],scopeFines:true});
+        else {
         await syncAbsencesForStudents(client, [request.student_id], request.school_year_id, true);
         await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
           client, [request.school_year_id], (progress) => {
@@ -1868,6 +1874,7 @@ export async function reviewAttendanceRequest(
             emit({ stage: progress.stage, percent: stages[progress.stage], message: labels[progress.stage] });
           },
         );
+        }
       } else {
         emit({
           stage: "resolving_events",
@@ -1911,6 +1918,8 @@ export async function reviewAttendanceRequest(
           percent: 42,
           message: "Recalculating the student's absences.",
         });
+        if(context)context.defer({schoolYearId:request.school_year_id,studentIds:[request.student_id],scopeFines:true});
+        else {
         await syncAbsencesForStudents(
           client,
           [request.student_id],
@@ -1946,6 +1955,7 @@ export async function reviewAttendanceRequest(
             });
           },
         );
+        }
       }
     }
 
@@ -1980,7 +1990,8 @@ export async function reviewAttendanceRequest(
       autoClosedByExemption: false,
       request: await getRequestViewById(requestId, client),
     };
-  });
+  };
+  const result = context ? await work(context.client) : await withTransaction(work);
 
   emit({
     stage: "finalizing",
@@ -2081,6 +2092,7 @@ export async function reviewAttendanceRequestGroup(
   input: AttendanceRequestGroupReviewInput,
   onProgress?: AttendanceRequestReviewProgressCallback,
   isDisconnected?: () => boolean,
+  context?: MaintenancePrimaryContext,
 ): Promise<AttendanceRequestGroupReviewResult> {
   const { reviewerId, studentId, requestIds, status, reviewNote } =
     normalizeGroupReviewInput(reviewerIdValue, input);
@@ -2098,7 +2110,7 @@ export async function reviewAttendanceRequestGroup(
   };
 
   emit({ stage: "validating", percent: 4, message: "Validating requests and reviewer." });
-  const result = await withTransaction(async (client) => {
+  const work = async (client:PoolClient):Promise<AttendanceRequestGroupReviewResult> => {
     const reviewerResult = await client.query<{ id: string }>(
       `SELECT id FROM users WHERE id = $1 LIMIT 1`,
       [reviewerId],
@@ -2106,7 +2118,7 @@ export async function reviewAttendanceRequestGroup(
     if (!reviewerResult.rows[0]) {
       throw createHttpError("Authenticated reviewer account was not found.", 401);
     }
-    await prepareAttendanceReviewTransaction(client, status, emit, isDisconnected);
+    if(!context) await prepareAttendanceReviewTransaction(client, status, emit, isDisconnected);
     const requestResult = await client.query<AttendanceRequestRecord>(
       `SELECT * FROM attendance_requests WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
       [requestIds],
@@ -2149,7 +2161,7 @@ export async function reviewAttendanceRequestGroup(
       );
       rejectedCount = total;
     } else {
-      const deferredDetailYears = events.length === 0 && zeroRequests.length === 0
+      const deferredDetailYears = context || (events.length === 0 && zeroRequests.length === 0)
         ? approvedEventSchoolYearIds : undefined;
       for (let index = 0; index < details.length; index += 1) {
         const request = details[index];
@@ -2243,6 +2255,8 @@ export async function reviewAttendanceRequestGroup(
       }
 
       if (approvedEventSchoolYearIds.size) {
+        if(context) for(const schoolYearId of approvedEventSchoolYearIds) context.defer({schoolYearId,studentIds:[studentId],scopeFines:true});
+        else {
         const schoolYearIds = [...approvedEventSchoolYearIds];
         for (let index = 0; index < schoolYearIds.length; index += 1) {
           emit({
@@ -2271,6 +2285,7 @@ export async function reviewAttendanceRequestGroup(
             });
           },
         );
+        }
       }
 
       emit({
@@ -2307,7 +2322,8 @@ export async function reviewAttendanceRequestGroup(
       updatedRowCount,
       removedExemptedEventCount,
     };
-  });
+  };
+  const result = context ? await work(context.client) : await withTransaction(work);
 
   emit({
     stage: "finalizing",

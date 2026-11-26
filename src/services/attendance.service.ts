@@ -3,7 +3,7 @@ import { reconcileAttendanceRow, resolveStudentAgainstMasterlist, upsertMasterli
 import path from "path";
 import { createHash } from "crypto";
 import { TextDecoder } from "util";
-import { PoolClient } from "pg";
+import { PoolClient, type QueryResultRow } from "pg";
 
 import {
   ACCEPTED_ATTENDANCE_EXTENSIONS,
@@ -76,6 +76,12 @@ export type UploadedAttendanceFile = {
 };
 
 type RawImportRow = Record<string, unknown>;
+export type MaintenanceRefreshScope = { schoolYearId: string | null; studentIds?: string[]; scopeFines?: boolean; skipRefresh?:boolean };
+export type MaintenancePrimaryContext = { client: PoolClient; defer: (scope: MaintenanceRefreshScope) => void };
+function primaryTransaction<T>(context: MaintenancePrimaryContext | undefined, work: (client: PoolClient) => Promise<T>) {
+  return context ? work(context.client) : withTransaction(work);
+}
+
 type CalculationSourceType = "imported" | "manual" | "zero_attendance";
 
 type AttendanceRowEventAssignment = {
@@ -3108,6 +3114,7 @@ export async function syncAbsencesForStudents(
   studentIds: string[],
   schoolYearIdValue?: unknown,
   scopeFines = false,
+  alreadyLocked = false,
 ) {
   const uniqueStudentIds = Array.from(
     new Set(
@@ -3125,7 +3132,7 @@ export async function syncAbsencesForStudents(
   }
 
   const schoolYearId = cleanText(schoolYearIdValue) || null;
-  await lockAttendanceAbsenceSync(client);
+  if(!alreadyLocked)await lockAttendanceAbsenceSync(client);
 
   const zeroAttendanceSync = await syncZeroAttendanceFineRecordsForStudents(
     client,
@@ -3824,7 +3831,7 @@ export async function previewAttendanceFile(
   return (await previewAttendanceFiles([file]))[0];
 }
 
-function prepareAttendanceRowsForSave(input: SaveRowsInput) {
+export function prepareAttendanceRowsForSave(input: SaveRowsInput) {
   const selected = requireAttendanceUploadCollege(input.college);
   const preview = scopeAttendancePreviewToCollege(buildPreview(
     input.fileName ?? "manual-import",
@@ -3866,13 +3873,14 @@ function prepareAttendanceRowsForSave(input: SaveRowsInput) {
   return { input: resolvedInput, preview, validRows };
 }
 
-async function saveAttendanceRowsWithClient(
+export async function saveAttendanceRowsWithClient(
   client: PoolClient,
   originalInput: SaveRowsInput,
   suppliedPreview?: AttendancePreviewResult,
   masterlistCache: MasterlistCache = new Map(),
+  maintenance = false,
 ): Promise<SavedAttendanceImportResult> {
-  await lockAttendanceAbsenceSync(client);
+  if(!maintenance) await lockAttendanceAbsenceSync(client);
   assertAttendanceImportNotCancelled(originalInput);
   const prepared = suppliedPreview
     ? {
@@ -4178,7 +4186,7 @@ async function saveAttendanceRowsWithClient(
     : false;
   // Exempt-only imports do not enter the existing post-commit refresh. A masterlist
   // import still reconciles existing students and rebuilds this term in that case.
-  const scopedSync = hasMasterlist && schoolYearId && (!input.deferDerivedRefresh || fullyExempt)
+  const scopedSync = hasMasterlist && schoolYearId && (!input.deferDerivedRefresh || (fullyExempt && !maintenance))
     ? await syncMasterlistAbsences(client, schoolYearId)
     : null;
   const synced = scopedSync ?? (input.deferDerivedRefresh || fullyExempt
@@ -4186,7 +4194,7 @@ async function saveAttendanceRowsWithClient(
     : await syncAbsencesForAttendanceRecordIds(client, savedRecordIds));
   const savedRecords = await listRecordsByIds(client, savedRecordIds);
 
-  if (hasMasterlist && schoolYearId && (!input.deferDerivedRefresh || fullyExempt)) {
+  if (hasMasterlist && schoolYearId && (!input.deferDerivedRefresh || (fullyExempt && !maintenance))) {
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [schoolYearId]);
   } else if (!input.deferDerivedRefresh && !fullyExempt) {
     await refreshAttendanceFinalResultsWithClient(client, { schoolYearId, importId });
@@ -4252,6 +4260,42 @@ async function saveAttendanceRowsWithClient(
   };
 }
 
+export async function planCommittedImportMaintenance(client:PoolClient,imports:SavedAttendanceImportResult[]) {
+  const scopes:MaintenanceRefreshScope[]=[];
+  const schoolYears=new Set<string|null>();
+  const masterlistYears=new Set<string>();
+  const legacyStudents=new Set<string>();
+  for(const imported of imports){
+    const record=(await client.query<{school_year_id:string|null}>("SELECT school_year_id FROM attendance_imports WHERE id=$1 AND deleted_at IS NULL",[imported.importId])).rows[0];
+    if(!record)throw createValidationError("Saved attendance import no longer exists.",404);
+    const schoolYearId=record.school_year_id;
+    if(schoolYearId && (await loadMasterlist(client,schoolYearId)).rows.length){
+      if(!masterlistYears.has(schoolYearId)){
+        masterlistYears.add(schoolYearId);
+        const ids=(await client.query<{student_id:string}>(`SELECT student_number AS student_id FROM student_masterlist WHERE school_year_id=$1 UNION SELECT DISTINCT ar.student_id FROM attendance_records ar WHERE school_year_id=$1 AND ${getAttendanceRecordVisibilitySql("ar")} AND ar.masterlist_status IS DISTINCT FROM 'unmatched'`,[schoolYearId])).rows.map(r=>r.student_id);
+        scopes.push({schoolYearId,studentIds:uniqueCleanTextValues(ids),scopeFines:true});
+      }
+    } else if(imported.savedRecords.length){
+      const keys=await getAttendanceRecordEventRosterCollegeKeys(client,imported.savedRecords.map(row=>row.id));
+      for(const id of await getAttendanceStudentIdsByEventRosterCollegeKeys(client,keys))legacyStudents.add(id);
+      schoolYears.add(schoolYearId);
+    }
+  }
+  if(legacyStudents.size)scopes.unshift({schoolYearId:null,studentIds:[...legacyStudents],skipRefresh:true});
+  for(const schoolYearId of schoolYears)scopes.push({schoolYearId});
+  return scopes;
+}
+export async function finishCommittedImportMaintenance(client:PoolClient,imports:SavedAttendanceImportResult[],fines:FineRecord[]) {
+  for(const imported of imports){
+    const ids=imported.savedRecords.map(row=>row.id);
+    imported.createdFines=filterAttendanceFinesByRecordIds(fines,ids);
+    const keys=[...new Set(imported.savedRecords.map(row=>cleanText(row.student_id).toLowerCase()).filter(Boolean))];
+    if(keys.length){
+      const counts=await client.query<{count:string}>(`SELECT COUNT(*)::TEXT AS count FROM attendance_final_results afr WHERE afr.school_year_id IS NOT DISTINCT FROM (SELECT school_year_id FROM attendance_imports WHERE id=$1) AND LOWER(TRIM(afr.student_id))=ANY($2::text[]) AND ${getAttendanceFinalResultVisibilitySql("afr")}`,[imported.importId,keys]);
+      imported.reconciliation.stageCounts.distinctFinalResults=Number(counts.rows[0]?.count??0);
+    }
+  }
+}
 /**
  * Post-commit reconciliation. The uploaded source rows must not disappear if an
  * expensive whole-year calculation times out. Reconciliation itself remains
@@ -4468,11 +4512,11 @@ async function applyAttendanceMergeMetadataChoice(
   return result.rows[0] ?? event;
 }
 
-export async function saveAttendanceFiles(
+export async function prepareAttendanceFilesForSave(
   files: UploadedAttendanceFile[],
   fileOptions: AttendanceFileSaveOption[] = [],
   onProgress?: AttendanceImportProgressCallback,
-): Promise<AttendanceBatchSaveResult> {
+) {
   if (!files.length) {
     throw createValidationError("Please upload at least one attendance file.");
   }
@@ -4521,8 +4565,13 @@ export async function saveAttendanceFiles(
     }
   });
 
-  const batch = await withTransaction(async (client) => {
-    await lockAttendanceAbsenceSync(client);
+  const preparedOptions = await Promise.all(options.map(async(option,index)=>({...option,schoolYearId:cleanText(option.schoolYearId) || await findSchoolYearIdForAttendancePreview(previews[index]) || undefined})));
+  return {files:files.map(file=>({originalname:file.originalname})),options:preparedOptions,previews};
+}
+export type PreparedAttendanceFiles = Awaited<ReturnType<typeof prepareAttendanceFilesForSave>>;
+export async function savePreparedAttendanceFilesWithClient(client:PoolClient,prepared:PreparedAttendanceFiles,onProgress?:AttendanceImportProgressCallback,maintenance=false):Promise<AttendanceBatchSaveResult> {
+  const {files,options,previews}=prepared;
+    if(!maintenance)await lockAttendanceAbsenceSync(client);
     const savedEvents = new Map<number, AttendanceEventRecord>();
     const masterlistCache: MasterlistCache = new Map();
     const savedFiles: AttendanceBatchSaveResult["files"] = [];
@@ -4536,8 +4585,7 @@ export async function saveAttendanceFiles(
         const preview = previews[index];
         const option = options[index];
         const detectedSchoolYearId =
-          cleanText(option.schoolYearId) ||
-          (await findSchoolYearIdForAttendancePreview(preview));
+          cleanText(option.schoolYearId);
         const earlierBatchEvent = Number.isInteger(option.mergeIntoBatchIndex)
           ? savedEvents.get(Number(option.mergeIntoBatchIndex)) ?? null
           : null;
@@ -4621,7 +4669,7 @@ export async function saveAttendanceFiles(
         };
 
         const result = await saveAttendanceRowsWithClient(
-          client, { ...input, deferDerivedRefresh: true }, preview, masterlistCache,
+          client, { ...input, deferDerivedRefresh: true }, preview, masterlistCache, maintenance,
         );
         if (result.event) savedEvents.set(index, result.event);
         savedFiles.push({
@@ -4658,7 +4706,11 @@ export async function saveAttendanceFiles(
         0,
       ),
     };
-  });
+}
+
+export async function saveAttendanceFiles(files:UploadedAttendanceFile[],fileOptions:AttendanceFileSaveOption[]=[],onProgress?:AttendanceImportProgressCallback):Promise<AttendanceBatchSaveResult> {
+  const prepared=await prepareAttendanceFilesForSave(files,fileOptions,onProgress);
+  const batch=await withTransaction(client=>savePreparedAttendanceFilesWithClient(client,prepared,onProgress));
   await emitAttendanceImportProgress(onProgress, {
     stage: "syncing", percent: 92,
     message: "Attendance records committed. Updating final results and fines...",
@@ -5179,17 +5231,18 @@ async function insertManualAttendanceRecord(client: PoolClient, input: RawImport
 }
 
 export type ManualAttendanceProgress = (stage: string, percent: number, message: string) => void;
-async function saveManualAttendanceInputs(inputs: RawImportRow[], onProgress?: ManualAttendanceProgress) {
-  return withTransaction(async client => {
+async function saveManualAttendanceInputs(inputs: RawImportRow[], onProgress?: ManualAttendanceProgress, context?: MaintenancePrimaryContext) {
+  return primaryTransaction(context,async client => {
     onProgress?.("waiting_for_lock", 0, "Waiting for lock");
-    await lockManualAttendanceTransaction(client);
+    if (!context) await lockManualAttendanceTransaction(client);
     const cache: MasterlistCache = new Map();
     const results: Awaited<ReturnType<typeof insertManualAttendanceRecord>>[] = [];
     for (const [index, input] of inputs.entries()) {
       onProgress?.("saving_events", 5 + 65 * index / inputs.length, `Saving event ${index + 1} of ${inputs.length}`);
       results.push(await insertManualAttendanceRecord(client, input, cache));
     }
-    await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, results.map(result => result.manualRecord.school_year_id), progress => {
+    if (context) { for (const schoolYearId of new Set(results.map(result=>result.manualRecord.school_year_id))) context.defer({schoolYearId}); }
+    else await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, results.map(result => result.manualRecord.school_year_id), progress => {
       const stages = { refreshing_final_results: ["Refreshing final results", 0], refreshing_calculations: ["Refreshing calculations", 1], refreshing_penalties: ["Refreshing penalties", 2] } as const;
       const [message, index] = stages[progress.stage];
       onProgress?.(progress.stage, 70 + 27 * ((progress.scopeIndex - 1) * 3 + index) / (progress.scopeTotal * 3), message);
@@ -5204,7 +5257,7 @@ export async function saveManualAttendanceRecord(input: RawImportRow) {
   return result;
 }
 
-export async function saveManualAttendanceRecords(input: RawImportRow, onProgress?: ManualAttendanceProgress) {
+export async function saveManualAttendanceRecords(input: RawImportRow, onProgress?: ManualAttendanceProgress, context?: MaintenancePrimaryContext) {
   const eventIds = input.eventIds;
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!Array.isArray(eventIds) || eventIds.length > 10000 || eventIds.some(id => typeof id !== "string" || !uuid.test(id))) {
@@ -5214,7 +5267,7 @@ export async function saveManualAttendanceRecords(input: RawImportRow, onProgres
   // An empty selection retains the existing zero-attendance registration behaviour.
   const inputs = ids.length ? ids.map(eventId => ({ ...input, attendanceType: "manual", eventId })) :
     [{ ...input, attendanceType: "zero_attendance", eventId: undefined, event_id: undefined }];
-  return saveManualAttendanceInputs(inputs, onProgress);
+  return saveManualAttendanceInputs(inputs, onProgress, context);
 }
 
 export async function updateAttendanceRecords(
@@ -7487,7 +7540,7 @@ function getCalculationSourceFlags(sourceTypes?: CalculationSourceType[]) {
 }
 
 
-async function resolveUnattachedAttendanceEventIdsWithClient(
+export async function resolveUnattachedAttendanceEventIdsWithClient(
   client: PoolClient,
   schoolYearId: string | null,
 ) {
@@ -8169,7 +8222,7 @@ export function selectExpectedEventGroupRepairTargets(
   });
 }
 
-async function refreshCalculationResultsWithClient(
+export async function refreshCalculationResultsWithClient(
   client: PoolClient,
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> & {
     logConsistencyViolation?: boolean;
@@ -9194,7 +9247,7 @@ async function loadCalculationPendingSummary(
   };
 }
 
-async function acknowledgeCalculationInputChangesWithClient(
+export async function acknowledgeCalculationInputChangesWithClient(
   client: PoolClient,
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> & {
     actor?: { sub: string; name?: string | null; email?: string | null; role?: string | null };
@@ -9307,6 +9360,7 @@ async function acknowledgeCalculationInputChangesWithClient(
 
 export async function getCalculationStatus(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> = {},
+  client?: PoolClient,
 ): Promise<CalculationStatus> {
   const schoolYearId = cleanText(options.schoolYearId) || null;
   const importIds = normalizeImportIds(options.importIds ?? []);
@@ -9314,7 +9368,8 @@ export async function getCalculationStatus(
   const sourceFlags = getCalculationSourceFlags(sourceTypes);
   const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
 
-  const result = await query<{
+  const runQuery = <T extends QueryResultRow>(text:string,params:unknown[]) => client ? client.query<T>(text,params) : query<T>(text,params);
+  const result = await runQuery<{
     source_record_count: string | number;
     source_student_count: string | number;
     latest_source_updated_at: Date | string | null;
@@ -9864,6 +9919,7 @@ export async function repairCalculationConsistency(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> & {
     actor?: { sub: string; name?: string | null; email?: string | null; role?: string | null };
   },
+  context?: MaintenancePrimaryContext,
 ) {
   const schoolYearId = cleanText(options.schoolYearId);
   if (!schoolYearId) {
@@ -9873,8 +9929,8 @@ export async function repairCalculationConsistency(
   const sourceTypes = normalizeCalculationSourceTypes(options.sourceTypes ?? []);
   const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
 
-  return withTransaction(async (client) => {
-    await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
+  return primaryTransaction(context,async (client) => {
+    if (!context) await client.query(ATTENDANCE_ABSENCE_SYNC_LOCK_SQL);
     // Repair stale persisted rows first, then inspect fresh source calculations.
     const previousViolations = await assertExpectedEventConsistencyWithClient(
       client, "calculation_results", schoolYearId, calculationScopeKey,
@@ -10226,7 +10282,7 @@ type AttendanceFinalResultsFilter = {
   offset?: number;
 };
 
-async function refreshAttendanceFinalResultsWithClient(
+export async function refreshAttendanceFinalResultsWithClient(
   client: PoolClient,
   options: Pick<AttendanceFinalResultsFilter, "schoolYearId" | "importId"> & {
     logConsistencyViolation?: boolean;
@@ -11456,7 +11512,7 @@ function validateStudentEventAttendanceChanges(finalResultId: string, changes: S
   }
 }
 
-async function writeStudentEventAttendancesWithClient(
+export async function writeStudentEventAttendancesWithClient(
   client: PoolClient,
   finalResultId: string,
   changes: StudentEventAttendanceChange[],
@@ -12669,7 +12725,7 @@ export async function createEventCollegeExemptions(input: {
   schoolYearId?: unknown;
   createdBy?: unknown;
   onProgress?: (progress: SaveEventExemptionsProgress) => void;
-}) {
+}, context?: MaintenancePrimaryContext) {
   const requestedCollegeLabels = Array.isArray(input.colleges)
     ? uniqueCleanTextValues(input.colleges.map(String))
     : [];
@@ -12719,13 +12775,13 @@ export async function createEventCollegeExemptions(input: {
     total: totalExemptions,
   });
 
-  return withTransaction(async (client) => {
+  return primaryTransaction(context,async (client) => {
     emit({
       stage: "waiting_for_lock",
       percent: 10,
       message: "Waiting for attendance recalculation access.",
     });
-    await lockAttendanceAbsenceSync(client);
+    if (!context) await lockAttendanceAbsenceSync(client);
     const eventResult = await client.query<{ id: string }>(
       `SELECT id FROM attendance_events WHERE id = ANY($1::uuid[]) AND school_year_id = $2`,
       [eventIds, schoolYearId],
@@ -12777,6 +12833,8 @@ export async function createEventCollegeExemptions(input: {
       percent: 40,
       message: `Recalculating absences for ${affectedStudentIds.size} affected student${affectedStudentIds.size === 1 ? "" : "s"}.`,
     });
+    if (context) context.defer({schoolYearId,studentIds:[...affectedStudentIds]});
+    else {
     await syncAbsencesForStudents(client, Array.from(affectedStudentIds), schoolYearId);
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
       client,
@@ -12806,6 +12864,8 @@ export async function createEventCollegeExemptions(input: {
         });
       },
     );
+
+    }
 
     emit({
       stage: "finalizing",
@@ -13031,7 +13091,7 @@ export async function deleteEventExemptionsByIds(input: {
   collegeExemptionIds?: unknown;
   yearLevelExemptionIds?: unknown;
   onProgress?: (progress: RemoveSelectedEventExemptionsProgress) => void;
-}) {
+}, context?: MaintenancePrimaryContext) {
   const schoolYearId = cleanText(input.schoolYearId);
   const collegeExemptionIds = Array.isArray(input.collegeExemptionIds)
     ? uniqueCleanTextValues(input.collegeExemptionIds.map(String))
@@ -13063,13 +13123,13 @@ export async function deleteEventExemptionsByIds(input: {
     total: allIds.length,
   });
 
-  const result = await withTransaction(async (client) => {
+  const result = await primaryTransaction(context,async (client) => {
     emit({
       stage: "waiting_for_lock",
       percent: 10,
       message: "Waiting for attendance recalculation access.",
     });
-    await lockAttendanceAbsenceSync(client);
+    if (!context) await lockAttendanceAbsenceSync(client);
 
     const schoolYearResult = await client.query<{ id: string }>(
       `SELECT id FROM school_years WHERE id = $1 LIMIT 1`,
@@ -13190,6 +13250,8 @@ export async function deleteEventExemptionsByIds(input: {
       percent: 38,
       message: `Recalculating absences for ${affectedStudentIds.size} affected student${affectedStudentIds.size === 1 ? "" : "s"}.`,
     });
+    if (context) context.defer({schoolYearId,studentIds:[...affectedStudentIds]});
+    else {
     await syncAbsencesForStudents(
       client,
       Array.from(affectedStudentIds),
@@ -13224,6 +13286,8 @@ export async function deleteEventExemptionsByIds(input: {
         });
       },
     );
+
+    }
 
     emit({
       stage: "finalizing",
@@ -13351,7 +13415,7 @@ export async function createEventYearLevelExemptions(input: {
   schoolYearId?: unknown;
   createdBy?: unknown;
   onProgress?: (progress: SaveEventExemptionsProgress) => void;
-}) {
+}, context?: MaintenancePrimaryContext) {
   const requestedYearLevels = Array.isArray(input.yearLevels)
     ? uniqueCleanTextValues(input.yearLevels.map(String))
     : [];
@@ -13387,13 +13451,13 @@ export async function createEventYearLevelExemptions(input: {
     total: totalExemptions,
   });
 
-  return withTransaction(async (client) => {
+  return primaryTransaction(context,async (client) => {
     emit({
       stage: "waiting_for_lock",
       percent: 10,
       message: "Waiting for attendance recalculation access.",
     });
-    await lockAttendanceAbsenceSync(client);
+    if (!context) await lockAttendanceAbsenceSync(client);
     const eventResult = await client.query<{ id: string }>(
       `SELECT id FROM attendance_events WHERE id = ANY($1::uuid[]) AND school_year_id = $2`,
       [eventIds, schoolYearId],
@@ -13464,6 +13528,8 @@ export async function createEventYearLevelExemptions(input: {
       percent: 40,
       message: `Recalculating absences for ${affectedStudentIds.size} affected student${affectedStudentIds.size === 1 ? "" : "s"}.`,
     });
+    if (context) context.defer({schoolYearId,studentIds:[...affectedStudentIds]});
+    else {
     await syncAbsencesForStudents(client, Array.from(affectedStudentIds), schoolYearId);
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
       client,
@@ -13493,6 +13559,8 @@ export async function createEventYearLevelExemptions(input: {
         });
       },
     );
+
+    }
 
     emit({
       stage: "finalizing",

@@ -1,3 +1,5 @@
+import { runSubmittedJob } from "../services/maintenance-jobs.service";
+import type { AuthenticatedRequest } from "./auth.controller";
 import { NextFunction, Request, Response } from "express";
 
 import {
@@ -254,10 +256,8 @@ export async function penaltyResultAbsentEvents(req: Request, res: Response, nex
 
 export async function refreshPenaltyResultRows(req: Request, res: Response, next: NextFunction) {
   try {
-    const rows = await refreshPenaltyResults({
-      schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
-      importIds: parseImportIds(req.body?.importIds ?? req.body?.import_ids),
-    });
+    const schoolYearId = req.body?.schoolYearId ?? req.body?.school_year_id ?? null;
+    const rows = await runSubmittedJob<Awaited<ReturnType<typeof refreshPenaltyResults>>>("derived_refresh",schoolYearId,{operation:"penalties",body:{schoolYearId,importIds:parseImportIds(req.body?.importIds ?? req.body?.import_ids)}},(req as AuthenticatedRequest).user?.sub,undefined,()=>req.aborted||res.destroyed||res.writableEnded);
 
     res.json({ message: "Penalty results refreshed.", data: rows });
   } catch (error) {
