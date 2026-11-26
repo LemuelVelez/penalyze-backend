@@ -537,7 +537,7 @@ app.use((_req: Request, res: Response) => {
   res.status(404).json({ message: "Route not found." });
 });
 
-app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
   const requestId = crypto.randomUUID();
   const raw = error as { statusCode?: number; status?: number; message?: string; stack?: string; expose?: boolean; code?: string };
   const status = error instanceof multer.MulterError ? 400 : Number(raw?.statusCode ?? raw?.status ?? 500);
@@ -552,14 +552,17 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   const safeStatus = raw?.code && Object.prototype.hasOwnProperty.call(databaseStatuses, raw.code)
     ? databaseStatuses[raw.code]
     : status >= 400 && status < 500 ? status : 500;
-  console.error(`[${requestId}] request failed`, error);
+  console.error(`[${requestId}] ${req.method} ${req.path} failed`, error);
+  if (safeStatus === 503) res.setHeader("Retry-After", "15");
   res.setHeader("X-Request-ID", requestId);
   const response: { message: string; requestId: string; stack?: string; code?: string } = {
     message: safeStatus === 400 ? "Invalid request." : safeStatus === 404 ? "Resource not found." : "Request failed.",
     requestId,
   };
   const databaseMessages: Record<string, string> = {
-    "57014": "The save took too long and was cancelled. Try again.",
+    "57014": req.method === "GET" || req.method === "HEAD"
+      ? "The database read timed out. Attendance data may still be rebuilding. Try again shortly."
+      : "The save took too long and was cancelled. Try again.",
     "55P03": "Another attendance update is still running. Try again in a moment.",
     "40P01": "The save conflicted with another update. Try again.",
     "40001": "The save conflicted with another update. Try again.",

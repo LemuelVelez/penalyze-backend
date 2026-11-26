@@ -3073,16 +3073,19 @@ async function syncZeroAttendanceFineRecordsForStudents(
           AND ($2::uuid IS NULL OR ar.school_year_id = $2::uuid)
         ORDER BY ar.id
         FOR UPDATE OF ar
+      ), updated_records AS (
+        UPDATE attendance_records ar
+        SET no_of_absences = target.no_of_absences, updated_at = NOW()
+        FROM target_records target
+        WHERE ar.id = target.id
+          AND ar.no_of_absences IS DISTINCT FROM target.no_of_absences
+        RETURNING ar.*
       )
-      UPDATE attendance_records ar
-      SET no_of_absences = target.no_of_absences,
-          updated_at = CASE
-            WHEN ar.no_of_absences IS DISTINCT FROM target.no_of_absences THEN NOW()
-            ELSE ar.updated_at
-          END
-      FROM target_records target
-      WHERE ar.id = target.id
-      RETURNING ar.*
+      SELECT updated.* FROM updated_records updated
+      UNION ALL
+      SELECT ar.* FROM target_records target
+      JOIN attendance_records ar ON ar.id = target.id
+      WHERE NOT EXISTS (SELECT 1 FROM updated_records updated WHERE updated.id = ar.id)
     `,
     [studentIds, schoolYearId, ZERO_ATTENDANCE_REMARK],
   );
@@ -3201,16 +3204,26 @@ export async function syncAbsencesForStudents(
         WHERE ${resolvedAttendanceSourceSql("ar")} AND ${getAttendanceRecordVisibilitySql("ar")}
         ORDER BY ar.id
         FOR UPDATE OF ar
+      ), updated_records AS (
+        -- Do not write unchanged rows: each UPDATE fires the calculation-input
+        -- tracking trigger, even when the absence count has not changed.
+        UPDATE attendance_records ar
+        SET no_of_absences = target.no_of_absences, updated_at = NOW()
+        FROM target_records target
+        WHERE ar.id = target.id
+          AND ar.no_of_absences IS DISTINCT FROM target.no_of_absences
+        RETURNING ar.*
+      ), current_records AS (
+        SELECT updated.* FROM updated_records updated
+        UNION ALL
+        SELECT ar.* FROM target_records target
+        JOIN attendance_records ar ON ar.id = target.id
+        WHERE NOT EXISTS (SELECT 1 FROM updated_records updated WHERE updated.id = ar.id)
       )
-      UPDATE attendance_records ar
-      SET no_of_absences = target.no_of_absences,
-          updated_at = CASE
-            WHEN ar.no_of_absences IS DISTINCT FROM target.no_of_absences THEN NOW()
-            ELSE ar.updated_at
-          END
-      FROM target_records target
-      WHERE ar.id = target.id
-      RETURNING ar.*, target.college_key AS attendance_event_roster_college_key, target.school_year_id AS attendance_school_year_id
+      SELECT ar.*, target.college_key AS attendance_event_roster_college_key,
+        target.school_year_id AS attendance_school_year_id
+      FROM current_records ar
+      JOIN target_records target ON target.id = ar.id
     `,
     [uniqueStudentIds, schoolYearId],
   );
@@ -6769,13 +6782,24 @@ export async function listAttendanceEvents(
 ) {
   const result = await query<AttendanceEventRecord>(
     `
+      WITH event_page AS MATERIALIZED (
+        SELECT e.*
+        FROM attendance_events e
+        ${schoolYearId ? "WHERE e.school_year_id = $3" : ""}
+        ORDER BY e.event_order ASC NULLS LAST,
+          COALESCE(e.event_start_at, e.event_end_at, e.created_at) ASC,
+          e.created_at ASC, e.id ASC
+        LIMIT $1 OFFSET $2
+      )
       SELECT
         e.*,
-        COUNT(DISTINCT attendee.normalized_student_id)::INT AS attendees_count,
+        attendee.attendees_count,
         COALESCE(exemptions.items, '[]'::jsonb) AS exempted_colleges,
         COALESCE(year_exemptions.items, '[]'::jsonb) AS exempted_year_levels
-      FROM attendance_events e
-      LEFT JOIN LATERAL (
+      FROM event_page e
+      CROSS JOIN LATERAL (
+        SELECT COUNT(normalized_student_id)::INT AS attendees_count
+        FROM (
         SELECT LOWER(TRIM(ar.student_id)) AS normalized_student_id
         FROM attendance_records ar
         WHERE ar.event_id = e.id
@@ -6785,7 +6809,8 @@ export async function listAttendanceEvents(
         FROM manual_attendance_records mar
         WHERE mar.event_id = e.id
           AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
-      ) attendee ON TRUE
+        ) AS distinct_attendees
+      ) attendee
       LEFT JOIN LATERAL (
         SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
           'id', x.id,
@@ -6806,10 +6831,9 @@ export async function listAttendanceEvents(
         FROM attendance_event_year_level_exemptions x
         WHERE x.event_id = e.id
       ) year_exemptions ON TRUE
-      ${schoolYearId ? "WHERE e.school_year_id = $3" : ""}
-      GROUP BY e.id, exemptions.items, year_exemptions.items
-      ORDER BY e.event_order ASC NULLS LAST, COALESCE(e.event_start_at, e.event_end_at, e.created_at) ASC, e.created_at ASC
-      LIMIT $1 OFFSET $2
+      ORDER BY e.event_order ASC NULLS LAST,
+        COALESCE(e.event_start_at, e.event_end_at, e.created_at) ASC,
+        e.created_at ASC, e.id ASC
     `,
     schoolYearId ? [limit, offset, schoolYearId] : [limit, offset],
   );
@@ -8856,7 +8880,26 @@ function getCalculationChangeCoveredByScopeSql(
   )`;
 }
 
+const pendingCalculationSummaryReads = new Map<string, Promise<CalculationPendingSummary>>();
+
 export async function getCalculationPendingSummary(
+  schoolYearIdInput?: string,
+): Promise<CalculationPendingSummary> {
+  const key = cleanText(schoolYearIdInput);
+  const existing = pendingCalculationSummaryReads.get(key);
+  if (existing) return existing;
+  const work = loadCalculationPendingSummary(key || undefined);
+  pendingCalculationSummaryReads.set(key, work);
+  try {
+    return await work;
+  } finally {
+    if (pendingCalculationSummaryReads.get(key) === work) {
+      pendingCalculationSummaryReads.delete(key);
+    }
+  }
+}
+
+async function loadCalculationPendingSummary(
   schoolYearIdInput?: string,
 ): Promise<CalculationPendingSummary> {
   const schoolYearId = cleanText(schoolYearIdInput) || null;
@@ -8883,6 +8926,13 @@ export async function getCalculationPendingSummary(
         FROM calculation_results cr
         WHERE ($1::uuid IS NULL OR cr.school_year_id = $1::uuid)
         GROUP BY cr.school_year_id, cr.calculation_scope_key
+      ), eligible_manual_years AS MATERIALIZED (
+        SELECT DISTINCT mar.school_year_id
+        FROM manual_attendance_records mar
+        WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+          AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+          AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($2::text)
+          AND ${getManualCalculationRecordEligibilitySql("mar")}
       ), relevant_changes AS (
         SELECT cic.*
         FROM calculation_input_changes cic
@@ -8926,15 +8976,12 @@ export async function getCalculationPendingSummary(
               AND (
                 EXISTS (
                   SELECT 1
-                  FROM manual_attendance_records mar
-                  WHERE mar.school_year_id IS NOT DISTINCT FROM cic.school_year_id
-                    AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
-                    AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($2::text)
-                    AND ${getManualCalculationRecordEligibilitySql("mar")}
+                  FROM eligible_manual_years manual_year
+                  WHERE manual_year.school_year_id IS NOT DISTINCT FROM cic.school_year_id
                 )
                 OR EXISTS (
                   SELECT 1
-                  FROM calculation_results existing_cr
+                  FROM saved_scopes existing_cr
                   WHERE existing_cr.school_year_id IS NOT DISTINCT FROM cic.school_year_id
                     AND ${getCalculationScopeIncludesSourceSql("existing_cr", "manual")}
                 )
@@ -8961,7 +9008,7 @@ export async function getCalculationPendingSummary(
                 )
                 OR EXISTS (
                   SELECT 1
-                  FROM calculation_results existing_cr
+                  FROM saved_scopes existing_cr
                   WHERE existing_cr.school_year_id IS NOT DISTINCT FROM cic.school_year_id
                     AND ${getCalculationScopeIncludesSourceSql("existing_cr", "zero_attendance")}
                 )
@@ -8998,9 +9045,8 @@ export async function getCalculationPendingSummary(
       )
       SELECT
         (
-          SELECT MAX(cr.calculated_at)
-          FROM calculation_results cr
-          WHERE ($1::uuid IS NULL OR cr.school_year_id = $1::uuid)
+          SELECT MAX(saved_scope.calculated_at)
+          FROM saved_scopes saved_scope
         ) AS last_calculated_at,
         (
           SELECT MAX(cic.changed_at)
@@ -9026,17 +9072,10 @@ export async function getCalculationPendingSummary(
         ) AS dependency_changes,
         EXISTS (
           SELECT 1
-          FROM (
-            SELECT DISTINCT mar.school_year_id
-            FROM manual_attendance_records mar
-            WHERE ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
-              AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
-              AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($2::text)
-              AND ${getManualCalculationRecordEligibilitySql("mar")}
-          ) manual_year
+          FROM eligible_manual_years manual_year
           WHERE NOT EXISTS (
             SELECT 1
-            FROM calculation_results cr
+            FROM saved_scopes cr
             WHERE cr.school_year_id IS NOT DISTINCT FROM manual_year.school_year_id
               AND ${manualScopeSql}
           )
@@ -9060,7 +9099,7 @@ export async function getCalculationPendingSummary(
           ) zero_year
           WHERE NOT EXISTS (
             SELECT 1
-            FROM calculation_results cr
+            FROM saved_scopes cr
             WHERE cr.school_year_id IS NOT DISTINCT FROM zero_year.school_year_id
               AND ${zeroScopeSql}
           )

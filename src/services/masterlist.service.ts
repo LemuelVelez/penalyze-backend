@@ -696,35 +696,26 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
       ? (await client.query<{college_key:string;event_id:string}>(`WITH ${attendanceEventRosterScopeCteSql("$1")} SELECT college_key,event_id FROM event_roster_scope`,[schoolYear.id])).rows
       : [];
     const finals: Awaited<ReturnType<typeof listAttendanceFinalResults>> = [];
-    const joined: {student_number_key:string;final_id:string|null}[] = [];
     const participation = new Map<string, Set<string>>();
-    for(let i=0;i<studentKeys.length;i+=200) {
-      const keys=studentKeys.slice(i,i+200);
-      finals.push(...await listAttendanceFinalResults({schoolYearId:schoolYear.id,consolidatedOnly:true,includeEventDetails:true,eventRosterScope,studentKeys:keys,limit:2147483647,offset:0},client));
+    for (let i = 0; i < studentKeys.length; i += 200) {
+      const keys = studentKeys.slice(i, i + 200);
       if (hasMasterlist) {
-        const observed = await client.query<{normalized_student_id:string;event_id:string}>(`WITH ${attendanceEventParticipationCteSql(true)} SELECT normalized_student_id,event_id FROM event_participation`, [keys.map(key => key.toLowerCase()), schoolYear.id]);
+        // The masterlist view derives every cell and count from actual evidence.
+        // Do not fetch stored final rows and repeat the per-student event scans.
+        const observed = await client.query<{normalized_student_id:string;event_id:string}>(
+          `WITH ${attendanceEventParticipationCteSql(true)} SELECT normalized_student_id,event_id FROM event_participation`,
+          [keys.map(key => key.toLowerCase()), schoolYear.id],
+        );
         for (const record of observed.rows) {
-          const key = record.normalized_student_id;
-          const eventIds = participation.get(key) ?? new Set<string>();
+          const eventIds = participation.get(record.normalized_student_id) ?? new Set<string>();
           eventIds.add(record.event_id);
-          participation.set(key, eventIds);
+          participation.set(record.normalized_student_id, eventIds);
         }
+      } else {
+        finals.push(...await listAttendanceFinalResults({schoolYearId:schoolYear.id,consolidatedOnly:true,includeEventDetails:true,eventRosterScope,studentKeys:keys,limit:2147483647,offset:0},client));
       }
-      if(hasMasterlist) joined.push(...(await client.query<{student_number_key:string;final_id:string|null}>(`SELECT m.student_number_key,f.id AS final_id FROM student_masterlist m LEFT JOIN attendance_final_results f ON f.school_year_id=m.school_year_id AND f.import_id IS NULL AND public.masterlist_student_number_key(f.student_id)=m.student_number_key WHERE m.school_year_id=$1 AND m.student_number_key = ANY($2::text[]) ORDER BY m.student_number_key`,[schoolYear.id,keys])).rows);
     }
-    const finalByUuid=new Map(finals.map(r=>[r.id,r]));
-    const byId=new Map<string, typeof finals[number]>();
-    for (const joinedRow of joined) {
-      const final = joinedRow.final_id ? finalByUuid.get(joinedRow.final_id) : undefined;
-      if (!final) continue;
-      const previous = byId.get(joinedRow.student_number_key);
-      if (!previous) { byId.set(joinedRow.student_number_key, final); continue; }
-      const details = new Map((previous.event_details ?? []).map(detail => [detail.id, detail]));
-      for (const detail of final.event_details ?? []) {
-        if (!details.has(detail.id) || detail.attended) details.set(detail.id, detail);
-      }
-      byId.set(joinedRow.student_number_key, { ...previous, event_details: [...details.values()] });
-    }
+    const finalByUuid = new Map(finals.map(r => [r.id, r]));
     const exemptions=(await client.query<{event_id:string;college_key:string|null;year_level_key:string|null}>(`SELECT x.event_id,x.college_key,NULL::text AS year_level_key FROM attendance_event_college_exemptions x JOIN attendance_events e ON e.id=x.event_id WHERE e.school_year_id=$1 UNION ALL SELECT x.event_id,x.college_key,x.year_level_key FROM attendance_event_year_level_exemptions x JOIN attendance_events e ON e.id=x.event_id WHERE e.school_year_id=$1`,[schoolYear.id])).rows;
     const roster = new Set<string>();
     if (hasMasterlist) {
@@ -750,8 +741,7 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
       return values;
     }
     const rows:FinalRow[]=hasMasterlist ? pageMaster.map(m=>{
-      const r=byId.get(normalizeStudentNumberKey(m.student_number));
-      const event_details=eventValues(m,r,m.student_number_key);
+      const event_details=eventValues(m,undefined,m.student_number_key);
       const values=Object.values(event_details);
       const attended_events=values.filter(value=>value==="P").length;
       const total_absences=values.filter(value=>value==="A").length;

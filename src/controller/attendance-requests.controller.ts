@@ -6,6 +6,7 @@ import type { AuthenticatedRequest } from "./auth.controller";
 import {
   createAttendanceRequest,
   listAttendanceRequests,
+  countPendingAttendanceRequests,
   listPublicAttendanceRequestsForStudent,
   lookupPublicStudentById,
   removeAttendanceRequestEvent,
@@ -112,6 +113,14 @@ export async function requests(
   next: NextFunction,
 ) {
   try {
+    // The dashboard only needs a count, not evidence URLs or student profiles.
+    if (req.query.countOnly === "true" && req.query.status === "pending" &&
+        req.query.requestType === undefined && req.query.request_type === undefined &&
+        req.query.schoolYearId === undefined && req.query.school_year_id === undefined &&
+        req.query.studentId === undefined && req.query.student_id === undefined) {
+      res.json({ data: await countPendingAttendanceRequests() });
+      return;
+    }
     const rows = await listAttendanceRequests({
       status: req.query.status,
       requestType: req.query.requestType ?? req.query.request_type,

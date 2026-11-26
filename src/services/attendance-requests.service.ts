@@ -968,6 +968,13 @@ export async function createAttendanceRequest(input: AttendanceRequestInput) {
   });
 }
 
+export async function countPendingAttendanceRequests(): Promise<number> {
+  const result = await query<{ count: string }>(
+    "SELECT COUNT(*) AS count FROM attendance_requests WHERE status = 'pending'",
+  );
+  return Number(result.rows[0]?.count ?? 0);
+}
+
 export async function listAttendanceRequests(
   options: AttendanceRequestListOptions = {},
 ) {
