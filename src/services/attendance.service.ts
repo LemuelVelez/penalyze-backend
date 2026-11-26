@@ -2542,10 +2542,9 @@ function attendanceStudentKeySql(value: string) {
 }
 
 function attendanceStudentIdsEqualSql(left: string, right: string) {
-  return `((public.masterlist_student_number_key(${right}) ~ '^TC-[0-9]{2}-[A-Z]-[0-9]{5}$'
-    AND public.masterlist_student_number_key(${left}) = public.masterlist_student_number_key(${right}))
-    OR (public.masterlist_student_number_key(${right}) !~ '^TC-[0-9]{2}-[A-Z]-[0-9]{5}$'
-    AND LOWER(TRIM(${left})) = LOWER(TRIM(${right}))))`;
+  // A single equality lets PostgreSQL use hash/merge joins instead of
+  // repeatedly evaluating an OR join across every student and attendance row.
+  return `(${attendanceStudentKeySql(left)} = ${attendanceStudentKeySql(right)})`;
 }
 
 // Remove only this participant's presence; leave the original event roster intact.
@@ -2931,7 +2930,7 @@ async function syncZeroAttendanceFineRecordsForStudents(
         SELECT 1 FROM attendance_records ar
         WHERE ar.deleted_at IS NULL AND ar.event_id IS NULL
           AND ar.school_year_id = $2::uuid
-          AND LOWER(TRIM(ar.student_id)) = ANY($1::text[])
+          AND ${attendanceStudentKeySql("ar.student_id")} = ANY($1::text[])
           AND LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($3::text)
       ) AS present`,
       [studentIds, schoolYearId, ZERO_ATTENDANCE_REMARK],
@@ -2962,7 +2961,7 @@ async function syncZeroAttendanceFineRecordsForStudents(
         WHERE ar.deleted_at IS NULL
           AND ar.event_id IS NULL
           AND LOWER(TRIM(COALESCE(ar.remarks, ''))) = LOWER($3::TEXT)
-          AND LOWER(TRIM(ar.student_id)) = ANY($1::TEXT[])
+          AND ${attendanceStudentKeySql("ar.student_id")} = ANY($1::TEXT[])
           AND ($2::uuid IS NULL OR ar.school_year_id = $2::uuid)
         ORDER BY ar.id
         FOR UPDATE OF ar
@@ -3035,8 +3034,9 @@ export async function syncAbsencesForStudents(
     `
       WITH ${participationCte},
       ${rosterCte},
-      student_scope AS ${scoped ? "MATERIALIZED " : ""}(
-        SELECT DISTINCT
+      selected_records AS MATERIALIZED (
+        SELECT
+          ar.id,
           ${attendanceStudentKeySql("ar.student_id")} AS student_key,
           ar.school_year_id,
           ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} AS college_key,
@@ -3046,6 +3046,10 @@ export async function syncAbsencesForStudents(
           AND ar.event_id IS NOT NULL
           AND ${attendanceStudentKeySql("ar.student_id")} = ANY($1::TEXT[])
           AND ${scoped ? "ar.school_year_id = $2::uuid" : "($2::uuid IS NULL OR ar.school_year_id = $2::uuid)"}
+      ),
+      student_scope AS ${scoped ? "MATERIALIZED " : ""}(
+        SELECT DISTINCT student_key, school_year_id, college_key, year_level_key
+        FROM selected_records
       ),
       student_absences AS ${scoped ? "MATERIALIZED " : ""}(
         SELECT
@@ -3068,7 +3072,7 @@ export async function syncAbsencesForStudents(
            "ss.college_key",
          )}
         LEFT JOIN event_participation attended
-          ON ${attendanceStudentIdsEqualSql("attended.normalized_student_id", "ss.student_key")}
+          ON attended.normalized_student_id = ss.student_key
           AND attended.event_id = roster.event_id
           AND attended.school_year_id ${scoped ? "=" : "IS NOT DISTINCT FROM"} ss.school_year_id
         GROUP BY ss.student_key, ss.college_key, ss.year_level_key, ss.school_year_id
@@ -3079,14 +3083,15 @@ export async function syncAbsencesForStudents(
           sa.college_key,
           sa.no_of_absences,
           sa.school_year_id
-        FROM attendance_records ar
+        FROM selected_records selected
         JOIN student_absences sa
-          ON ${attendanceStudentIdsEqualSql("ar.student_id", "sa.student_key")}
-         AND ${ATTENDANCE_RECORD_EVENT_ROSTER_COLLEGE_SQL} = sa.college_key
-         AND ar.school_year_id ${scoped ? "=" : "IS NOT DISTINCT FROM"} sa.school_year_id
+          ON selected.student_key = sa.student_key
+         AND selected.college_key = sa.college_key
+         AND selected.school_year_id ${scoped ? "=" : "IS NOT DISTINCT FROM"} sa.school_year_id
+         AND selected.year_level_key IS NOT DISTINCT FROM sa.year_level_key
+        JOIN attendance_records ar ON ar.id = selected.id
         WHERE ar.deleted_at IS NULL
           AND ar.event_id IS NOT NULL
-          ${scoped ? `AND ar.school_year_id = $2::uuid AND ${attendanceStudentKeySql("ar.student_id")} = ANY($1::text[])` : ""}
         ORDER BY ar.id
         FOR UPDATE OF ar
       )

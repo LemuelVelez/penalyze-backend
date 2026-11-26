@@ -197,10 +197,10 @@ export async function upsertMasterlistStudent(client: PoolClient, year: string, 
   await client.query("SELECT set_config('penalyze.masterlist_school_year','',true)");
 }
 type Existing = { id: string; student_id: string; name: string; program: string | null; college: string | null; year_level: string | null };
-async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRecord, rebuild = true, cache: MasterlistCache = new Map(), onProgress?: ProgressCallback, isCancelled?: () => boolean) {
+async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRecord, rebuild = true, cache: MasterlistCache = new Map(), onProgress?: ProgressCallback, isCancelled?: () => boolean, offlineRepair = false) {
   const emit = progressReporter(onProgress, isCancelled);
   emit({ stage: "reconciling_records", percent: 10, message: "Counting attendance records…" });
-  await client.query("SELECT set_config('statement_timeout','180000ms',true)");
+  await client.query("SELECT set_config('statement_timeout',$1,true)", [offlineRepair ? "0" : "180000ms"]);
   await client.query("SELECT set_config('lock_timeout','60000ms',true)");
   const index = await loadMasterlist(client, schoolYear.id, cache);
   if (!index.rows.length) throw bad("Upload a masterlist before reconciling.");
@@ -345,7 +345,7 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
   await client.query("SELECT set_config('penalyze.masterlist_school_year','',true)");
   summary.studentsUpdated = changed.size;
   if (rebuild) {
-    await syncMasterlistAbsences(client, schoolYear.id, emit, isCancelled);
+    await syncMasterlistAbsences(client, schoolYear.id, emit, isCancelled, offlineRepair);
     await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client,[schoolYear.id], progress => {
       const stages = ["refreshing_final_results", "refreshing_calculations", "refreshing_penalties"] as const;
       const messages = ["Refreshing final attendance results…", "Refreshing calculations…", "Refreshing penalties…"];
@@ -359,7 +359,7 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
 }
 
 // Migration 047 invokes the same resolver and full rebuild in its transaction.
-export async function repairUploadAttendanceMatchingWithClient(client: PoolClient) {
+export async function repairUploadAttendanceMatchingWithClient(client: PoolClient, onProgress?: ProgressCallback) {
   await lockAttendanceAbsenceSync(client);
   const years = (await client.query<SchoolYearRecord>(`SELECT sy.* FROM school_years sy
     WHERE public.is_masterlist_school_year(sy.id)
@@ -378,7 +378,7 @@ export async function repairUploadAttendanceMatchingWithClient(client: PoolClien
         WHERE m.id=x.id AND (m.name_key,m.last_name,m.given_name,m.full_name)
           IS DISTINCT FROM (x.name_key,x.last_name,x.given_name,x.full_name)`, [JSON.stringify(profiles)]);
     }
-    const summary = await reconcileWithClient(client, year);
+    const summary = await reconcileWithClient(client, year, true, new Map(), onProgress, undefined, true);
     await client.query(`UPDATE student_masterlist_imports SET summary=$2 WHERE id=(SELECT id FROM student_masterlist_imports WHERE school_year_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1)`, [year.id, JSON.stringify(summary)]);
   }
 }
@@ -394,7 +394,7 @@ export async function reconcileMasterlistForAttendanceUpload(client: PoolClient,
   return true;
 }
 
-export async function syncMasterlistAbsences(client: PoolClient, schoolYearId: string, onProgress?: ProgressCallback, isCancelled?: () => boolean) {
+export async function syncMasterlistAbsences(client: PoolClient, schoolYearId: string, onProgress?: ProgressCallback, isCancelled?: () => boolean, offlineRepair = false) {
   const emit = progressReporter(onProgress, isCancelled);
   emit({ stage: "syncing_absences", percent: 68, message: "Preparing absence synchronization…" });
   const rows = (await client.query<{ student_id: string }>("SELECT DISTINCT student_id FROM attendance_records WHERE school_year_id=$1 AND deleted_at IS NULL", [schoolYearId])).rows;
@@ -402,7 +402,10 @@ export async function syncMasterlistAbsences(client: PoolClient, schoolYearId: s
   type SyncResult = Awaited<ReturnType<typeof syncAbsencesForStudents>>;
   const records = new Map<string, SyncResult["records"][number]>();
   const fines = new Map<string, SyncResult["fines"][number]>();
-  const chunkSize = 250;
+  // The migration is offline and atomic: synchronize the whole school year
+  // in one set-based pass rather than rebuilding its roster for every batch.
+  // Interactive reconciliation keeps its existing chunking and cancellation.
+  const chunkSize = offlineRepair ? Math.max(ids.length, 1) : 250;
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i,i + chunkSize);
     const chunkIndex = Math.floor(i / chunkSize) + 1;
