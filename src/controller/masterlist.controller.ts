@@ -83,7 +83,7 @@ export async function download(req:Request,res:Response) {const result=await exp
 
 export async function status(req: AuthenticatedRequest, res: Response) {
   const status = await getMasterlistStatus();
-  const rebuildJob = req.user?.role === "admin" ? (await pool.query(`SELECT id,CASE WHEN status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '2 minutes' THEN 'paused' ELSE status END AS status,phase,percent::float8 AS percent,message,last_error FROM maintenance_jobs WHERE kind='masterlist_presence_rebuild' AND school_year_id=$1 AND status IN ('pending','running','paused','failed') ORDER BY updated_at DESC LIMIT 1`,[status.schoolYearId])).rows[0] ?? null : null;
+  const rebuildJob = req.user?.role === "admin" ? (await pool.query(`SELECT id,CASE WHEN status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '5 minutes' THEN 'paused' ELSE status END AS status,phase,percent::float8 AS percent,message,last_error FROM maintenance_jobs WHERE kind='masterlist_presence_rebuild' AND school_year_id=$1 AND status IN ('pending','running','paused','failed') ORDER BY updated_at DESC LIMIT 1`,[status.schoolYearId])).rows[0] ?? null : null;
   res.json({...status,rebuildJob});
 }
 export async function publicStatus(_req: Request, res: Response) { const { active } = await getMasterlistStatus(); res.json({ active }); }

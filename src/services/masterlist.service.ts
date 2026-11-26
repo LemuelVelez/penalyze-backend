@@ -3,7 +3,7 @@ import type { PoolClient } from "pg";
 import * as XLSX from "xlsx";
 import type { MasterlistStatus, SchoolYearRecord, StudentMasterlistRecord, StudentMasterlistImportRecord, ParsedAttendanceRow, MaintenanceJob } from "../database/model/schema.model";
 import { pool, withTransaction } from "../lib/db";
-import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelKey, normalizeCollegeKey, lockAttendanceAbsenceSync, refreshDerivedAttendanceResultsForSchoolYearsWithClient, refreshAttendanceFinalResultsWithClient, refreshCalculationResultsWithClient, refreshPenaltyResultsForSchoolYearWithClient, listAttendanceFinalResults, listFinalAttendanceEventRoster, syncAbsencesForStudents, attendanceEventRosterScopeCteSql, attendanceEventParticipationCteSql } from "./attendance.service";
+import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelKey, normalizeCollegeKey, lockAttendanceAbsenceSync, refreshDerivedAttendanceResultsForSchoolYearsWithClient, refreshAttendanceFinalResultsWithClient, refreshCalculationResultsWithClient, prepareMasterlistDerivedRefresh, finishMasterlistDerivedRefresh, refreshPenaltyResultsForSchoolYearWithClient, listAttendanceFinalResults, listFinalAttendanceEventRoster, syncAbsencesForStudents, attendanceEventRosterScopeCteSql, attendanceEventParticipationCteSql } from "./attendance.service";
 import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
 import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram, parseStudentNumberParts, isPlaceholderStudentNumber, nameTokens, nameTokensAgree, nameKeysAgree, sharedNameTokenCount, nameTokenSignatures, repairNameMojibake, surnameTokensOverlap, joinedGivenNamesAgree, masterlistNameMatchRank, masterlistNameSignatures } from "./masterlist-normalize";
 
@@ -20,6 +20,7 @@ export type MasterlistProgress = {
 };
 type ProgressCallback = (progress: MasterlistProgress) => void;
 const MASTERLIST_CHUNK_SIZE = 500;
+const MASTERLIST_REFRESH_CHUNK_SIZE = 50;
 function checkCancelled(isCancelled?: () => boolean) {
   if (isCancelled?.()) throw Object.assign(new Error("Masterlist operation was cancelled."), { statusCode: 499 });
 }
@@ -194,8 +195,9 @@ type ReconcileState = {
   derivedUpdates: ReconcileUpdate;
   mapping: { old: string; target: string }[];
   studentIds: string[];
+  refreshKeys?: string[];
 };
-type ReconcileCursor = { id?: string; tableIndex: number; offset?: number };
+type ReconcileCursor = { id?: string; tableIndex: number; offset?: number; refreshOffset?: number; refreshBatchSize?: number };
 async function planReconciliation(client: PoolClient, schoolYear: SchoolYearRecord, cache: MasterlistCache = new Map()): Promise<ReconcileState> {
   const index = await loadMasterlist(client, schoolYear.id, cache);
   if (!index.rows.length) throw bad("Upload a masterlist before reconciling.");
@@ -226,7 +228,7 @@ function reconciliationStage(phase: string): MasterlistProgress["stage"] {
   return "finalizing";
 }
 export { reconciliationStage };
-async function reconcileStep(client: PoolClient, schoolYear: SchoolYearRecord, phase: string, cursor: ReconcileCursor, state: ReconcileState, rebuild: boolean, cache: MasterlistCache = new Map()) {
+async function reconcileStep(client: PoolClient, schoolYear: SchoolYearRecord, phase: string, cursor: ReconcileCursor, state: ReconcileState, rebuild: boolean, cache: MasterlistCache = new Map(), checkpointRefresh = false) {
   const summary = state.summary;
   const index = await loadMasterlist(client, schoolYear.id, cache);
   if (!index.rows.length) throw bad("Upload a masterlist before reconciling.");
@@ -397,15 +399,46 @@ async function reconcileStep(client: PoolClient, schoolYear: SchoolYearRecord, p
     percent = 68+12*(total ? processed/total : 1); message = `Synced absences: ${processed} / ${total} students`;
     nextCursor = {tableIndex:0,offset:processed};
     if (processed>=total) nextPhase = "refresh_final_results";
-  } else if (phase === "refresh_final_results") {
-    await refreshAttendanceFinalResultsWithClient(client,{schoolYearId:schoolYear.id});
-    nextPhase = "refresh_calculations"; percent = 86; message = "Final attendance results refreshed.";
-  } else if (phase === "refresh_calculations") {
-    await refreshCalculationResultsWithClient(client,{schoolYearId:schoolYear.id});
-    nextPhase = "refresh_penalties"; percent = 92; message = "Calculations refreshed.";
-  } else if (phase === "refresh_penalties") {
-    await refreshPenaltyResultsForSchoolYearWithClient(client,schoolYear.id);
-    nextPhase = "finalize"; percent = 98; message = "Penalties refreshed.";
+  } else if (phase === "refresh_final_results" || phase === "refresh_calculations" || phase === "refresh_penalties") {
+    const final = phase === "refresh_final_results";
+    const calculations = phase === "refresh_calculations";
+    const start = final ? 80 : calculations ? 86 : 92;
+    const end = start+6;
+    const following = final ? "refresh_calculations" : calculations ? "refresh_penalties" : "finalize";
+    const label = final ? "final results" : calculations ? "calculations" : "penalties";
+    const completedMessage = final ? "Final attendance results refreshed." : calculations ? "Calculations refreshed." : "Penalties refreshed.";
+    if (!checkpointRefresh) {
+      if (final) await refreshAttendanceFinalResultsWithClient(client,{schoolYearId:schoolYear.id});
+      else if (calculations) await refreshCalculationResultsWithClient(client,{schoolYearId:schoolYear.id});
+      else await refreshPenaltyResultsForSchoolYearWithClient(client,schoolYear.id);
+      nextPhase = following; percent = end; message = completedMessage;
+    } else if (!state.refreshKeys) {
+      state.refreshKeys = await prepareMasterlistDerivedRefresh(client,schoolYear.id,final || calculations);
+      nextCursor = {tableIndex:0,refreshOffset:0};
+      processed = 0; total = state.refreshKeys.length; percent = start;
+      message = `Preparing ${label}: ${total} student keys`;
+    } else {
+      const offset = cursor.refreshOffset ?? 0;
+      total = state.refreshKeys.length;
+      if (offset < total) {
+        const batchSize = cursor.refreshBatchSize ?? MASTERLIST_REFRESH_CHUNK_SIZE;
+        const chunk = state.refreshKeys.slice(offset,offset+batchSize);
+        const options = {schoolYearId:schoolYear.id,masterlistStudentKeys:chunk,resolveUnattachedEvents:false};
+        if (final) await refreshAttendanceFinalResultsWithClient(client,options);
+        else if (calculations) await refreshCalculationResultsWithClient(client,options);
+        else await refreshPenaltyResultsForSchoolYearWithClient(client,schoolYear.id,undefined,chunk);
+        processed = offset+chunk.length;
+        nextCursor = {tableIndex:0,refreshOffset:processed,refreshBatchSize:batchSize};
+        percent = start+(end-start)*processed/Math.max(1,total);
+        message = `Refreshed ${label}: ${processed} / ${total} student keys`;
+      } else {
+        if (final || calculations) await finishMasterlistDerivedRefresh(client,schoolYear.id,final ? "attendance_final_results" : "calculation_results");
+        // Refresh the key list for the next phase; never reuse an absence offset.
+        delete state.refreshKeys;
+        nextCursor = {tableIndex:0};
+        processed = total; nextPhase = following; percent = end; message = completedMessage;
+      }
+    }
   } else if (phase === "finalize") {
     await client.query(`UPDATE student_masterlist_imports SET summary=$2 WHERE id=(SELECT id FROM student_masterlist_imports WHERE school_year_id=$1 ORDER BY created_at DESC,id DESC LIMIT 1)`, [schoolYear.id,JSON.stringify(summary)]);
     done = true; percent = 100; message = "Masterlist reconciled.";
@@ -435,9 +468,21 @@ export async function planMasterlistMaintenance(client: PoolClient, job: Mainten
   const state = await planReconciliation(client,year);
   return {total:state.totals.reduce((sum,count)=>sum+count,0),phase:job.kind === "masterlist_presence_rebuild" ? "normalize_masterlist" : `reconcile:${scopedTables[0]}`,cursor:{tableIndex:0},state};
 }
+// Only a rolled-back result batch can be reduced and replayed safely. Do not
+// retry planning, the whole-term consistency audit, or other job kinds here.
+export function smallerMasterlistRefreshCursor(job: MaintenanceJob): ReconcileCursor | null {
+  if (job.kind !== "masterlist_presence_rebuild" && job.kind !== "masterlist_reconcile") return null;
+  if (!["refresh_final_results", "refresh_calculations", "refresh_penalties"].includes(job.phase)) return null;
+  const state = job.state as ReconcileState;
+  const cursor = job.cursor as ReconcileCursor;
+  const offset = cursor.refreshOffset;
+  const size = cursor.refreshBatchSize ?? MASTERLIST_REFRESH_CHUNK_SIZE;
+  if (offset === undefined || !state.refreshKeys || offset >= state.refreshKeys.length || size <= 1) return null;
+  return {...cursor,refreshBatchSize:Math.max(1,Math.floor(size/2))};
+}
 export async function stepMasterlistMaintenance(client: PoolClient, job: MaintenanceJob) {
   const state = job.state as ReconcileState;
-  return reconcileStep(client,state.summary.schoolYear,job.phase,job.cursor as ReconcileCursor,state,true);
+  return reconcileStep(client,state.summary.schoolYear,job.phase,job.cursor as ReconcileCursor,state,true,new Map(),true);
 }
 
 // Called inside the existing upload transaction, after its raw rows are saved.

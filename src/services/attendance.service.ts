@@ -2609,7 +2609,15 @@ function scopedAttendanceStudentKeySql(value: string, schoolYear: string) {
   return `(CASE WHEN ${hasMasterlistScopeSql(schoolYear)} THEN LOWER(public.masterlist_student_number_key(${value})) ELSE LOWER(TRIM(${value})) END)`;
 }
 
-function canonicalStudentsCteSql() {
+function canonicalStudentsCteSql(masterlistKeysParam?: string) {
+  if (masterlistKeysParam) return `canonical_students AS MATERIALIZED (
+    SELECT DISTINCT ON (student_key) s.*, TRUE AS masterlist_scope,
+      LOWER(public.masterlist_student_number_key(s.student_id)) AS student_key
+    FROM students s
+    WHERE NULLIF(TRIM(s.student_id), '') IS NOT NULL
+      AND public.masterlist_student_number_key(s.student_id) = ANY(${masterlistKeysParam}::text[])
+    ORDER BY student_key, s.updated_at DESC, s.created_at DESC, s.id DESC
+  )`;
   return `canonical_students AS (
     SELECT DISTINCT ON (scope.masterlist_scope, student_key)
       s.*, scope.masterlist_scope,
@@ -8140,6 +8148,85 @@ export function getDenominatorEventScopeCtesSql() {
       )`;
 }
 
+// A masterlist rebuild uses authoritative profiles. Keep the complete term's
+// roster for every batch (never restrict the denominator to the batch), but
+// restrict participation and result writes to the indexed student keys.
+function masterlistRefreshFilter(alias: string, parameter?: string, column = "student_id") {
+  return parameter ? `AND public.masterlist_student_number_key(${alias}.${column}) = ANY(${parameter}::text[])` : "";
+}
+
+function masterlistRefreshYearLevels(parameter: string) {
+  return `calculation_resolved_year_levels AS MATERIALIZED (
+    SELECT ml.school_year_id, LOWER(ml.student_number_key) AS normalized_student_id, ml.year_level_key
+    FROM student_masterlist ml
+    WHERE ml.school_year_id = $1::uuid AND ml.student_number_key = ANY(${parameter}::text[])
+  )`;
+}
+
+function masterlistRefreshDenominator(parameter: string) {
+  const college = getCanonicalCollegeKeySql("ml", "ml");
+  const matched = (alias: string) => `${alias}.masterlist_status IN ('matched_by_id', 'matched_by_partial_id', 'matched_by_name', 'id_name_mismatch')`;
+  return `masterlist_event_sources AS MATERIALIZED (
+    SELECT ar.school_year_id, COALESCE(ar.event_id, ai.event_id) AS event_id,
+      ar.student_id, ml.student_number_key, ${college} AS college_key
+    FROM attendance_records ar
+    JOIN student_masterlist ml ON ml.school_year_id = ar.school_year_id
+      AND ml.student_number_key = public.masterlist_student_number_key(ar.student_id)
+    LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
+    WHERE ar.school_year_id = $1::uuid AND ${matched("ar")}
+      AND ${getAttendanceRecordVisibilitySql("ar")}
+      AND COALESCE(ar.event_id, ai.event_id) IS NOT NULL
+      AND ${getEventStudentExemptionFilterSql("COALESCE(ar.event_id, ai.event_id)", "ml.year_level_key", college)}
+    UNION ALL
+    SELECT mar.school_year_id, mar.event_id, mar.student_id, ml.student_number_key, ${college}
+    FROM manual_attendance_records mar
+    JOIN student_masterlist ml ON ml.school_year_id = mar.school_year_id
+      AND ml.student_number_key = public.masterlist_student_number_key(mar.student_id)
+    WHERE mar.school_year_id = $1::uuid AND ${matched("mar")} AND mar.event_id IS NOT NULL
+      AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+      AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
+      AND ${getEventStudentExemptionFilterSql("mar.event_id", "ml.year_level_key", college)}
+  ), masterlist_override_events AS MATERIALIZED (
+    SELECT correction.school_year_id, correction.event_id, ml.student_number_key, ${college} AS college_key
+    FROM attendance_student_event_overrides correction
+    JOIN student_masterlist ml ON ml.school_year_id = correction.school_year_id
+      AND ml.student_number_key = public.masterlist_student_number_key(correction.student_key)
+    WHERE correction.school_year_id = $1::uuid AND correction.attended = TRUE
+      AND ${getEventStudentExemptionFilterSql("correction.event_id", "ml.year_level_key", college)}
+  ), event_roster_scope AS MATERIALIZED (
+    SELECT school_year_id, event_id, college_key FROM masterlist_event_sources WHERE college_key IS NOT NULL
+    UNION
+    SELECT school_year_id, event_id, college_key FROM masterlist_override_events WHERE college_key IS NOT NULL
+  ), event_participation AS MATERIALIZED (
+    SELECT source.school_year_id, source.event_id, LOWER(source.student_number_key) AS normalized_student_id
+    FROM masterlist_event_sources source
+    WHERE source.student_number_key = ANY(${parameter}::text[])
+      AND NULLIF(TRIM(source.student_id), '') IS NOT NULL
+      AND ${getStudentEventOverrideExclusionSql("source.school_year_id", "source.student_id", "source.event_id")}
+    UNION
+    SELECT school_year_id, event_id, LOWER(student_number_key) FROM masterlist_override_events
+    WHERE student_number_key = ANY(${parameter}::text[])
+  )`;
+}
+
+export async function prepareMasterlistDerivedRefresh(client: PoolClient, schoolYearId: string, resolveEvents = true) {
+  const scope = await client.query<{ active: boolean }>(`SELECT ${hasMasterlistScopeSql("$1::uuid")} AS active`, [schoolYearId]);
+  if (!scope.rows[0]?.active) throw createValidationError("An active masterlist is required to refresh in batches.");
+  if (resolveEvents) await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
+  // Include stale result keys so each batch can delete only its own obsolete rows.
+  const { rows } = await client.query<{ student_key: string }>(`
+    SELECT student_number_key AS student_key FROM student_masterlist WHERE school_year_id = $1
+    UNION SELECT public.masterlist_student_number_key(student_id) FROM attendance_final_results WHERE school_year_id = $1
+    UNION SELECT public.masterlist_student_number_key(student_id) FROM calculation_results WHERE school_year_id = $1 AND calculation_scope_key = 'school_year'
+    UNION SELECT public.masterlist_student_number_key(student_id) FROM penalty_results WHERE school_year_id = $1
+    ORDER BY student_key`, [schoolYearId]);
+  return rows.map(row => row.student_key);
+}
+
+export async function finishMasterlistDerivedRefresh(client: PoolClient, schoolYearId: string, table: AttendanceConsistencyTable) {
+  await assertExpectedEventConsistencyWithClient(client, table, schoolYearId, table === "calculation_results" ? "school_year" : undefined, true);
+}
+
 // Repairs are applied to the *displayed* college and year-level groups (not an
 // intermediate raw year level), which also handles source year-level fallbacks.
 // When the set of raw totals changes, an old repair no longer applies.
@@ -8227,6 +8314,7 @@ export async function refreshCalculationResultsWithClient(
   options: Pick<CalculationResultsFilter, "schoolYearId" | "importIds" | "sourceTypes"> & {
     logConsistencyViolation?: boolean;
     resolveUnattachedEvents?: boolean;
+    masterlistStudentKeys?: string[];
   } = {},
 ) {
   const schoolYearId = cleanText(options.schoolYearId) || null;
@@ -8236,14 +8324,17 @@ export async function refreshCalculationResultsWithClient(
   const includeMasterlist = importIds.length === 0 && sourceFlags.includeImported && sourceFlags.includeManual && sourceFlags.includeZeroAttendance;
   const calculationScopeKey = getCalculationScopeKey(importIds, sourceTypes);
 
-  if (options.resolveUnattachedEvents !== false) {
+  const batch = options.masterlistStudentKeys;
+  if (batch && (!schoolYearId || !includeMasterlist)) throw createValidationError("Batched calculations require a full masterlist school year.");
+  const batchParam = batch ? "$9" : undefined;
+  if (options.resolveUnattachedEvents !== false && !batch) {
     await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
   }
 
   await client.query(
     `
-      WITH ${canonicalStudentsCteSql()},
-      ${getYearLevelResolutionCtesSql()}, ${getDenominatorEventScopeCtesSql()}, selected_imported_records AS (
+      WITH ${canonicalStudentsCteSql(batchParam)},
+      ${batchParam ? masterlistRefreshYearLevels(batchParam) : getYearLevelResolutionCtesSql()}, ${batchParam ? masterlistRefreshDenominator(batchParam) : getDenominatorEventScopeCtesSql()}, selected_imported_records AS (
         SELECT
           ar.school_year_id,
           ar.import_id,
@@ -8251,6 +8342,7 @@ export async function refreshCalculationResultsWithClient(
         FROM attendance_records ar
         WHERE ${getAttendanceRecordVisibilitySql("ar")} AND ${resolvedAttendanceSourceSql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+          ${masterlistRefreshFilter("ar", batchParam)}
           AND (
             (
               $5::BOOLEAN
@@ -8273,6 +8365,7 @@ export async function refreshCalculationResultsWithClient(
           ON selected_manual_year_level.school_year_id IS NOT DISTINCT FROM mar.school_year_id
          AND selected_manual_year_level.normalized_student_id = ${scopedAttendanceStudentKeySql("mar.student_id", "mar.school_year_id")}
         WHERE ${resolvedAttendanceSourceSql("mar")} AND ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+          ${masterlistRefreshFilter("mar", batchParam)}
           AND (
             (
               $6::BOOLEAN
@@ -8330,6 +8423,7 @@ export async function refreshCalculationResultsWithClient(
          AND imported_year_level.normalized_student_id = ${scopedAttendanceStudentKeySql("ar.student_id", "ar.school_year_id")}
         WHERE ${getAttendanceRecordVisibilitySql("ar")} AND ${resolvedAttendanceSourceSql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+          ${masterlistRefreshFilter("ar", batchParam)}
       ), all_manual_records AS (
         SELECT
           mar.school_year_id,
@@ -8370,6 +8464,7 @@ export async function refreshCalculationResultsWithClient(
           ON manual_year_level.school_year_id IS NOT DISTINCT FROM mar.school_year_id
          AND manual_year_level.normalized_student_id = ${scopedAttendanceStudentKeySql("mar.student_id", "mar.school_year_id")}
         WHERE ${resolvedAttendanceSourceSql("mar")} AND ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+          ${masterlistRefreshFilter("mar", batchParam)}
           AND (
             mar.attendance_type = 'zero_attendance'
             OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($4::TEXT)
@@ -8417,6 +8512,7 @@ export async function refreshCalculationResultsWithClient(
         WHERE ($1::uuid IS NULL OR ml.school_year_id = $1::uuid)
           AND $8::boolean
           AND public.is_masterlist_school_year(ml.school_year_id)
+          ${batchParam ? `AND ml.student_number_key = ANY(${batchParam}::text[])` : ""}
       ), selected_student_keys AS (
         SELECT school_year_id, normalized_student_id FROM selected_imported_records
         UNION
@@ -8708,8 +8804,18 @@ export async function refreshCalculationResultsWithClient(
       sourceFlags.includeManual,
       sourceFlags.includeZeroAttendance,
       includeMasterlist,
+      ...(batch ? [batch] : []),
     ],
   );
+
+  if (batch) {
+    await client.query(`DELETE FROM calculation_results cr
+      WHERE cr.school_year_id = $1 AND cr.calculation_scope_key = $2
+        AND public.masterlist_student_number_key(cr.student_id) = ANY($3::text[])
+        AND NOT EXISTS (SELECT 1 FROM student_masterlist ml WHERE ml.school_year_id = cr.school_year_id
+          AND ml.student_number_key = public.masterlist_student_number_key(cr.student_id))`, [schoolYearId, calculationScopeKey, batch]);
+    return [];
+  }
 
   await client.query(
     `
@@ -10287,19 +10393,23 @@ export async function refreshAttendanceFinalResultsWithClient(
   options: Pick<AttendanceFinalResultsFilter, "schoolYearId" | "importId"> & {
     logConsistencyViolation?: boolean;
     resolveUnattachedEvents?: boolean;
+    masterlistStudentKeys?: string[];
   } = {},
 ) {
   const schoolYearId = cleanText(options.schoolYearId) || null;
 
-  if (options.resolveUnattachedEvents !== false) {
+  const batch = options.masterlistStudentKeys;
+  if (batch && !schoolYearId) throw createValidationError("Batched final results require a masterlist school year.");
+  const batchParam = batch ? "$3" : undefined;
+  if (options.resolveUnattachedEvents !== false && !batch) {
     await resolveUnattachedAttendanceEventIdsWithClient(client, schoolYearId);
   }
 
   await client.query(
     `
-      WITH ${canonicalStudentsCteSql()},
-      ${getYearLevelResolutionCtesSql()},
-      ${getDenominatorEventScopeCtesSql()},
+      WITH ${canonicalStudentsCteSql(batchParam)},
+      ${batchParam ? masterlistRefreshYearLevels(batchParam) : getYearLevelResolutionCtesSql()},
+      ${batchParam ? masterlistRefreshDenominator(batchParam) : getDenominatorEventScopeCtesSql()},
       all_imported_records AS (
         SELECT
           ar.school_year_id,
@@ -10315,7 +10425,7 @@ export async function refreshAttendanceFinalResultsWithClient(
             WHEN COALESCE(ar.event_id, ai.event_id) IS NOT NULL
               AND NOT (${getEventStudentExemptionFilterSql(
                 "COALESCE(ar.event_id, ai.event_id)",
-                getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
+                batch ? "imported_year_level.year_level_key" : getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
                 getCanonicalCollegeKeySql("ar", "s"),
               )})
             THEN NULL
@@ -10329,8 +10439,12 @@ export async function refreshAttendanceFinalResultsWithClient(
           ON ai.id = ar.import_id
          AND ai.deleted_at IS NULL
         LEFT JOIN canonical_students s ON ${canonicalStudentJoinSql("s", "ar.student_id", "ar.school_year_id")}
+        ${batch ? `LEFT JOIN calculation_resolved_year_levels imported_year_level
+          ON imported_year_level.school_year_id = ar.school_year_id
+          AND imported_year_level.normalized_student_id = LOWER(public.masterlist_student_number_key(ar.student_id))` : ""}
         WHERE ${getAttendanceRecordVisibilitySql("ar")} AND ${resolvedAttendanceSourceSql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+          ${masterlistRefreshFilter("ar", batchParam)}
       ), all_manual_records AS (
         SELECT
           mar.school_year_id,
@@ -10349,7 +10463,7 @@ export async function refreshAttendanceFinalResultsWithClient(
                 mar.event_id IS NOT NULL
                 AND NOT (${getEventStudentExemptionFilterSql(
                   "mar.event_id",
-                  getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
+                  batch ? "manual_year_level.year_level_key" : getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
                   getCanonicalCollegeKeySql("mar", "s"),
                 )})
               )
@@ -10367,14 +10481,18 @@ export async function refreshAttendanceFinalResultsWithClient(
           mar.updated_at
         FROM manual_attendance_records mar
         LEFT JOIN canonical_students s ON ${canonicalStudentJoinSql("s", "mar.student_id", "mar.school_year_id")}
+        ${batch ? `LEFT JOIN calculation_resolved_year_levels manual_year_level
+          ON manual_year_level.school_year_id = mar.school_year_id
+          AND manual_year_level.normalized_student_id = LOWER(public.masterlist_student_number_key(mar.student_id))` : ""}
         WHERE ${resolvedAttendanceSourceSql("mar")} AND ($1::uuid IS NULL OR mar.school_year_id = $1::uuid)
+          ${masterlistRefreshFilter("mar", batchParam)}
           AND (
             mar.attendance_type = 'zero_attendance'
             OR LOWER(TRIM(COALESCE(mar.remarks, ''))) = LOWER($2::TEXT)
             OR mar.event_id IS NULL
             OR ${getEventStudentExemptionFilterSql(
               "mar.event_id",
-              getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
+              batch ? "manual_year_level.year_level_key" : getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
               getCanonicalCollegeKeySql("mar", "s"),
             )}
           )
@@ -10414,6 +10532,7 @@ export async function refreshAttendanceFinalResultsWithClient(
         FROM student_masterlist ml
         WHERE ($1::uuid IS NULL OR ml.school_year_id = $1::uuid)
           AND public.is_masterlist_school_year(ml.school_year_id)
+          ${batchParam ? `AND ml.student_number_key = ANY(${batchParam}::text[])` : ""}
       ), student_keys AS (
         SELECT school_year_id, normalized_student_id FROM imported_totals
         UNION
@@ -10590,6 +10709,7 @@ export async function refreshAttendanceFinalResultsWithClient(
           updated_at = NOW()
         FROM candidates candidate
         WHERE existing.import_id IS NULL
+          ${masterlistRefreshFilter("existing", batchParam)}
           AND existing.school_year_id IS NOT DISTINCT FROM candidate.school_year_id
           AND ${scopedAttendanceStudentKeySql("existing.student_id", "existing.school_year_id")} = ${scopedAttendanceStudentKeySql("candidate.student_id", "candidate.school_year_id")}
           AND (
@@ -10672,6 +10792,7 @@ export async function refreshAttendanceFinalResultsWithClient(
       ), deleted AS (
         DELETE FROM attendance_final_results AS existing
         WHERE ($1::uuid IS NULL OR existing.school_year_id = $1::uuid)
+          ${masterlistRefreshFilter("existing", batchParam)}
           AND (
             existing.import_id IS NOT NULL
             OR NOT EXISTS (
@@ -10688,8 +10809,10 @@ export async function refreshAttendanceFinalResultsWithClient(
         (SELECT COUNT(*)::INT FROM inserted) AS inserted_count,
         (SELECT COUNT(*)::INT FROM deleted) AS deleted_count
     `,
-    [schoolYearId, ZERO_ATTENDANCE_REMARK],
+    [schoolYearId, ZERO_ATTENDANCE_REMARK, ...(batch ? [batch] : [])],
   );
+
+  if (batch) return [];
 
   const currentResult = await client.query<AttendanceFinalResultRecord>(
     `
@@ -10716,7 +10839,11 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
   client: PoolClient,
   schoolYearId?: string,
   _calculationScopeKey?: string,
+  masterlistStudentKeys?: string[],
 ) {
+  if (masterlistStudentKeys && !schoolYearId) throw createValidationError("Batched penalties require a school year.");
+  const batchParams = masterlistStudentKeys ? [schoolYearId, masterlistStudentKeys] : [];
+  const batchScope = masterlistStudentKeys ? "pr.school_year_id = $1::uuid AND public.masterlist_student_number_key(pr.student_id) = ANY($2::text[]) AND " : "";
   const visibleFinalResultSql = getAttendanceFinalResultVisibilitySql("afr");
   const result = await client.query<PenaltyResultRecord>(
     `
@@ -10728,6 +10855,7 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
           afr.*
         FROM attendance_final_results afr
         WHERE ($1::uuid IS NULL OR afr.school_year_id = $1::uuid)
+          ${masterlistRefreshFilter("afr", masterlistStudentKeys ? "$2" : undefined)}
           AND afr.total_absences > 0
           AND afr.college_key IS NOT NULL
           AND ${visibleFinalResultSql}
@@ -10809,13 +10937,13 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
       )
       RETURNING *
     `,
-    [schoolYearId ?? null],
+    [schoolYearId ?? null, ...(masterlistStudentKeys ? [masterlistStudentKeys] : [])],
   );
 
   await client.query(
     `
       DELETE FROM penalty_results pr
-      WHERE NOT EXISTS (
+      WHERE ${batchScope}NOT EXISTS (
         SELECT 1
         FROM attendance_final_results afr
         WHERE afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
@@ -10825,6 +10953,7 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
           AND ${visibleFinalResultSql}
       )
     `,
+    batchParams,
   );
 
   const unresolved = await client.query<{
@@ -10840,7 +10969,7 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
         pr.student_id,
         pr.source_table
       FROM penalty_results pr
-      WHERE NOT EXISTS (
+      WHERE ${batchScope}NOT EXISTS (
         SELECT 1
         FROM attendance_final_results afr
         WHERE afr.school_year_id IS NOT DISTINCT FROM pr.school_year_id
@@ -10852,6 +10981,7 @@ export async function refreshPenaltyResultsForSchoolYearWithClient(
       ORDER BY pr.updated_at DESC, pr.id
       LIMIT 10
     `,
+    batchParams,
   );
 
   if (unresolved.rows.length) {

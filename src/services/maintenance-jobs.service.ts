@@ -5,7 +5,7 @@ import type { PoolClient } from "pg";
 import type { MaintenanceJob } from "../database/model/schema.model";
 import { jobPool, withJobTransaction } from "../lib/db";
 import { tryLockAttendanceAbsenceSync } from "./attendance.service";
-import { planMasterlistMaintenance, stepMasterlistMaintenance, reconciliationStage, type MasterlistProgress } from "./masterlist.service";
+import { planMasterlistMaintenance, stepMasterlistMaintenance, smallerMasterlistRefreshCursor, reconciliationStage, type MasterlistProgress } from "./masterlist.service";
 
 type JobPlan = { total: number; phase: string; cursor: object; state: object };
 type JobStep = JobPlan & { done: boolean; processed: number; percent: number; message: string; result?: unknown };
@@ -50,12 +50,12 @@ export async function getJob(id: string) {
   return normalized(job);
 }
 export async function listJobs(filters: { kind?: string; schoolYearId?: string; open?: boolean } = {}) {
-  const {rows} = await jobPool.query<MaintenanceJob>(`SELECT *, CASE WHEN status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '2 minutes' THEN 'paused' ELSE status END AS status FROM maintenance_jobs WHERE ($1::text IS NULL OR kind=$1) AND ($2::uuid IS NULL OR school_year_id=$2) AND (NOT $3::boolean OR ${openStatus}) ORDER BY updated_at DESC`,[filters.kind ?? null,filters.schoolYearId ?? null,filters.open ?? false]);
+  const {rows} = await jobPool.query<MaintenanceJob>(`SELECT *, CASE WHEN status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '5 minutes' THEN 'paused' ELSE status END AS status FROM maintenance_jobs WHERE ($1::text IS NULL OR kind=$1) AND ($2::uuid IS NULL OR school_year_id=$2) AND (NOT $3::boolean OR ${openStatus}) ORDER BY updated_at DESC`,[filters.kind ?? null,filters.schoolYearId ?? null,filters.open ?? false]);
   return rows.map(normalized);
 }
 export async function claimJob(id: string) {
   const token = randomUUID();
-  const job = await withJobTransaction(async client => (await client.query<MaintenanceJob>(`UPDATE maintenance_jobs SET status='running',runner_token=$2,heartbeat_at=clock_timestamp(),updated_at=clock_timestamp(),started_at=COALESCE(started_at,NOW()),attempts=attempts+1,last_error=NULL WHERE id=$1 AND (status IN ('pending','paused','failed') OR (status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '2 minutes')) RETURNING *`,[id,token])).rows[0]);
+  const job = await withJobTransaction(async client => (await client.query<MaintenanceJob>(`WITH available AS (SELECT id FROM maintenance_jobs WHERE id=$1 AND (status IN ('pending','paused','failed') OR (status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '5 minutes')) FOR UPDATE SKIP LOCKED) UPDATE maintenance_jobs j SET status='running',runner_token=$2,heartbeat_at=clock_timestamp(),updated_at=clock_timestamp(),started_at=COALESCE(j.started_at,NOW()),attempts=j.attempts+1,last_error=NULL FROM available WHERE j.id=available.id RETURNING j.*`,[id,token])).rows[0]);
   if (!job) throw conflict();
   return normalized(job);
 }
@@ -69,23 +69,54 @@ export async function runJob(id: string, onProgress?: (progress: MasterlistProgr
   const token = job.runner_token;
   const handler = requireHandler(job.kind);
   const emit = (message: string, phase = job.phase) => onProgress?.({stage:reconciliationStage(phase),percent:Number(job.percent),message,processed:job.processed,total:job.total});
+  let lockRetries = 0;
   try {
     while (!isCancelled()) {
       const previousPhase = job.phase;
-      const checkpoint = await withJobTransaction(async client => {
-        const acquired = await tryLockAttendanceAbsenceSync(client);
-        const current = (await client.query<MaintenanceJob>("SELECT * FROM maintenance_jobs WHERE id=$1 FOR UPDATE",[id])).rows[0];
-        if (!current || current.runner_token !== token || current.status !== "running") throw conflict();
-        if (!acquired) {
-          await client.query("UPDATE maintenance_jobs SET heartbeat_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1 AND runner_token=$2",[id,token]);
-          return null;
+      let checkpoint: MaintenanceJob | null | undefined;
+      try {
+        checkpoint = await withJobTransaction(async client => {
+          const acquired = await tryLockAttendanceAbsenceSync(client);
+          const current = (await client.query<MaintenanceJob>("SELECT * FROM maintenance_jobs WHERE id=$1 FOR UPDATE",[id])).rows[0];
+          if (!current || current.runner_token !== token || current.status !== "running") throw conflict();
+          if (!acquired) {
+            await client.query("UPDATE maintenance_jobs SET heartbeat_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1 AND runner_token=$2",[id,token]);
+            return null;
+          }
+          // Plan has its own checkpoint; no plan or step is replayed after commit.
+          const step: JobStep = current.phase === "queued"
+            ? {...await handler.plan(client,current),done:false,processed:0,percent:0,message:"Maintenance planned."}
+            : await handler.step(client,current);
+          return (await client.query<MaintenanceJob>(`UPDATE maintenance_jobs SET phase=$3,cursor=$4::jsonb,state=$5::jsonb,processed=$6,total=$7,percent=CASE WHEN $10 THEN 100 ELSE GREATEST(percent,$8) END,message=$9,heartbeat_at=clock_timestamp(),updated_at=clock_timestamp(),status=CASE WHEN $10 THEN 'completed' ELSE 'running' END,completed_at=CASE WHEN $10 THEN NOW() ELSE completed_at END,runner_token=CASE WHEN $10 THEN NULL ELSE runner_token END,result=CASE WHEN $10 THEN $11::jsonb ELSE result END WHERE id=$1 AND runner_token=$2 RETURNING *`,[id,token,step.phase,JSON.stringify(step.cursor),JSON.stringify(step.state),step.processed,step.total,step.percent,step.message,step.done,JSON.stringify(step.result ?? null)])).rows[0];
+        });
+      } catch (error) {
+        const code = (error as {code?:string})?.code;
+        const smaller = code === "57014" ? smallerMasterlistRefreshCursor(job) : null;
+        if (smaller && !isCancelled()) {
+          const message = `Database query timed out. Retrying this checkpoint with ${smaller.refreshBatchSize} student keys per batch.`;
+          // The failed transaction was rolled back. Only save the reduced batch
+          // size, leaving all previously committed data and offsets unchanged.
+          const saved = await withJobTransaction(async client => (await client.query<MaintenanceJob>(
+            `UPDATE maintenance_jobs SET cursor=$3::jsonb,message=$4,heartbeat_at=clock_timestamp(),updated_at=clock_timestamp() WHERE id=$1 AND runner_token=$2 AND status='running' RETURNING *`,
+            [id,token,JSON.stringify(smaller),message],
+          )).rows[0]);
+          if (!saved) throw conflict();
+          job = normalized(saved);
+          console.warn(`[maintenance-job ${id}] ${job.phase}: ${message}`,error);
+          emit(message);
+          await setImmediate();
+          continue;
         }
-        // Plan has its own checkpoint; no plan or step is replayed after commit.
-        const step: JobStep = current.phase === "queued"
-          ? {...await handler.plan(client,current),done:false,processed:0,percent:0,message:"Maintenance planned."}
-          : await handler.step(client,current);
-        return (await client.query<MaintenanceJob>(`UPDATE maintenance_jobs SET phase=$3,cursor=$4::jsonb,state=$5::jsonb,processed=$6,total=$7,percent=CASE WHEN $10 THEN 100 ELSE GREATEST(percent,$8) END,message=$9,heartbeat_at=clock_timestamp(),updated_at=clock_timestamp(),status=CASE WHEN $10 THEN 'completed' ELSE 'running' END,completed_at=CASE WHEN $10 THEN NOW() ELSE completed_at END,runner_token=CASE WHEN $10 THEN NULL ELSE runner_token END,result=CASE WHEN $10 THEN $11::jsonb ELSE result END WHERE id=$1 AND runner_token=$2 RETURNING *`,[id,token,step.phase,JSON.stringify(step.cursor),JSON.stringify(step.state),step.processed,step.total,step.percent,step.message,step.done,JSON.stringify(step.result ?? null)])).rows[0];
-      });
+        if (code === "55P03" && lockRetries < 3 && !isCancelled()) {
+          lockRetries++;
+          emit("Waiting for another attendance operation…");
+          await setTimeout(2000);
+          continue;
+        }
+        if (isCancelled() && (code === "57014" || code === "55P03")) break;
+        throw error;
+      }
+      lockRetries = 0;
       if (!checkpoint) { emit("Waiting for another attendance operation…"); await setTimeout(2000); continue; }
       job = normalized(checkpoint);
       if (job.status === "completed") { emit(job.message ?? "Maintenance completed.","finalize"); return job; }
@@ -110,7 +141,7 @@ export async function cancelJob(id: string) {
   return normalized(job);
 }
 export async function recoverMaintenanceJobs() {
-  await jobPool.query("UPDATE maintenance_jobs SET status='paused',runner_token=NULL,updated_at=clock_timestamp() WHERE status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '2 minutes'");
+  await jobPool.query("WITH stale AS (SELECT id FROM maintenance_jobs WHERE status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '5 minutes' FOR UPDATE SKIP LOCKED) UPDATE maintenance_jobs j SET status='paused',runner_token=NULL,updated_at=clock_timestamp() FROM stale WHERE j.id=stale.id");
 }
 
 export async function runSubmittedJob<T>(kind:string,schoolYearId:string|null,input:unknown,actor?:string,onProgress?:(progress:MasterlistProgress)=>void,isCancelled?:()=>boolean):Promise<T> {
