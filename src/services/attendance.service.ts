@@ -771,7 +771,7 @@ function loadRequiredModule<T = any>(packageName: string): T {
 function hasAttendanceStudentHeaders(headers: string[]) {
   const hasId = headers.some(header => HEADER_ALIASES.studentId.some(alias => normalizeHeader(alias) === header));
   const hasName = headers.some(header => HEADER_ALIASES.name.some(alias => normalizeHeader(alias) === header));
-  return hasId || hasName || (headers.includes("barcode") && headers.includes("format") && headers.includes("scan date"));
+  return hasId || hasName || headers.includes("barcode");
 }
 
 function getByAliases(row: RawImportRow, aliases: readonly string[]) {
@@ -812,7 +812,11 @@ function normalizeImportRows(
   rows: RawImportRow[] | ParsedAttendanceRow[],
 ): ParsedAttendanceRow[] {
   return rows.map((inputRow, index) => {
-    const raw = (inputRow as ParsedAttendanceRow).raw ?? inputRow;
+    const source = (inputRow as ParsedAttendanceRow).raw ?? inputRow;
+    const payload = parseScannerBarcodePayload(getByAliases(source, ["barcode", "name"]));
+    const payloadFields = Object.entries(payload ?? {}).filter(([, value]) => cleanText(value));
+    const payloadHeaders = new Set(payloadFields.map(([key]) => normalizeHeader(key)));
+    const raw = payload ? { ...Object.fromEntries(Object.entries(source).filter(([key]) => !payloadHeaders.has(normalizeHeader(key)))), ...Object.fromEntries(payloadFields) } : source;
     const rowNumber = Number(
       (inputRow as ParsedAttendanceRow).rowNumber ??
         (raw as Record<string, unknown>).__rowNumber ??
@@ -1181,7 +1185,7 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
     (sheet: { rows: RawImportRow[] }) => sheet.rows,
   );
   const supplementalStudentKey = (row: ParsedAttendanceRow) => JSON.stringify([
-    row.studentId.trim().toUpperCase(), row.name.trim().toUpperCase(),
+    row.studentId.trim(), row.name.trim(), row.program ?? "", row.yearLevel ?? "", row.college ?? "",
     normalizeAttendanceEventIdentityName(row.eventName), row.eventStartAt ?? "", row.eventEndAt ?? "",
   ]);
   const normalizeSupplementalRows = (rows: RawImportRow[]) => normalizeImportRows(rows.map(row => {
@@ -1202,7 +1206,7 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
       const normalizedRows = normalizeSupplementalRows(sheet.rows);
       sheet.rows.forEach((row, index) => {
         const normalized = normalizedRows[index];
-        if (!normalized.eventName && selectedEvents.size > 1) return;
+        
         if (!normalized.eventName && selectedEvents.size === 1) {
           const event = [...selectedEvents.values()][0];
           normalized.eventName = event.eventName;
@@ -1211,7 +1215,7 @@ async function parseExcelFile(file: UploadedAttendanceFile) {
           row = { ...row, Event: event.eventName, "Event Start At": event.eventStartAt, "Event End At": event.eventEndAt };
         }
         const key = supplementalStudentKey(normalized);
-        if (represented.has(key)) return;
+        if (represented.has(key) && normalized.studentId && normalized.name && normalized.eventName) return;
         supplementalRows.push(row);
         represented.add(key);
       });
@@ -1283,9 +1287,7 @@ function getScannerEventNameFromFileName(fileName: string) {
 function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
   const headers = getRawImportRowHeaders(rows);
   const isBarcodeScannerExport =
-    headers.includes("barcode") &&
-    headers.includes("format") &&
-    headers.includes("scan date");
+    headers.includes("barcode");
   const isCheckInScannerExport =
     headers.includes("name") &&
     (headers.includes("check in time") || headers.includes("arrival time"));
@@ -1301,7 +1303,7 @@ function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
 
     if (isBarcodeScannerExport) {
       payload = getByAliases(row, ["barcode"]);
-      scannedAtInput = getByAliases(row, ["scan date"]);
+      scannedAtInput = getByAliases(row, HEADER_ALIASES.scannedAt);
     } else {
       payload = getByAliases(row, ["name"]);
       const scanDate = cleanText(
@@ -1331,7 +1333,7 @@ function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
 
     transformedRows.push({
       ...row,
-      ...parsedPayload,
+      ...Object.fromEntries(Object.entries(parsedPayload).filter(([, value]) => cleanText(value))),
       "Student ID": cleanText(getByAliases(parsedPayload, HEADER_ALIASES.studentId)) || getByAliases(row, HEADER_ALIASES.studentId),
       Name: cleanText(getByAliases(parsedPayload, HEADER_ALIASES.name)) || (isBarcodeScannerExport ? getByAliases(row, HEADER_ALIASES.name) : ""),
       __rowNumber: row.__rowNumber,
@@ -1363,7 +1365,8 @@ function transformScannerExportRows(fileName: string, rows: RawImportRow[]) {
 async function parseFileToRawRows(file: UploadedAttendanceFile) {
   ensureSupportedFile(file.originalname);
   const parsed = await parseExcelFile(file);
-  return transformScannerExportRows(file.originalname, parsed.rawRows) ?? parsed;
+  const transformed = transformScannerExportRows(file.originalname, parsed.rawRows);
+  return transformed ? { ...transformed, detectedEvent: mergeDetectedAttendanceEvents(parsed.detectedEvent, transformed.detectedEvent) } : parsed;
 }
 
 function getParsedAttendanceRowTime(row: ParsedAttendanceRow) {
@@ -1393,8 +1396,11 @@ function getAttendanceRowMergeKey(
 
   const studentKey = normalizeStudentNumberKey(row.studentId).toLowerCase();
   const base = JSON.stringify([eventKey, normalizeHeader(collegeKey), studentKey]);
-  return isPlaceholderStudentNumber(row.studentId) || row.masterlist_status === "id_name_mismatch" || (!row.masterlist_status && !/^tc-\d{2}-[a-z]-\d{5}$/.test(studentKey))
-    ? `${base}:${normalizeNameKey(row.masterlist_status === "id_name_mismatch" ? row.masterlist_original?.name ?? row.name : row.name)}` : base;
+  if (row.masterlist_status && row.masterlist_status !== "no_masterlist") {
+    return JSON.stringify([eventKey, studentKey, row.masterlist_original ?? null]);
+  }
+  return isPlaceholderStudentNumber(row.studentId) || (!row.masterlist_status && !/^tc-\d{2}-[a-z]-\d{5}$/.test(studentKey))
+    ? `${base}:${normalizeNameKey(row.name)}` : base;
 }
 
 type AttendanceRowMergeResult = {
@@ -1459,6 +1465,7 @@ export function mergeAttendanceImportRowsByStudentAndEvent(
         remarks,
         raw: { ...merged.raw, ...row.raw },
         masterlist_original: latestRow.masterlist_original,
+        masterlist_status: latestRow.masterlist_status,
         errors: [],
         warnings: [...new Set([...(merged.warnings ?? []), ...(row.warnings ?? [])])],
       };
@@ -1963,6 +1970,23 @@ function toAttendanceEventMergeCandidate(
   };
 }
 
+function haveConflictingMasterlistEventSchedules(
+  incoming: { name?: string | null; startAt?: string | Date | null; endAt?: string | Date | null },
+  existing: { name?: string | null; startAt?: string | Date | null; endAt?: string | Date | null },
+) {
+  if (haveConflictingAttendanceEventDates(incoming, existing) ||
+      haveConflictingAttendanceEventSessions(incoming.name, existing.name)) return true;
+  const time = (value: string | Date | null | undefined) => value instanceof Date ? value.getTime() : value ? new Date(value).getTime() : NaN;
+  const a = time(incoming.startAt), b = time(existing.startAt);
+  const ae = time(incoming.endAt), be = time(existing.endAt);
+  const day = (value: number) => new Date(value + PHILIPPINE_UTC_OFFSET_MS).toISOString().slice(0, 10);
+  if (Number.isFinite(a) && Number.isFinite(b)) {
+    if (day(a) !== day(b)) return true;
+    if (Number.isFinite(ae) && Number.isFinite(be) && (ae < b || be < a)) return true;
+  }
+  return false;
+}
+
 async function rankAttendanceEventCandidates(props: {
   metadata: AttendanceDetectedEventMetadata;
   schoolYearId?: string;
@@ -1973,6 +1997,10 @@ async function rankAttendanceEventCandidates(props: {
     return [] as AttendanceEventMergeCandidate[];
   }
 
+  const scopeResult = props.client
+    ? await props.client.query<{ active: boolean }>(`SELECT ${hasMasterlistScopeSql("$1::uuid")} AS active`, [props.schoolYearId])
+    : await query<{ active: boolean }>(`SELECT ${hasMasterlistScopeSql("$1::uuid")} AS active`, [props.schoolYearId]);
+  const masterlistScoped = scopeResult.rows[0]?.active === true;
   const values: unknown[] = [props.schoolYearId];
   const conditions: string[] = ["e.school_year_id = $1"];
 
@@ -1987,7 +2015,6 @@ async function rankAttendanceEventCandidates(props: {
     ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
     GROUP BY e.id
     ORDER BY e.event_order ASC NULLS LAST, e.created_at DESC
-    LIMIT 500
   `;
   const result = props.client
     ? await props.client.query<AttendanceEventRecord>(sql, values)
@@ -2016,7 +2043,7 @@ async function rankAttendanceEventCandidates(props: {
         },
       ),
     }))
-    .filter(({ event, match }) => match.score >= 0.58 && !haveConflictingAttendanceEventDates(
+    .filter(({ event, match }) => match.score >= 0.58 && !(masterlistScoped ? haveConflictingMasterlistEventSchedules : haveConflictingAttendanceEventDates)(
       { name: incomingName, startAt: props.metadata.eventStartAt, endAt: props.metadata.eventEndAt },
       { name: event.name, startAt: event.event_start_at, endAt: event.event_end_at },
     ))
@@ -2082,11 +2109,22 @@ async function findOrCreateAttendanceEvent(
       ),
     }))
     .sort((left, right) => right.match.score - left.match.score);
-  const eligibleEvents = forceCreateEvent ? [] : rankedExistingEvents.filter(({ event, match }) =>
-    !haveConflictingAttendanceEventDates(
+  const masterlistScoped = (await client.query<{ active: boolean }>(`SELECT ${hasMasterlistScopeSql("$1::uuid")} AS active`, [schoolYearId])).rows[0]?.active === true;
+  const exactEvents = rankedExistingEvents.filter(({ event }) =>
+    normalizeAttendanceEventIdentityName(event.name) === incomingIdentityName &&
+    !haveConflictingMasterlistEventSchedules(
       { name, startAt: eventInput.eventStartAt, endAt: eventInput.eventEndAt },
       { name: event.name, startAt: event.event_start_at, endAt: event.event_end_at },
-    ) && (normalizeAttendanceEventIdentityName(event.name) === incomingIdentityName || match.score >= 0.94),
+    ));
+  if (masterlistScoped && exactEvents.length > 1) {
+    throw createValidationError(`Multiple existing events match "${name}". Select the exact event before saving.`, 409);
+  }
+  if (masterlistScoped && exactEvents.length === 1) return exactEvents[0].event;
+  const eligibleEvents = forceCreateEvent ? [] : rankedExistingEvents.filter(({ event, match }) =>
+    !(masterlistScoped ? haveConflictingMasterlistEventSchedules : haveConflictingAttendanceEventDates)(
+      { name, startAt: eventInput.eventStartAt, endAt: eventInput.eventEndAt },
+      { name: event.name, startAt: event.event_start_at, endAt: event.event_end_at },
+    ) && (normalizeAttendanceEventIdentityName(event.name) === incomingIdentityName || (!masterlistScoped && match.score >= 0.94)),
   );
   if (eligibleEvents.length > 1 && eligibleEvents[0].match.score - eligibleEvents[1].match.score < 0.05) {
     throw createValidationError(`Multiple existing events match "${name}". Select the exact event before saving.`, 409);
@@ -2562,14 +2600,14 @@ function hasMasterlistScopeSql(schoolYear: string) {
 }
 
 function scopedAttendanceStudentKeySql(value: string, schoolYear: string) {
-  return `(CASE WHEN ${hasMasterlistScopeSql(schoolYear)} THEN ${attendanceStudentKeySql(value)} ELSE LOWER(TRIM(${value})) END)`;
+  return `(CASE WHEN ${hasMasterlistScopeSql(schoolYear)} THEN LOWER(public.masterlist_student_number_key(${value})) ELSE LOWER(TRIM(${value})) END)`;
 }
 
 function canonicalStudentsCteSql() {
   return `canonical_students AS (
     SELECT DISTINCT ON (scope.masterlist_scope, student_key)
       s.*, scope.masterlist_scope,
-      CASE WHEN scope.masterlist_scope THEN ${attendanceStudentKeySql("s.student_id")} ELSE LOWER(TRIM(s.student_id)) END AS student_key
+      CASE WHEN scope.masterlist_scope THEN LOWER(public.masterlist_student_number_key(s.student_id)) ELSE LOWER(TRIM(s.student_id)) END AS student_key
     FROM students s CROSS JOIN (VALUES (TRUE), (FALSE)) AS scope(masterlist_scope)
     WHERE NULLIF(TRIM(s.student_id), '') IS NOT NULL
     ORDER BY scope.masterlist_scope, student_key, s.updated_at DESC, s.created_at DESC, s.id DESC
@@ -2583,7 +2621,14 @@ function canonicalStudentJoinSql(alias: string, studentId: string, schoolYear: s
 // A record is visible for audit even when its identity is unresolved. It must
 // never contribute to another student's attendance or fines.
 function resolvedAttendanceSourceSql(alias: string) {
-  return `${alias}.masterlist_status IS DISTINCT FROM 'unmatched'`;
+  return `(${alias}.masterlist_status IS DISTINCT FROM 'unmatched' AND (
+    NOT ${hasMasterlistScopeSql(`${alias}.school_year_id`)} OR (
+      ${alias}.masterlist_status IN ('matched_by_id', 'matched_by_partial_id', 'matched_by_name', 'id_name_mismatch')
+      AND EXISTS (SELECT 1 FROM student_masterlist resolved_ml
+        WHERE resolved_ml.school_year_id = ${alias}.school_year_id
+          AND resolved_ml.student_number_key = public.masterlist_student_number_key(${alias}.student_id))
+    )
+  ))`;
 }
 
 function attendanceStudentIdsEqualSql(left: string, right: string) {
@@ -2668,6 +2713,12 @@ export function attendanceEventParticipationCteSql(scoped = false) {
       ${attendanceStudentKeySql("correction.student_key")} AS normalized_student_id
     FROM attendance_student_event_overrides correction
     WHERE correction.attended = TRUE
+      AND (NOT ${hasMasterlistScopeSql("correction.school_year_id")} OR EXISTS (
+        SELECT 1 FROM student_masterlist override_ml
+        WHERE override_ml.school_year_id = correction.school_year_id
+          AND override_ml.student_number_key = public.masterlist_student_number_key(correction.student_key)
+          AND ${getEventStudentExemptionFilterSql("correction.event_id", "override_ml.year_level_key", getCanonicalCollegeKeySql("override_ml", "override_ml"))}
+      ))
       ${scope("correction", attendanceStudentKeySql("correction.student_key"))}
   )
 `;
@@ -2716,6 +2767,18 @@ export function attendanceEventRosterScopeCteSql(schoolYearParam?: string, event
         getResolvedStudentYearLevelKeySql("mar.student_id", "mar.school_year_id"),
         MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL,
       )}
+
+    UNION
+    SELECT DISTINCT correction.school_year_id, correction.event_id,
+      ${getCanonicalCollegeKeySql("override_ml", "override_ml")} AS college_key
+    FROM attendance_student_event_overrides correction
+    JOIN student_masterlist override_ml ON override_ml.school_year_id = correction.school_year_id
+      AND override_ml.student_number_key = public.masterlist_student_number_key(correction.student_key)
+    WHERE correction.attended = TRUE AND ${hasMasterlistScopeSql("correction.school_year_id")}
+      AND ${getCanonicalCollegeKeySql("override_ml", "override_ml")} IS NOT NULL
+      AND ${getEventStudentExemptionFilterSql("correction.event_id", "override_ml.year_level_key", getCanonicalCollegeKeySql("override_ml", "override_ml"))}
+      ${scope("correction")}
+      ${eventScope("correction.event_id")}
   )
 `;
 }
@@ -3582,7 +3645,6 @@ function applyReviewedRowEvents(
   option: Pick<SaveRowsInput, "rowEventOverrides" | "rowEventsReviewed">,
 ): AttendancePreviewResult {
   const rowEventIdentities = new Set(preview.rows
-    .filter((row) => !row.errors.some(e => !e.includes(": unrecognised college ")))
     .map((row) => JSON.stringify([
       normalizeAttendanceEventIdentityName(row.eventName),
       cleanText(row.eventStartAt), cleanText(row.eventEndAt),
@@ -7414,6 +7476,7 @@ async function resolveUnattachedAttendanceEventIdsWithClient(
       WHERE ar.import_id = ai.id
         AND ar.event_id IS NULL
         AND ai.event_id IS NOT NULL
+        AND EXISTS (SELECT 1 FROM attendance_events linked_event WHERE linked_event.id = ai.event_id AND linked_event.school_year_id IS NOT DISTINCT FROM ar.school_year_id)
         AND ai.deleted_at IS NULL
         AND ar.deleted_at IS NULL
         AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
@@ -7426,13 +7489,16 @@ async function resolveUnattachedAttendanceEventIdsWithClient(
     school_year_id: string | null;
     event_name_snapshot: string | null;
     created_at: Date | string;
+    first_scan_at: Date | string | null;
+    masterlist_scope: boolean;
   }>(
     `
-      SELECT DISTINCT
+      SELECT
         ai.id AS import_id,
         COALESCE(ai.school_year_id, ar.school_year_id) AS school_year_id,
         ai.event_name_snapshot,
-        ai.created_at
+        ai.created_at, MIN(ar.scanned_at) AS first_scan_at,
+        ${hasMasterlistScopeSql("COALESCE(ai.school_year_id, ar.school_year_id)")} AS masterlist_scope
       FROM attendance_records ar
       JOIN attendance_imports ai ON ai.id = ar.import_id
       WHERE ar.event_id IS NULL
@@ -7441,7 +7507,7 @@ async function resolveUnattachedAttendanceEventIdsWithClient(
         AND ar.deleted_at IS NULL
         AND NULLIF(TRIM(ai.event_name_snapshot), '') IS NOT NULL
         AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
-      LIMIT 250
+      GROUP BY ai.id, ai.school_year_id, ar.school_year_id, ai.event_name_snapshot, ai.created_at
     `,
     [schoolYearId],
   );
@@ -7451,16 +7517,16 @@ async function resolveUnattachedAttendanceEventIdsWithClient(
     school_year_id: string | null;
     remarks: string | null;
     scanned_at: Date | string | null;
+    masterlist_scope: boolean;
   }>(
     `
-      SELECT id, school_year_id, remarks, scanned_at
-      FROM manual_attendance_records
+      SELECT id, school_year_id, remarks, scanned_at, ${hasMasterlistScopeSql("unattached_manual.school_year_id")} AS masterlist_scope
+      FROM manual_attendance_records unattached_manual
       WHERE event_id IS NULL
         AND COALESCE(attendance_type, 'manual') <> 'zero_attendance'
         AND NULLIF(TRIM(remarks), '') IS NOT NULL
         AND LOWER(TRIM(remarks)) <> LOWER($2::TEXT)
         AND ($1::uuid IS NULL OR school_year_id = $1::uuid)
-      LIMIT 250
     `,
     [schoolYearId, ZERO_ATTENDANCE_REMARK],
   );
@@ -7481,9 +7547,13 @@ async function resolveUnattachedAttendanceEventIdsWithClient(
     name: string,
     schoolYear: string | null,
     timestamp?: Date | string | null,
+    masterlistScoped = false,
   ) => {
     const ranked = eventResult.rows
-      .filter((event) => event.school_year_id === schoolYear)
+      .filter((event) => event.school_year_id === schoolYear && (!masterlistScoped || (
+        normalizeAttendanceEventIdentityName(name) === normalizeAttendanceEventIdentityName(event.name) &&
+        !haveConflictingMasterlistEventSchedules({ name, startAt: timestamp }, { name: event.name, startAt: event.event_start_at, endAt: event.event_end_at })
+      )))
       .map((event) => ({
         event,
         match: scoreAttendanceEventIdentity(
@@ -7499,6 +7569,7 @@ async function resolveUnattachedAttendanceEventIdsWithClient(
     const best = ranked[0];
     const second = ranked[1];
 
+    if (masterlistScoped) return ranked.length === 1 ? ranked[0].event : null;
     if (!best || best.match.score < 0.94) return null;
     if (second && best.match.score - second.match.score < 0.08) return null;
     return best.event;
@@ -7508,7 +7579,8 @@ async function resolveUnattachedAttendanceEventIdsWithClient(
     const event = findUniqueHighConfidenceEvent(
       row.event_name_snapshot ?? "",
       row.school_year_id,
-      row.created_at,
+      row.masterlist_scope ? row.first_scan_at : row.created_at,
+      row.masterlist_scope,
     );
     if (!event) continue;
 
@@ -7539,6 +7611,7 @@ async function resolveUnattachedAttendanceEventIdsWithClient(
       row.remarks ?? "",
       row.school_year_id,
       row.scanned_at,
+      row.masterlist_scope,
     );
     if (!event) continue;
 
@@ -7923,6 +7996,12 @@ export function getDenominatorEventScopeCtesSql() {
           ${scopedAttendanceStudentKeySql("correction.student_key", "correction.school_year_id")} AS normalized_student_id
         FROM attendance_student_event_overrides correction
         WHERE correction.attended = TRUE
+      AND (NOT ${hasMasterlistScopeSql("correction.school_year_id")} OR EXISTS (
+        SELECT 1 FROM student_masterlist override_ml
+        WHERE override_ml.school_year_id = correction.school_year_id
+          AND override_ml.student_number_key = public.masterlist_student_number_key(correction.student_key)
+          AND ${getEventStudentExemptionFilterSql("correction.event_id", "override_ml.year_level_key", getCanonicalCollegeKeySql("override_ml", "override_ml"))}
+      ))
           AND ($1::uuid IS NULL OR correction.school_year_id = $1::uuid)
       ), event_roster_scope AS MATERIALIZED (
         SELECT DISTINCT
@@ -7970,6 +8049,17 @@ export function getDenominatorEventScopeCtesSql() {
             "roster_manual_year_level.year_level_key",
             getCanonicalCollegeKeySql("mar", "roster_manual_student"),
           )}
+
+    UNION
+    SELECT DISTINCT correction.school_year_id, correction.event_id,
+      ${getCanonicalCollegeKeySql("override_ml", "override_ml")} AS college_key
+    FROM attendance_student_event_overrides correction
+    JOIN student_masterlist override_ml ON override_ml.school_year_id = correction.school_year_id
+      AND override_ml.student_number_key = public.masterlist_student_number_key(correction.student_key)
+    WHERE correction.attended = TRUE AND ${hasMasterlistScopeSql("correction.school_year_id")}
+      AND ${getCanonicalCollegeKeySql("override_ml", "override_ml")} IS NOT NULL
+      AND ${getEventStudentExemptionFilterSql("correction.event_id", "override_ml.year_level_key", getCanonicalCollegeKeySql("override_ml", "override_ml"))}
+      AND ($1::uuid IS NULL OR correction.school_year_id = $1::uuid)
       )`;
 }
 
@@ -7995,7 +8085,7 @@ export function getExpectedEventGroupRepairCtesSql(isCalculation: boolean) {
     ), aligned AS (
       SELECT raw.*,
         COALESCE(
-          CASE WHEN cardinality(repair.observed_expected_values) > 1
+          CASE WHEN NOT ${hasMasterlistScopeSql("raw.school_year_id")} AND cardinality(repair.observed_expected_values) > 1
             AND groups.observed_values <@ repair.observed_expected_values
             THEN repair.expected_events END,
           raw.raw_expected_events
@@ -8353,28 +8443,28 @@ async function refreshCalculationResultsWithClient(
           COALESCE(imported.imported_absences, 0)::INT AS raw_fallback_imported_absences,
           COALESCE(attended.attended_expected_events, 0)::INT AS attended_events,
           CASE
-            WHEN COALESCE(expected.expected_events, 0) > 0 THEN
+            WHEN ${hasMasterlistScopeSql("keys.school_year_id")} OR COALESCE(expected.expected_events, 0) > 0 THEN
               GREATEST(
                 COALESCE(expected.expected_events, 0) - COALESCE(attended.attended_expected_events, 0),
                 0
               )::INT
             ELSE COALESCE(imported.imported_absences, 0)::INT
           END AS raw_imported_absences,
-          COALESCE(manual.manual_absences, 0)::INT AS manual_absences,
+          CASE WHEN ${hasMasterlistScopeSql("keys.school_year_id")} THEN 0 ELSE COALESCE(manual.manual_absences, 0) END::INT AS manual_absences,
           (
             CASE
-              WHEN COALESCE(expected.expected_events, 0) > 0 THEN
+              WHEN ${hasMasterlistScopeSql("keys.school_year_id")} OR COALESCE(expected.expected_events, 0) > 0 THEN
                 GREATEST(
                   COALESCE(expected.expected_events, 0) - COALESCE(attended.attended_expected_events, 0),
                   0
                 )
               ELSE COALESCE(imported.imported_absences, 0)
             END
-            + COALESCE(manual.manual_absences, 0)
+            + CASE WHEN ${hasMasterlistScopeSql("keys.school_year_id")} THEN 0 ELSE COALESCE(manual.manual_absences, 0) END
           )::INT AS raw_total_absences,
           CASE
             WHEN scope.college_key IS NULL THEN 'unresolved_college'
-            WHEN COALESCE(expected.expected_events, 0) > 0 THEN 'roster'
+            WHEN ${hasMasterlistScopeSql("keys.school_year_id")} OR COALESCE(expected.expected_events, 0) > 0 THEN 'roster'
             ELSE 'imported_fallback'
           END AS raw_absence_calculation_source,
           (
@@ -10318,21 +10408,21 @@ async function refreshAttendanceFinalResultsWithClient(
           COALESCE(expected.expected_events, 0)::INT AS raw_expected_events,
           COALESCE(imported.imported_absences, 0)::INT AS raw_fallback_imported_absences,
           COALESCE(attended.attended_expected_events, 0)::INT AS attended_events,
-          COALESCE(manual.manual_absences, 0)::INT AS manual_absences,
+          CASE WHEN ${hasMasterlistScopeSql("keys.school_year_id")} THEN 0 ELSE COALESCE(manual.manual_absences, 0) END::INT AS manual_absences,
           (
             CASE
-              WHEN COALESCE(expected.expected_events, 0) > 0 THEN
+              WHEN ${hasMasterlistScopeSql("keys.school_year_id")} OR COALESCE(expected.expected_events, 0) > 0 THEN
                 GREATEST(
                   COALESCE(expected.expected_events, 0) - COALESCE(attended.attended_expected_events, 0),
                   0
                 )
               ELSE COALESCE(imported.imported_absences, 0)
             END
-            + COALESCE(manual.manual_absences, 0)
+            + CASE WHEN ${hasMasterlistScopeSql("keys.school_year_id")} THEN 0 ELSE COALESCE(manual.manual_absences, 0) END
           )::INT AS raw_total_absences,
           CASE
             WHEN scope.college_key IS NULL THEN 'unresolved_college'
-            WHEN COALESCE(expected.expected_events, 0) > 0 THEN 'roster'
+            WHEN ${hasMasterlistScopeSql("keys.school_year_id")} OR COALESCE(expected.expected_events, 0) > 0 THEN 'roster'
             ELSE 'imported_fallback'
           END AS raw_absence_calculation_source,
           GREATEST(
@@ -11607,7 +11697,9 @@ export async function listAttendanceFinalResults(
 
   if (options.studentKeys !== undefined) {
     params.push(options.studentKeys);
-    clauses.push(`public.masterlist_student_number_key(afr.student_id) = ANY($${params.length}::text[])`);
+    clauses.push(`(CASE WHEN ${hasMasterlistScopeSql("afr.school_year_id")}
+      THEN LOWER(public.masterlist_student_number_key(afr.student_id)) = ANY(ARRAY(SELECT LOWER(public.masterlist_student_number_key(requested_key)) FROM unnest($${params.length}::text[]) AS requested_key))
+      ELSE public.masterlist_student_number_key(afr.student_id) = ANY($${params.length}::text[]) END)`);
   }
 
   if (options.college) {
@@ -11759,6 +11851,14 @@ export async function listAttendanceFinalResults(
               getResolvedStudentYearLevelKeySql("detail_manual.student_id", "detail_manual.school_year_id"),
               getCanonicalCollegeKeySql("detail_manual", "detail_manual_student"),
             )}
+          UNION
+          SELECT correction.event_id FROM attendance_student_event_overrides correction
+          JOIN student_masterlist override_ml ON override_ml.school_year_id = correction.school_year_id
+            AND override_ml.student_number_key = public.masterlist_student_number_key(correction.student_key)
+          WHERE correction.school_year_id = afr.school_year_id AND correction.attended = TRUE
+            AND ${hasMasterlistScopeSql("correction.school_year_id")}
+            AND ${getCanonicalCollegeKeySql("override_ml", "override_ml")} = afr.college_key
+            AND ${getEventStudentExemptionFilterSql("correction.event_id", "override_ml.year_level_key", getCanonicalCollegeKeySql("override_ml", "override_ml"))}
         )`} roster
         JOIN attendance_events expected_event ON expected_event.id = roster.event_id
           AND ${getEventYearLevelExemptionFilterSql(

@@ -154,7 +154,7 @@ async function runMigrations() {
         await client.query(sql);
         // The current repair requires the audit columns added in 048. On a
         // fresh installation 048 supersedes the earlier TypeScript repair.
-        if (file === "048_reconcile_attendance_presence.sql") {
+        if (file === "048_reconcile_attendance_presence.sql" || file === "049_rebuild_masterlist_event_presence.sql") {
           const { repairUploadAttendanceMatchingWithClient } = await import("../../services/masterlist.service");
           await repairUploadAttendanceMatchingWithClient(client, (progress) => {
             migrationTask.update(file, `${Math.floor(progress.percent)}% • ${progress.message}`);

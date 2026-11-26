@@ -92,7 +92,7 @@ export async function loadMasterlist(client: PoolClient, schoolYearId: string, c
     row.name_key = normalizeNameKey(`${row.given_name} ${row.last_name}`);
     const parts = parseStudentNumberParts(row.student_number_key);
     if (parts) {
-      index.ids.set(row.student_number_key, row);
+      index.ids.set(normalizeStudentNumberKey(row.student_number_key), row);
       const serialRows = index.serials.get(parts.serial) ?? [];
       serialRows.push(row); index.serials.set(parts.serial, serialRows);
     }
@@ -126,7 +126,7 @@ function resolve(index: MasterIndex, profile: Profile): Resolution {
     const target = parseStudentNumberParts(master.student_number_key);
     const partialAgrees = !owner && parts && target && parts.serial === target.serial &&
       (!parts.year || parts.year === target.year) && (!parts.letter || parts.letter === target.letter);
-    return { status: partialAgrees ? "matched_by_partial_id" : "matched_by_name", master };
+    return { status: owner && owner.id !== master.id ? "id_name_mismatch" : partialAgrees ? "matched_by_partial_id" : "matched_by_name", master };
   }
   return { status: "unmatched", reason: candidates.length > 1
     ? "Ambiguous name: multiple masterlist students match. Correct the student ID and name."
@@ -232,19 +232,21 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
         if (!seen.has(key)) { seen.add(key); if (resolution.status === "matched_by_id") summary.matchedById++; else if (resolution.status === "matched_by_partial_id") summary.matchedByPartialId++; else if (resolution.status === "matched_by_name") summary.matchedByName++; else if (resolution.status === "id_name_mismatch") summary.idNameMismatches++; else summary.unmatched++; }
         const m = resolution.master;
         if (!m) {
-          unresolvedAliases.add(normalizeStudentNumberKey(original.studentId).toLowerCase());
+          if (isSource) unresolvedAliases.add(normalizeStudentNumberKey(original.studentId).toLowerCase());
           if (isSource && (row.masterlist_status !== "unmatched" || !row.masterlist_original)) {
             updates.push({ ...row, student_id: original.studentId, name: original.name, college: original.college ?? null, program: original.program ?? null, year_level: original.yearLevel ?? null, masterlist_original: original, masterlist_status: "unmatched" });
           }
           continue;
         }
-        if (full) {
+        if (isSource) {
           const profiles = sourceProfiles.get(key) ?? new Set<StudentMasterlistRecord>();
           profiles.add(m); sourceProfiles.set(key, profiles);
         }
         matched.set(m.student_number, m);
-        const alias = normalizeStudentNumberKey(original.studentId).toLowerCase();
-        const targets = aliases.get(alias) ?? new Set<string>(); targets.add(m.student_number); aliases.set(alias, targets);
+        if (isSource) {
+          const alias = normalizeStudentNumberKey(original.studentId).toLowerCase();
+          const targets = aliases.get(alias) ?? new Set<string>(); targets.add(m.student_number); aliases.set(alias, targets);
+        }
         const resolvedName = m.full_name;
         if (row.student_id === m.student_number && row.name === resolvedName && (!full || (row.program === m.program && row.college === m.college && row.year_level === m.year_level)) && (!isSource || (row.masterlist_original && row.masterlist_status === resolution.status))) continue;
         changed.add(m.student_number);
@@ -300,7 +302,7 @@ async function reconcileWithClient(client: PoolClient, schoolYear: SchoolYearRec
   const mapping = [...aliases].filter(([old, values]) => {
     const owner = index.ids.get(normalizeStudentNumberKey(old));
     return !owner || values.has(owner.student_number);
-  }).filter(([, values]) => values.size === 1).filter(([old]) => !unresolvedAliases.has(old)).map(([old, values]) => ({ old, target: [...values][0].toLowerCase() }));
+  }).filter(([, values]) => values.size === 1).filter(([old]) => !unresolvedAliases.has(old)).map(([old, values]) => ({ old, target: normalizeStudentNumberKey([...values][0]).toLowerCase() }));
   if (mapping.length) {
     const data = JSON.stringify(mapping);
     const rank = `WITH mapping AS (SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(old text,target text)), ranked AS (SELECT o.id,ROW_NUMBER() OVER(PARTITION BY COALESCE(m.target,LOWER(public.masterlist_student_number_key(o.student_key))),o.event_id ORDER BY o.updated_at DESC,o.id DESC) AS rn FROM attendance_student_event_overrides o LEFT JOIN mapping m ON m.old=LOWER(public.masterlist_student_number_key(o.student_key)) WHERE o.school_year_id=$1)`;
@@ -383,7 +385,7 @@ export async function reconcileMasterlistForAttendanceUpload(client: PoolClient,
 export async function syncMasterlistAbsences(client: PoolClient, schoolYearId: string, onProgress?: ProgressCallback, isCancelled?: () => boolean, offlineRepair = false) {
   const emit = progressReporter(onProgress, isCancelled);
   emit({ stage: "syncing_absences", percent: 68, message: "Preparing absence synchronization…" });
-  const rows = (await client.query<{ student_id: string }>(`SELECT DISTINCT ar.student_id FROM attendance_records ar WHERE school_year_id=$1 AND ${getAttendanceRecordVisibilitySql("ar")} AND ar.masterlist_status IS DISTINCT FROM 'unmatched'`, [schoolYearId])).rows;
+  const rows = (await client.query<{ student_id: string }>(`SELECT student_number AS student_id FROM student_masterlist WHERE school_year_id=$1 UNION SELECT DISTINCT ar.student_id FROM attendance_records ar WHERE school_year_id=$1 AND ${getAttendanceRecordVisibilitySql("ar")} AND ar.masterlist_status IS DISTINCT FROM 'unmatched'`, [schoolYearId])).rows;
   const ids = [...new Set<string>(rows.map(row => normalizeStudentNumberKey(row.student_id).toLowerCase()).filter(Boolean))];
   type SyncResult = Awaited<ReturnType<typeof syncAbsencesForStudents>>;
   const records = new Map<string, SyncResult["records"][number]>();
@@ -454,11 +456,13 @@ export async function uploadMasterlist(file: {originalname: string;buffer: Buffe
     const student_number=normalizeStudentNumberKey(get("studentnumber")), student_number_key=student_number, last_name=repairNameMojibake(get("lastname")), given_name=repairNameMojibake(get("givenname")), middle_initial=get("middleinitial").replace(/\.+$/, "") || null;
     const program=cleanProgram(get("degreeprogram")); const year_level_key=normalizeYearLevelKey(get("yearlevel"));
     const year_level=({"1":"1st Year","2":"2nd Year","3":"3rd Year","4":"4th Year","5":"5th Year"} as Record<string,string>)[year_level_key ?? ""];
-    const college = collegeForProgram(program);
+    const suppliedCollege = headers.includes("college") ? get("college") : "";
+    const knownColleges = ["College of Business Administration", "College of Teacher Education", "College of Computing Studies", "College of Agriculture and Forestry", "College of Liberal Arts, Mathematics and Sciences", "School of Engineering", "School of Criminal Justice Education"];
+    const college = suppliedCollege ? knownColleges.find(c => normalizeCollegeKey(c) === normalizeCollegeKey(suppliedCollege)) ?? null : collegeForProgram(program);
     const reasons = [
       !/^TC-\d{2}-[A-Z]-\d{5}$/.test(student_number_key) || isPlaceholderStudentNumber(student_number_key) ? "invalid student number" : "",
       !last_name || !given_name ? "missing name" : "", !year_level ? "invalid year level" : "",
-      ids.has(student_number_key) ? "duplicate student number" : "", !college ? `unmapped degree program (${program || "blank"})` : "",
+      ids.has(student_number_key) ? "duplicate student number" : "", !college ? `unmapped degree program or college (${program || "blank"}${suppliedCollege ? ` / ${suppliedCollege}` : ""})` : "",
     ].filter(Boolean);
     if (reasons.length) { invalid++; invalidRows.push(`Row ${headerIndex + offset + 2}: ${student_number || "no ID"}: ${reasons.join(", ")}`); continue; }
     ids.add(student_number_key);
@@ -685,7 +689,7 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
     const start=f.offset ?? 0, end=start+(f.limit ?? 50);
     const pageMaster=exportAll ? filteredMaster : filteredMaster.slice(start,end);
     const pageFinals=exportAll ? filteredFinals : filteredFinals.slice(start,end);
-    const studentKeys=[...new Set(hasMasterlist ? pageMaster.map(r=>r.student_number_key) : pageFinals.map(r=>normalizeStudentNumberKey(r.student_id)))];
+    const studentKeys=[...new Set(hasMasterlist ? pageMaster.map(r=>normalizeStudentNumberKey(r.student_number)) : pageFinals.map(r=>normalizeStudentNumberKey(r.student_id)))];
     // Calculate the event/college roster once for the selected semester, and
     // reuse it for every page student (and every batch when exporting).
     const eventRosterScope=hasMasterlist || studentKeys.length
@@ -735,8 +739,8 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
       const detail=new Map((final?.event_details ?? []).map(d=>[d.id,d]));
       for(const event of events) {
         const d=detail.get(event.id);
-        const observed=studentKey ? participation.get(studentKey.toLowerCase())?.has(event.id) === true : false;
-        const applies=roster.has(`${c}|${event.id}`) || !!d || observed;
+        const observed=studentKey ? participation.get(normalizeStudentNumberKey(studentKey).toLowerCase())?.has(event.id) === true : false;
+        const applies=roster.has(`${c}|${event.id}`) || (!hasMasterlist && !!d) || observed;
         const exempt=exemptions.some(x=>x.event_id===event.id && (x.college_key===null || normalizeCollegeKey(x.college_key)===c) && (x.year_level_key===null || normalizeYearLevelKey(x.year_level_key)===y));
         if(exempt && (applies || (!!c && exemptions.some(x=>x.event_id===event.id && x.college_key!==null && normalizeCollegeKey(x.college_key)===c)))) values[event.id]="E";
         else if(hasMasterlist && observed) values[event.id]="P";
@@ -745,7 +749,15 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
       }
       return values;
     }
-    const rows:FinalRow[]=hasMasterlist ? pageMaster.map(m=>{const r=byId.get(m.student_number_key);return {student_number:m.student_number,name:m.full_name,last_name:m.last_name,given_name:m.given_name,middle_initial:m.middle_initial,program:m.program,year_level:m.year_level,college:m.college,attended_events:r?.attended_events ?? 0,expected_events:r?.expected_events ?? null,total_absences:r?.total_absences ?? null,attendance_status:r?.attendance_status ?? "No attendance record",event_details:eventValues(m,r,m.student_number_key)};}) : pageFinals.map(r=>({student_number:r.student_id,name:r.name,last_name:null,given_name:null,middle_initial:null,program:r.program,year_level:r.year_level,college:r.college,attended_events:r.attended_events,expected_events:r.expected_events,total_absences:r.total_absences,attendance_status:r.attendance_status,event_details:eventValues(r,finalByUuid.get(r.id))}));
+    const rows:FinalRow[]=hasMasterlist ? pageMaster.map(m=>{
+      const r=byId.get(normalizeStudentNumberKey(m.student_number));
+      const event_details=eventValues(m,r,m.student_number_key);
+      const values=Object.values(event_details);
+      const attended_events=values.filter(value=>value==="P").length;
+      const total_absences=values.filter(value=>value==="A").length;
+      const expected_events=attended_events+total_absences;
+      return {student_number:m.student_number,name:m.full_name,last_name:m.last_name,given_name:m.given_name,middle_initial:m.middle_initial,program:m.program,year_level:m.year_level,college:m.college,attended_events,expected_events,total_absences,attendance_status:expected_events===0 ? "No attendance record" : total_absences>0 ? "with_absences" : "perfect_attendance",event_details};
+    }) : pageFinals.map(r=>({student_number:r.student_id,name:r.name,last_name:null,given_name:null,middle_initial:null,program:r.program,year_level:r.year_level,college:r.college,attended_events:r.attended_events,expected_events:r.expected_events,total_absences:r.total_absences,attendance_status:r.attendance_status,event_details:eventValues(r,finalByUuid.get(r.id))}));
     const includeUnmatched=exportAll || f.includeUnmatched === true;
     const unmatched=includeUnmatched ? await loadUnmatched(client,schoolYear.id,index,f) : [];
     const programRows=hasMasterlist ? index.rows : baseFinals;

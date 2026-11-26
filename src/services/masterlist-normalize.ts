@@ -141,13 +141,21 @@ export function masterlistNameMatchRank(name: unknown, surname: unknown, givenNa
       if (!familyExact && !nameTokensAgree(candidate, familyKey)) continue;
       const rest = [...uploaded.slice(0, start), ...uploaded.slice(end)];
       if (!rest.length) continue;
-      const left = rest.join(" "), right = given.join(" ");
+      // Full given names outrank an omitted/extra middle name. Do not match
+      // solely on a shared middle name when the first given names conflict.
+      const full = rest.join("") === given.join("");
       const shorter = Math.min(rest.length, given.length);
-      const exact = rest.join("") === given.join("") ||
-        rest.every(t => given.includes(t)) || given.every(t => rest.includes(t));
-      const fuzzy = sharedNameTokenCount(left, right) === shorter;
-      if (familyExact && exact) best = Math.max(best, 2);
-      else if ((familyExact && fuzzy) || (!familyExact && exact)) best = Math.max(best, 1);
+      const prefix = rest.slice(0, shorter).every((token, i) => token === given[i]);
+      let fuzzy = false;
+      if (!full && !prefix && familyExact) {
+        const left = rest.slice(0, shorter).join("");
+        const right = given.slice(0, shorter).join("");
+        fuzzy = nameTokensAgree(left, right);
+      }
+      if (familyExact && full) best = Math.max(best, 4);
+      else if (familyExact && prefix) best = Math.max(best, 3);
+      else if (!familyExact && full) best = Math.max(best, 2);
+      else if ((familyExact && fuzzy) || (!familyExact && prefix)) best = Math.max(best, 1);
     }
   }
   return best;
@@ -158,11 +166,11 @@ export const normalizeProgram = (value: unknown) => cleanProgram(value).toUpperC
 export function collegeForProgram(value: unknown): string | null {
   const p = normalizeProgram(value).replace(/[^A-Z0-9]/g, "");
   if (/^(?:BS)?(?:AGRICULTURAL(?:AND)?BIOSYSTEMSENGINEERING|AGRICULTURALENGINEERING|ABE)$/.test(p) || /^(?:BACHELOROFSCIENCEIN)AGRICULTURAL(?:AND)?BIOSYSTEMSENGINEERING$/.test(p) || p === "BSABE") return "School of Engineering";
-  if (/^(?:BSBA|BSAB|BSHM|BSABM)(?:FINANCIALMANAGEMENT)?$/.test(p) || /^(?:BACHELOROFSCIENCEIN|BS)(?:BUSINESSADMINISTRATION|AGRIBUSINESS|HOSPITALITYMANAGEMENT)/.test(p)) return "College of Business Administration";
-  if (/^(?:BSED|BEED|BPED|BPE|BACHELOROFSECONDARYEDUCATION|BACHELOROFELEMENTARYEDUCATION|BACHELOROFPHYSICALEDUCATION)/.test(p)) return "College of Teacher Education";
+  if (/^(?:BSBA|BSAB|BSHM|BSABM)(?:FINANCIALMANAGEMENT|MARKETINGMANAGEMENT|HUMANRESOURCEMANAGEMENT|OPERATIONSMANAGEMENT)?$/.test(p) || /^(?:BACHELOROFSCIENCEIN|BS)(?:BUSINESSADMINISTRATION|AGRIBUSINESS|HOSPITALITYMANAGEMENT)/.test(p)) return "College of Business Administration";
+  if (/^(?:BSED|BEED|BPED|BPE|BACHELOROFSECONDARYEDUCATION|BACHELOROFELEMENTARYEDUCATION|BACHELOROFPHYSICALEDUCATION|BACHELOROFSPECIALNEEDSEDUCATION|BSNED|BECED|BACHELOROFEARLYCHILDHOODEDUCATION)/.test(p)) return "College of Teacher Education";
   if (/^(?:BSCS|BSIS|BSIT|(?:BACHELOROFSCIENCEIN|BS)(?:COMPUTERSCIENCE|INFORMATIONSYSTEMS|INFORMATIONTECHNOLOGY))$/.test(p)) return "College of Computing Studies";
   if (/^(?:BSA|BSF|(?:BACHELOROFSCIENCEIN|BS)(?:AGRICULTURE|FORESTRY))/.test(p)) return "College of Agriculture and Forestry";
-  if (/^(?:BAELS|BAENGLISHLANGUAGESTUDIES|BACHELOROFARTSINENGLISHLANGUAGESTUDIES)$/.test(p)) return "College of Liberal Arts, Mathematics and Sciences";
+  if (/^(?:BAELS|ABELS|BAENGLISHLANGUAGESTUDIES|ABENGLISHLANGUAGESTUDIES|BACHELOROFARTSINENGLISHLANGUAGESTUDIES)$/.test(p)) return "College of Liberal Arts, Mathematics and Sciences";
   if (/^(?:BSCrim|BSCRIM|BSCRIMINOLOGY|BACHELOROFSCIENCEINCRIMINOLOGY)$/.test(p)) return "School of Criminal Justice Education";
   return null;
 }
