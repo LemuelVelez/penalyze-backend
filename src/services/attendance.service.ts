@@ -7153,31 +7153,142 @@ export async function deleteAttendanceEvent(id: string) {
   });
 }
 
-function getDashboardExemptionGuardSql(eventExpr: string, fullFilterSql: string) {
-  return `(CASE
-    WHEN ${eventExpr} IS NULL THEN TRUE
-    WHEN NOT EXISTS (SELECT 1 FROM attendance_event_college_exemptions guard_ce WHERE guard_ce.event_id = ${eventExpr})
-     AND NOT EXISTS (SELECT 1 FROM attendance_event_year_level_exemptions guard_ye WHERE guard_ye.event_id = ${eventExpr})
-    THEN TRUE
-    ELSE ${fullFilterSql}
-  END)`;
-}
-
-function getAttendanceDashboardRecordWhereSql(schoolYearId?: string) {
-  const schoolYearSql = schoolYearId ? "AND ar.school_year_id = $1" : "";
+// Resolve exemption profiles in sets, rather than executing the correlated
+// attendance-history resolver for every attendance record in the dashboard.
+function getDashboardVisibleRecordsCteSql(schoolYearId?: string) {
+  const recordSchoolYearSql = schoolYearId ? "AND ar.school_year_id = $1::uuid" : "";
+  const manualSchoolYearSql = schoolYearId ? "AND mar.school_year_id = $1::uuid" : "";
+  const scopeSchoolYearSql = schoolYearId ? "WHERE sy.id = $1::uuid" : "";
+  const collegeValue = `CASE WHEN ml.id IS NOT NULL THEN ml.college
+    ELSE COALESCE(NULLIF(TRIM(cs.college), ''), NULLIF(TRIM(v.college), '')) END`;
+  const collegeKey = `NULLIF(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(
+    LOWER(REPLACE(${collegeValue}, '&', ' and ')), '[^a-z0-9]+', ' ', 'g'),
+    '[[:space:]]+', ' ', 'g')), '')`;
 
   return `
-    ${getAttendanceRecordVisibilitySql("ar")}
-    AND ${getDashboardExemptionGuardSql(
-      "COALESCE(ar.event_id, ai.event_id)",
-      getEventStudentExemptionFilterSql(
-        "COALESCE(ar.event_id, ai.event_id)",
-        getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
-        getCanonicalCollegeKeySql("ar"),
-      ),
-    )}
-    ${schoolYearSql}
-  `;
+    school_scopes AS MATERIALIZED (
+      SELECT sy.id,
+        public.is_masterlist_school_year(sy.id) AND EXISTS (
+          SELECT 1 FROM student_masterlist ml WHERE ml.school_year_id = sy.id
+        ) AS masterlist_scope
+      FROM school_years sy
+      ${scopeSchoolYearSql}
+    ),
+    visible AS MATERIALIZED (
+      SELECT ar.id, ar.school_year_id, ar.student_id, ar.college, ar.year_level,
+        ar.masterlist_status, ar.scanned_at, ar.created_at, ar.updated_at,
+        COALESCE(ar.event_id, ai.event_id) AS effective_event_id
+      FROM attendance_records ar
+      LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
+      WHERE ar.deleted_at IS NULL
+        AND (ar.import_id IS NULL OR ai.id IS NOT NULL)
+        ${recordSchoolYearSql}
+    ),
+    exemption_events AS MATERIALIZED (
+      SELECT event_id, BOOL_OR(has_year_exemptions) AS has_year_exemptions
+      FROM (
+        SELECT event_id, FALSE AS has_year_exemptions
+        FROM attendance_event_college_exemptions
+        UNION ALL
+        SELECT event_id, TRUE AS has_year_exemptions
+        FROM attendance_event_year_level_exemptions
+      ) events
+      GROUP BY event_id
+    ),
+    exempt_candidates AS MATERIALIZED (
+      SELECT v.*, ee.has_year_exemptions,
+        LOWER(TRIM(v.student_id)) AS student_key,
+        public.masterlist_student_number_key(v.student_id) AS masterlist_key,
+        COALESCE(ss.masterlist_scope, FALSE) AS masterlist_scope
+      FROM visible v
+      JOIN exemption_events ee ON ee.event_id = v.effective_event_id
+      LEFT JOIN school_scopes ss ON ss.id = v.school_year_id
+    ),
+    candidate_students AS MATERIALIZED (
+      SELECT DISTINCT student_key FROM exempt_candidates
+    ),
+    canonical_students AS MATERIALIZED (
+      SELECT DISTINCT ON (keys.student_key)
+        keys.student_key, s.college, s.year_level
+      FROM candidate_students keys
+      JOIN students s ON LOWER(TRIM(s.student_id)) = keys.student_key
+      ORDER BY keys.student_key, s.updated_at DESC, s.created_at DESC, s.id DESC
+    ),
+    exemption_profiles AS MATERIALIZED (
+      SELECT v.id, v.school_year_id, v.effective_event_id, v.student_key,
+        v.has_year_exemptions, v.masterlist_scope,
+        ml.id IS NOT NULL AS has_masterlist_profile,
+        ml.year_level_key AS masterlist_year_key,
+        ${getYearLevelKeySql("cs.year_level")} AS student_year_key,
+        ${collegeKey} AS college_key
+      FROM exempt_candidates v
+      LEFT JOIN canonical_students cs ON cs.student_key = v.student_key
+      LEFT JOIN student_masterlist ml ON v.masterlist_scope
+        AND ml.school_year_id = v.school_year_id
+        AND ml.student_number_key = v.masterlist_key
+    ),
+    year_targets AS MATERIALIZED (
+      -- In a masterlist-scoped term, a missing masterlist profile cannot have
+      -- resolved attendance history with the same canonical student key.
+      -- Such rows fall back to the students table, as in the original resolver.
+      SELECT DISTINCT school_year_id, student_key
+      FROM exemption_profiles
+      WHERE has_year_exemptions AND NOT has_masterlist_profile AND NOT masterlist_scope
+    ),
+    year_history AS MATERIALIZED (
+      SELECT t.school_year_id, t.student_key, v.id, v.updated_at, v.created_at,
+        COALESCE(v.scanned_at, v.updated_at, v.created_at) AS sort_at,
+        ${getYearLevelKeySql("v.year_level")} AS year_level_key
+      FROM visible v
+      JOIN year_targets t ON t.student_key = LOWER(TRIM(v.student_id))
+        AND t.school_year_id IS NOT DISTINCT FROM v.school_year_id
+      WHERE v.masterlist_status IS DISTINCT FROM 'unmatched'
+      UNION ALL
+      SELECT t.school_year_id, t.student_key, mar.id, mar.updated_at, mar.created_at,
+        COALESCE(mar.scanned_at, mar.updated_at, mar.created_at) AS sort_at,
+        ${getYearLevelKeySql("mar.year_level")} AS year_level_key
+      FROM manual_attendance_records mar
+      JOIN year_targets t ON t.student_key = LOWER(TRIM(mar.student_id))
+        AND t.school_year_id IS NOT DISTINCT FROM mar.school_year_id
+      WHERE mar.masterlist_status IS DISTINCT FROM 'unmatched'
+        ${manualSchoolYearSql}
+    ),
+    latest_year_history AS MATERIALIZED (
+      SELECT DISTINCT ON (school_year_id, student_key)
+        school_year_id, student_key, year_level_key
+      FROM year_history
+      WHERE year_level_key IS NOT NULL
+      ORDER BY school_year_id, student_key, sort_at DESC NULLS LAST,
+        updated_at DESC, created_at DESC, id DESC
+    ),
+    resolved_profiles AS MATERIALIZED (
+      SELECT p.id, p.effective_event_id, p.college_key,
+        CASE WHEN p.has_masterlist_profile THEN p.masterlist_year_key
+          ELSE COALESCE(h.year_level_key, p.student_year_key) END AS year_level_key
+      FROM exemption_profiles p
+      LEFT JOIN latest_year_history h ON p.has_year_exemptions
+        AND NOT p.has_masterlist_profile AND NOT p.masterlist_scope
+        AND h.student_key = p.student_key
+        AND h.school_year_id IS NOT DISTINCT FROM p.school_year_id
+    ),
+    excluded_records AS MATERIALIZED (
+      SELECT p.id FROM resolved_profiles p
+      JOIN attendance_event_college_exemptions ce
+        ON ce.event_id = p.effective_event_id AND ce.college_key = p.college_key
+      UNION
+      SELECT p.id FROM resolved_profiles p
+      JOIN attendance_event_year_level_exemptions ye
+        ON ye.event_id = p.effective_event_id AND ye.year_level_key = p.year_level_key
+        AND (ye.college_key IS NULL OR ye.college_key = p.college_key)
+    ),
+    scoped AS MATERIALIZED (
+      SELECT v.id, v.effective_event_id, v.scanned_at, v.created_at,
+        COALESCE(NULLIF(TRIM(v.college), ''), 'Unassigned') AS college,
+        timezone('Asia/Manila', COALESCE(v.scanned_at, v.created_at))::date AS local_date
+      FROM visible v
+      LEFT JOIN excluded_records e ON e.id = v.id
+      WHERE e.id IS NULL
+    )`;
 }
 
 export type AttendanceDashboardOverview = {
@@ -7229,84 +7340,84 @@ async function computeAttendanceDashboardOverview(
   schoolYearId?: string,
 ): Promise<AttendanceDashboardOverview> {
   const params = schoolYearId ? [schoolYearId] : [];
-  const attendanceSchoolYearSql = schoolYearId
-    ? "AND ar.school_year_id = $1"
-    : "";
   const importSchoolYearSql = schoolYearId ? "AND ai.school_year_id = $1" : "";
-  const dashboardWhereSql = getAttendanceDashboardRecordWhereSql(schoolYearId);
+  const visibleRecordsCteSql = getDashboardVisibleRecordsCteSql(schoolYearId);
+
+  // Aggregate once and select the actual latest eight visible IDs, even if
+  // more than 200 of the newest raw records are exempt. Only those eight rows
+  // need the expensive display-profile projection.
+  const summaryPromise = query<{
+    total: number;
+    trend: AttendanceDashboardOverview["attendanceTrend"];
+    colleges: AttendanceDashboardOverview["attendanceByCollege"];
+    recentIds: string[];
+  }>(
+    `
+      WITH ${visibleRecordsCteSql},
+      date_range AS (
+        SELECT generate_series(
+          timezone('Asia/Manila', NOW())::date - INTERVAL '13 days',
+          timezone('Asia/Manila', NOW())::date,
+          INTERVAL '1 day'
+        )::date AS date
+      ),
+      daily_counts AS (
+        SELECT local_date, COUNT(*)::INT AS count
+        FROM scoped
+        WHERE local_date >= timezone('Asia/Manila', NOW())::date - 13
+          AND local_date <= timezone('Asia/Manila', NOW())::date
+        GROUP BY local_date
+      ),
+      trend AS (
+        SELECT d.date, COALESCE(dc.count, 0)::INT AS count
+        FROM date_range d LEFT JOIN daily_counts dc ON dc.local_date = d.date
+      ),
+      colleges AS (
+        SELECT college, COUNT(*)::INT AS count
+        FROM scoped GROUP BY college ORDER BY count DESC, college ASC LIMIT 8
+      ),
+      recent AS (
+        SELECT id, scanned_at, created_at FROM scoped
+        ORDER BY COALESCE(scanned_at, created_at) DESC NULLS LAST, created_at DESC, id DESC
+        LIMIT 8
+      )
+      SELECT
+        (SELECT COUNT(*)::INT FROM scoped) AS total,
+        COALESCE((SELECT json_agg(json_build_object('date', TO_CHAR(t.date, 'YYYY-MM-DD'), 'count', t.count) ORDER BY t.date) FROM trend t), '[]'::json) AS trend,
+        COALESCE((SELECT json_agg(json_build_object('college', c.college, 'count', c.count) ORDER BY c.count DESC, c.college ASC) FROM colleges c), '[]'::json) AS colleges,
+        ARRAY(SELECT id FROM recent ORDER BY COALESCE(scanned_at, created_at) DESC NULLS LAST, created_at DESC, id DESC) AS "recentIds"
+    `,
+    params,
+  );
+
+  const attendancePromise = summaryPromise.then(async (summary) => {
+    const recentIds = summary.rows[0]?.recentIds ?? [];
+    if (!recentIds.length) return [] as AttendanceRecord[];
+
+    const result = await query<AttendanceRecord>(
+      `
+        SELECT ${ATTENDANCE_RECORD_SELECT}
+        FROM unnest($1::uuid[]) WITH ORDINALITY AS recent(id, position)
+        JOIN attendance_records ar ON ar.id = recent.id
+        LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
+        LEFT JOIN attendance_events ae ON ae.id = COALESCE(ar.event_id, ai.event_id)
+        LEFT JOIN LATERAL (
+          SELECT student.* FROM students student
+          WHERE LOWER(TRIM(student.student_id)) = LOWER(TRIM(ar.student_id))
+          ORDER BY student.updated_at DESC, student.created_at DESC, student.id DESC
+          LIMIT 1
+        ) s ON TRUE
+        WHERE ar.deleted_at IS NULL AND (ar.import_id IS NULL OR ai.id IS NOT NULL)
+        ORDER BY recent.position
+      `,
+      [recentIds],
+    );
+    return result.rows;
+  });
 
   const [summaryResult, attendanceResult, importResult] = await Promise.allSettled([
-    query<{
-      total: number;
-      trend: AttendanceDashboardOverview["attendanceTrend"];
-      colleges: AttendanceDashboardOverview["attendanceByCollege"];
-    }>(
-      `
-        WITH scoped AS MATERIALIZED (
-          SELECT
-            ar.id,
-            COALESCE(NULLIF(TRIM(ar.college), ''), 'Unassigned') AS college,
-            timezone('Asia/Manila', COALESCE(ar.scanned_at, ar.created_at))::date AS local_date
-          FROM attendance_records ar
-          LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
-          WHERE ${dashboardWhereSql}
-        ),
-        date_range AS (
-          SELECT generate_series(
-            timezone('Asia/Manila', NOW())::date - INTERVAL '13 days',
-            timezone('Asia/Manila', NOW())::date,
-            INTERVAL '1 day'
-          )::date AS date
-        ),
-        trend AS (
-          SELECT date_range.date, COALESCE(COUNT(scoped.id), 0)::INT AS count
-          FROM date_range
-          LEFT JOIN scoped ON scoped.local_date = date_range.date
-          GROUP BY date_range.date
-        ),
-        colleges AS (
-          SELECT college, COUNT(*)::INT AS count
-          FROM scoped
-          GROUP BY college
-          ORDER BY count DESC, college ASC
-          LIMIT 8
-        )
-        SELECT
-          (SELECT COUNT(*)::INT FROM scoped) AS total,
-          COALESCE((SELECT json_agg(json_build_object('date', TO_CHAR(t.date, 'YYYY-MM-DD'), 'count', t.count) ORDER BY t.date) FROM trend t), '[]'::json) AS trend,
-          COALESCE((SELECT json_agg(json_build_object('college', c.college, 'count', c.count) ORDER BY c.count DESC, c.college ASC) FROM colleges c), '[]'::json) AS colleges
-      `,
-      params,
-    ),
-    query<AttendanceRecord>(
-      `
-        WITH candidates AS MATERIALIZED (
-          SELECT ar.id, COALESCE(ar.event_id, ai.event_id) AS effective_event_id
-          FROM attendance_records ar
-          LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
-          WHERE ${getAttendanceRecordVisibilitySql("ar")}
-            ${attendanceSchoolYearSql}
-          ORDER BY COALESCE(ar.scanned_at, ar.created_at) DESC NULLS LAST, ar.created_at DESC, ar.id DESC
-          LIMIT 200
-        )
-        SELECT ${ATTENDANCE_RECORD_SELECT}
-        FROM candidates c
-        JOIN attendance_records ar ON ar.id = c.id
-        LEFT JOIN attendance_events ae ON ae.id = c.effective_event_id
-        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
-        WHERE ${getDashboardExemptionGuardSql(
-          "c.effective_event_id",
-          getEventStudentExemptionFilterSql(
-            "c.effective_event_id",
-            getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
-            getCanonicalCollegeKeySql("ar", "s"),
-          ),
-        )}
-        ORDER BY COALESCE(ar.scanned_at, ar.created_at) DESC NULLS LAST, ar.created_at DESC, ar.id DESC
-        LIMIT 8
-      `,
-      params,
-    ),
+    summaryPromise,
+    attendancePromise,
     query<AttendanceImportRecord>(
       `
         SELECT ${ATTENDANCE_IMPORT_SELECT}
@@ -7349,7 +7460,7 @@ async function computeAttendanceDashboardOverview(
 
   return {
     attendanceRecordCount: Number(summary?.total ?? 0),
-    recentAttendanceRecords: attendanceResult.status === "fulfilled" ? attendanceResult.value.rows : [],
+    recentAttendanceRecords: attendanceResult.status === "fulfilled" ? attendanceResult.value : [],
     recentImports: importResult.status === "fulfilled" ? importResult.value.rows.map(withAttendanceImportRetention) : [],
     attendanceTrend: (summary?.trend ?? []).map((row) => ({
       date: row.date,
