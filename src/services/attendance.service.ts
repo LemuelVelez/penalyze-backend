@@ -7153,19 +7153,29 @@ export async function deleteAttendanceEvent(id: string) {
   });
 }
 
+function getDashboardExemptionGuardSql(eventExpr: string, fullFilterSql: string) {
+  return `(CASE
+    WHEN ${eventExpr} IS NULL THEN TRUE
+    WHEN NOT EXISTS (SELECT 1 FROM attendance_event_college_exemptions guard_ce WHERE guard_ce.event_id = ${eventExpr})
+     AND NOT EXISTS (SELECT 1 FROM attendance_event_year_level_exemptions guard_ye WHERE guard_ye.event_id = ${eventExpr})
+    THEN TRUE
+    ELSE ${fullFilterSql}
+  END)`;
+}
+
 function getAttendanceDashboardRecordWhereSql(schoolYearId?: string) {
   const schoolYearSql = schoolYearId ? "AND ar.school_year_id = $1" : "";
 
   return `
     ${getAttendanceRecordVisibilitySql("ar")}
-    AND (
-      COALESCE(ar.event_id, ai.event_id) IS NULL
-      OR ${getEventStudentExemptionFilterSql(
+    AND ${getDashboardExemptionGuardSql(
+      "COALESCE(ar.event_id, ai.event_id)",
+      getEventStudentExemptionFilterSql(
         "COALESCE(ar.event_id, ai.event_id)",
         getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
         getCanonicalCollegeKeySql("ar"),
-      )}
-    )
+      ),
+    )}
     ${schoolYearSql}
   `;
 }
@@ -7176,9 +7186,46 @@ export type AttendanceDashboardOverview = {
   recentImports: AttendanceImportRecord[];
   attendanceTrend: Array<{ date: string; count: number }>;
   attendanceByCollege: Array<{ college: string; count: number }>;
+  partial?: boolean;
+  failedSections?: Array<"summary" | "recentRecords" | "recentImports">;
 };
 
-export async function getAttendanceDashboardOverview(
+const DASHBOARD_OVERVIEW_TTL_MS = 30_000;
+const dashboardOverviewCache = new Map<string, { expiresAt: number; value: AttendanceDashboardOverview }>();
+const dashboardOverviewInFlight = new Map<string, Promise<AttendanceDashboardOverview>>();
+
+export function getAttendanceDashboardOverview(
+  schoolYearId?: string,
+): Promise<AttendanceDashboardOverview> {
+  const key = schoolYearId ?? "__all__";
+  const cached = dashboardOverviewCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return Promise.resolve(cached.value);
+  }
+  if (cached) dashboardOverviewCache.delete(key);
+
+  const inFlight = dashboardOverviewInFlight.get(key);
+  if (inFlight) return inFlight;
+
+  const computation = computeAttendanceDashboardOverview(schoolYearId)
+    .then((value) => {
+      if (value.partial !== true) {
+        dashboardOverviewCache.set(key, {
+          expiresAt: Date.now() + DASHBOARD_OVERVIEW_TTL_MS,
+          value,
+        });
+      }
+      return value;
+    })
+    .finally(() => {
+      dashboardOverviewInFlight.delete(key);
+    });
+
+  dashboardOverviewInFlight.set(key, computation);
+  return computation;
+}
+
+async function computeAttendanceDashboardOverview(
   schoolYearId?: string,
 ): Promise<AttendanceDashboardOverview> {
   const params = schoolYearId ? [schoolYearId] : [];
@@ -7188,48 +7235,74 @@ export async function getAttendanceDashboardOverview(
   const importSchoolYearSql = schoolYearId ? "AND ai.school_year_id = $1" : "";
   const dashboardWhereSql = getAttendanceDashboardRecordWhereSql(schoolYearId);
 
-  const [
-    countResult,
-    attendanceResult,
-    importResult,
-    trendResult,
-    collegeResult,
-  ] = await Promise.all([
-    query<{ total: number }>(
+  const [summaryResult, attendanceResult, importResult] = await Promise.allSettled([
+    query<{
+      total: number;
+      trend: AttendanceDashboardOverview["attendanceTrend"];
+      colleges: AttendanceDashboardOverview["attendanceByCollege"];
+    }>(
       `
-        SELECT COUNT(*)::INT AS total
-        FROM attendance_records ar
-        LEFT JOIN attendance_imports ai
-          ON ai.id = ar.import_id
-         AND ai.deleted_at IS NULL
-        WHERE ${dashboardWhereSql}
+        WITH scoped AS MATERIALIZED (
+          SELECT
+            ar.id,
+            COALESCE(NULLIF(TRIM(ar.college), ''), 'Unassigned') AS college,
+            timezone('Asia/Manila', COALESCE(ar.scanned_at, ar.created_at))::date AS local_date
+          FROM attendance_records ar
+          LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
+          WHERE ${dashboardWhereSql}
+        ),
+        date_range AS (
+          SELECT generate_series(
+            timezone('Asia/Manila', NOW())::date - INTERVAL '13 days',
+            timezone('Asia/Manila', NOW())::date,
+            INTERVAL '1 day'
+          )::date AS date
+        ),
+        trend AS (
+          SELECT date_range.date, COALESCE(COUNT(scoped.id), 0)::INT AS count
+          FROM date_range
+          LEFT JOIN scoped ON scoped.local_date = date_range.date
+          GROUP BY date_range.date
+        ),
+        colleges AS (
+          SELECT college, COUNT(*)::INT AS count
+          FROM scoped
+          GROUP BY college
+          ORDER BY count DESC, college ASC
+          LIMIT 8
+        )
+        SELECT
+          (SELECT COUNT(*)::INT FROM scoped) AS total,
+          COALESCE((SELECT json_agg(json_build_object('date', TO_CHAR(t.date, 'YYYY-MM-DD'), 'count', t.count) ORDER BY t.date) FROM trend t), '[]'::json) AS trend,
+          COALESCE((SELECT json_agg(json_build_object('college', c.college, 'count', c.count) ORDER BY c.count DESC, c.college ASC) FROM colleges c), '[]'::json) AS colleges
       `,
       params,
     ),
     query<AttendanceRecord>(
       `
+        WITH candidates AS MATERIALIZED (
+          SELECT ar.id, COALESCE(ar.event_id, ai.event_id) AS effective_event_id
+          FROM attendance_records ar
+          LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
+          WHERE ${getAttendanceRecordVisibilitySql("ar")}
+            ${attendanceSchoolYearSql}
+          ORDER BY COALESCE(ar.scanned_at, ar.created_at) DESC NULLS LAST, ar.created_at DESC, ar.id DESC
+          LIMIT 200
+        )
         SELECT ${ATTENDANCE_RECORD_SELECT}
-        FROM attendance_records ar
-        LEFT JOIN attendance_imports ai
-          ON ai.id = ar.import_id
-         AND ai.deleted_at IS NULL
-        LEFT JOIN attendance_events ae ON ae.id = COALESCE(ar.event_id, ai.event_id)
-        LEFT JOIN students s
-          ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
-        WHERE ${getAttendanceRecordVisibilitySql("ar")}
-          AND (
-            COALESCE(ar.event_id, ai.event_id) IS NULL
-            OR ${getEventStudentExemptionFilterSql(
-              "COALESCE(ar.event_id, ai.event_id)",
-              getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
-              getCanonicalCollegeKeySql("ar", "s"),
-            )}
-          )
-          ${attendanceSchoolYearSql}
-        ORDER BY
-          COALESCE(ar.scanned_at, ar.created_at) DESC NULLS LAST,
-          ar.created_at DESC,
-          ar.id DESC
+        FROM candidates c
+        JOIN attendance_records ar ON ar.id = c.id
+        LEFT JOIN attendance_events ae ON ae.id = c.effective_event_id
+        LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+        WHERE ${getDashboardExemptionGuardSql(
+          "c.effective_event_id",
+          getEventStudentExemptionFilterSql(
+            "c.effective_event_id",
+            getResolvedStudentYearLevelKeySql("ar.student_id", "ar.school_year_id"),
+            getCanonicalCollegeKeySql("ar", "s"),
+          ),
+        )}
+        ORDER BY COALESCE(ar.scanned_at, ar.created_at) DESC NULLS LAST, ar.created_at DESC, ar.id DESC
         LIMIT 8
       `,
       params,
@@ -7248,68 +7321,45 @@ export async function getAttendanceDashboardOverview(
       `,
       params,
     ),
-    query<{ date: string; count: number }>(
-      `
-        WITH date_range AS (
-          SELECT generate_series(
-            timezone('Asia/Manila', NOW())::date - INTERVAL '13 days',
-            timezone('Asia/Manila', NOW())::date,
-            INTERVAL '1 day'
-          )::date AS date
-        ),
-        attendance_counts AS (
-          SELECT
-            timezone('Asia/Manila', COALESCE(ar.scanned_at, ar.created_at))::date AS date,
-            COUNT(*)::INT AS count
-          FROM attendance_records ar
-          LEFT JOIN attendance_imports ai
-            ON ai.id = ar.import_id
-           AND ai.deleted_at IS NULL
-          WHERE ${dashboardWhereSql}
-            AND timezone('Asia/Manila', COALESCE(ar.scanned_at, ar.created_at))::date
-              BETWEEN timezone('Asia/Manila', NOW())::date - INTERVAL '13 days'
-                  AND timezone('Asia/Manila', NOW())::date
-          GROUP BY 1
-        )
-        SELECT
-          TO_CHAR(date_range.date, 'YYYY-MM-DD') AS date,
-          COALESCE(attendance_counts.count, 0)::INT AS count
-        FROM date_range
-        LEFT JOIN attendance_counts ON attendance_counts.date = date_range.date
-        ORDER BY date_range.date ASC
-      `,
-      params,
-    ),
-    query<{ college: string; count: number }>(
-      `
-        SELECT
-          COALESCE(NULLIF(TRIM(ar.college), ''), 'Unassigned') AS college,
-          COUNT(*)::INT AS count
-        FROM attendance_records ar
-        LEFT JOIN attendance_imports ai
-          ON ai.id = ar.import_id
-         AND ai.deleted_at IS NULL
-        WHERE ${dashboardWhereSql}
-        GROUP BY COALESCE(NULLIF(TRIM(ar.college), ''), 'Unassigned')
-        ORDER BY count DESC, college ASC
-        LIMIT 8
-      `,
-      params,
-    ),
   ]);
 
+  const failedSections: NonNullable<AttendanceDashboardOverview["failedSections"]> = [];
+  if (summaryResult.status === "rejected") {
+    failedSections.push("summary");
+    console.error("[dashboard-overview] summary failed", summaryResult.reason);
+  }
+  if (attendanceResult.status === "rejected") {
+    failedSections.push("recentRecords");
+    console.error("[dashboard-overview] recentRecords failed", attendanceResult.reason);
+  }
+  if (importResult.status === "rejected") {
+    failedSections.push("recentImports");
+    console.error("[dashboard-overview] recentImports failed", importResult.reason);
+  }
+
+  if (
+    summaryResult.status === "rejected" &&
+    attendanceResult.status === "rejected" &&
+    importResult.status === "rejected"
+  ) {
+    throw summaryResult.reason;
+  }
+
+  const summary = summaryResult.status === "fulfilled" ? summaryResult.value.rows[0] : undefined;
+
   return {
-    attendanceRecordCount: Number(countResult.rows[0]?.total ?? 0),
-    recentAttendanceRecords: attendanceResult.rows,
-    recentImports: importResult.rows.map(withAttendanceImportRetention),
-    attendanceTrend: trendResult.rows.map((row) => ({
+    attendanceRecordCount: Number(summary?.total ?? 0),
+    recentAttendanceRecords: attendanceResult.status === "fulfilled" ? attendanceResult.value.rows : [],
+    recentImports: importResult.status === "fulfilled" ? importResult.value.rows.map(withAttendanceImportRetention) : [],
+    attendanceTrend: (summary?.trend ?? []).map((row) => ({
       date: row.date,
       count: Number(row.count ?? 0),
     })),
-    attendanceByCollege: collegeResult.rows.map((row) => ({
+    attendanceByCollege: (summary?.colleges ?? []).map((row) => ({
       college: row.college,
       count: Number(row.count ?? 0),
     })),
+    ...(failedSections.length ? { partial: true, failedSections } : {}),
   };
 }
 
