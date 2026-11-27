@@ -502,12 +502,12 @@ export async function stepMasterlistMaintenance(client: PoolClient, job: Mainten
 
 // Called inside the existing upload transaction, after its raw rows are saved.
 // The caller holds the attendance synchronization lock and owns the derived refresh.
-export async function reconcileMasterlistForAttendanceUpload(client: PoolClient, schoolYearId: string, cache: MasterlistCache) {
+export async function reconcileMasterlistForAttendanceUpload(client: PoolClient, schoolYearId: string, cache: MasterlistCache, onProgress?: ProgressCallback) {
   const index = await loadMasterlist(client, schoolYearId, cache);
   if (!index.rows.length) return false;
   const year = (await client.query<SchoolYearRecord>("SELECT * FROM school_years WHERE id=$1", [schoolYearId])).rows[0];
   if (!isMasterlistSchoolYear(year)) return false;
-  await reconcileWithClient(client, year, false, cache);
+  await reconcileWithClient(client, year, false, cache, onProgress);
   return true;
 }
 

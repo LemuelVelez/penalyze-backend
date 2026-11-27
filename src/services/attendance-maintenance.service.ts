@@ -1,5 +1,5 @@
 import { savePreparedAttendanceFilesWithClient, saveAttendanceRowsWithClient, planCommittedImportMaintenance, finishCommittedImportMaintenance, type PreparedAttendanceFiles, type AttendanceBatchSaveResult } from "./attendance.service";
-import type { SavedAttendanceImportResult, FineRecord } from "../database/model/schema.model";
+import type { AttendanceImportProgress, SavedAttendanceImportResult, FineRecord } from "../database/model/schema.model";
 import { reviewAttendanceRequest, reviewAttendanceRequestGroup } from "./attendance-requests.service";
 import type { PoolClient } from "pg";
 import type { MaintenanceJob } from "../database/model/schema.model";
@@ -14,7 +14,7 @@ const EVENT_REFRESH_BATCH_SIZE = 50;
 const EVENT_REFRESH_PHASES = ["refresh_final_results", "refresh_calculations", "refresh_penalties"];
 type EventRefreshCursor = { scopeIndex?:number; offset?:number; refreshBatchSize?:number };
 export function smallerEventRefreshCursor(job: MaintenanceJob) {
-  if (job.kind !== "final_result_event_batch" || !EVENT_REFRESH_PHASES.includes(job.phase)) return null;
+  if (!["final_result_event_batch", "attendance_import_save"].includes(job.kind) || !EVENT_REFRESH_PHASES.includes(job.phase)) return null;
   const state = job.state as State;
   const cursor = job.cursor as EventRefreshCursor;
   const remaining = (state.refreshKeys?.length ?? 0) - (state.refreshOffset ?? 0);
@@ -27,7 +27,7 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
   return {kind, async plan(_client,job) {
     if (!job.input) throw validation("Missing saved operation input.");
     return {phase:"primary",total:0,cursor:{},state:{scopes:[],scopeIndex:0,offset:0}};
-  }, async step(client:PoolClient,job:MaintenanceJob) {
+  }, async step(client:PoolClient,job:MaintenanceJob,onProgress) {
     const input = job.input as Input;
     const state = job.state as State;
     const options = input.body as DerivedOptions;
@@ -49,13 +49,28 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
           state.refreshOffset=0;
         }
       } else if(kind === "attendance_import_save") {
-        if(input.operation === "files")state.result=await savePreparedAttendanceFilesWithClient(client,input.body as unknown as PreparedAttendanceFiles,undefined,true);
+        const report = (progress: AttendanceImportProgress) => {
+          const percent = Math.min(20, 2 + Math.round(progress.percent * 0.18));
+          onProgress?.({ stage: "reconciling_records", percent, message: progress.message,
+            processed: progress.processedRows, total: progress.totalRows,
+            attendance: { ...progress, stage: "saving", percent } });
+        };
+        onProgress?.({ stage: "reconciling_records", percent: 2, message: "Preparing attendance records for saving..." });
+        if(input.operation === "files")state.result=await savePreparedAttendanceFilesWithClient(client,input.body as unknown as PreparedAttendanceFiles,report,true);
         else {
           const prepared=input.body as unknown as {input:Parameters<typeof saveAttendanceRowsWithClient>[1];preview:Parameters<typeof saveAttendanceRowsWithClient>[2]};
-          state.result=await saveAttendanceRowsWithClient(client,{...prepared.input,deferDerivedRefresh:true},prepared.preview,new Map(),true);
+          state.result=await saveAttendanceRowsWithClient(client,{...prepared.input,deferDerivedRefresh:true,onProgress:report},prepared.preview,new Map(),true);
         }
         const imports=input.operation==="files"?(state.result as AttendanceBatchSaveResult).files.flatMap(file=>file.result?[file.result]:[]):[state.result as SavedAttendanceImportResult];
-        state.scopes=await planCommittedImportMaintenance(client,imports);state.fines=[];
+        const savedRecords = imports.reduce((sum, item) => sum + item.savedRecords.length, 0);
+        const totalRows = imports.reduce((sum, item) => sum + item.rowsTotal, 0);
+        state.scopes=await planCommittedImportMaintenance(client,imports,progress => {
+          const percent = Math.min(24, 21 + Math.floor(progress.percent / 25));
+          onProgress?.({ ...progress, percent, attendance: {
+            stage: "saving", percent, message: progress.message, processedRows: totalRows,
+            totalRows, savedRecords, createdFines: 0,
+          } });
+        });state.fines=[];
       } else if(kind === "request_group_review") {
         if(input.operation === "single") state.result=await reviewAttendanceRequest(input.requestId,job.created_by,input.body as Parameters<typeof reviewAttendanceRequest>[2],undefined,undefined,primary);
         else state.result=await reviewAttendanceRequestGroup(job.created_by,input.body as Parameters<typeof reviewAttendanceRequestGroup>[1],undefined,undefined,primary);
@@ -96,7 +111,7 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
         state.offset+=chunk.length;
         percent=25+25*(ids.length ? state.offset/ids.length : 1);message=`Absences synchronized: ${state.offset} / ${ids.length}`;
         if(state.offset>=ids.length){if(scope.skipRefresh){state.scopeIndex++;state.offset=0;phase=state.scopeIndex<state.scopes.length?"sync_absences":"finalize";}else phase="refresh_final_results";}
-      } else if(kind === "final_result_event_batch" && schoolYearId && EVENT_REFRESH_PHASES.includes(phase) && state.refreshKeys !== null) {
+      } else if(["final_result_event_batch", "attendance_import_save"].includes(kind) && schoolYearId && EVENT_REFRESH_PHASES.includes(phase) && state.refreshKeys !== null) {
         const final=phase === "refresh_final_results";
         const calculations=phase === "refresh_calculations";
         const start=final?50:calculations?65:80;
@@ -111,7 +126,7 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
             delete state.refreshPlanPending;
           } else {
             state.refreshKeys=await isMasterlistDerivedRefreshScope(client,schoolYearId)
-              ? await prepareMasterlistDerivedRefresh(client,schoolYearId,false) : null;
+              ? await prepareMasterlistDerivedRefresh(client,schoolYearId,kind === "attendance_import_save") : null;
           }
           state.refreshOffset=0;
           message=state.refreshKeys === null ? "Preparing legacy attendance refresh." : `Preparing ${label}: ${state.refreshKeys.length} students.`;
@@ -132,6 +147,11 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
           } else {
             if(final || calculations) await finishMasterlistDerivedRefresh(client,schoolYearId,final?"attendance_final_results":"calculation_results");
             phase=final?"refresh_calculations":calculations?"refresh_penalties":"finalize";
+            if (!final && !calculations && kind === "attendance_import_save") {
+              state.scopeIndex++; state.offset=0;
+              delete state.refreshKeys;
+              phase=state.scopeIndex<state.scopes.length?"sync_absences":"finalize";
+            }
             state.refreshOffset=0;
             percent=end;message=`Finished ${label}.`;
           }
@@ -145,10 +165,10 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
       } else if(phase === "refresh_penalties") {
         const rows=await refreshPenaltyResultsForSchoolYearWithClient(client,schoolYearId);
         if(kind==="derived_refresh"&&input.operation==="penalties")state.result=rows;
-        state.scopeIndex++;state.offset=0;phase=state.scopeIndex<state.scopes.length?"sync_absences":"finalize";percent=95;message="Penalties refreshed.";
+        state.scopeIndex++;state.offset=0;delete state.refreshKeys;delete state.refreshOffset;phase=state.scopeIndex<state.scopes.length?"sync_absences":"finalize";percent=95;message="Penalties refreshed.";
       } else throw validation("Invalid maintenance checkpoint.");
     }
-    const refreshCursor=kind === "final_result_event_batch" && phase===job.phase ? {refreshBatchSize:(job.cursor as EventRefreshCursor).refreshBatchSize} : {};
+    const refreshCursor=["final_result_event_batch", "attendance_import_save"].includes(kind) && phase===job.phase ? {refreshBatchSize:(job.cursor as EventRefreshCursor).refreshBatchSize} : {};
     return {done,phase,cursor:{scopeIndex:state.scopeIndex,offset:state.offset,...refreshCursor},state,processed:state.refreshOffset??state.offset,total:state.refreshKeys?.length??state.scopes[state.scopeIndex]?.studentIds?.length??0,percent,message,result:done?state.result:undefined};
   }};
 }

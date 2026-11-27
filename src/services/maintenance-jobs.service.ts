@@ -2,14 +2,15 @@ import { attendanceMaintenanceHandler, smallerEventRefreshCursor } from "./atten
 import { randomUUID } from "node:crypto";
 import { setImmediate, setTimeout } from "node:timers/promises";
 import type { PoolClient } from "pg";
-import type { MaintenanceJob } from "../database/model/schema.model";
+import type { AttendanceImportProgress, MaintenanceJob } from "../database/model/schema.model";
 import { jobPool, withJobTransaction } from "../lib/db";
 import { tryLockAttendanceAbsenceSync } from "./attendance.service";
 import { planMasterlistMaintenance, stepMasterlistMaintenance, smallerMasterlistRefreshCursor, reconciliationStage, type MasterlistProgress } from "./masterlist.service";
 
 type JobPlan = { total: number; phase: string; cursor: object; state: object };
 type JobStep = JobPlan & { done: boolean; processed: number; percent: number; message: string; result?: unknown };
-export type JobHandler = { kind: string; plan(client: PoolClient, job: MaintenanceJob): Promise<JobPlan>; step(client: PoolClient, job: MaintenanceJob): Promise<JobStep> };
+export type JobProgress = MasterlistProgress & { attendance?: AttendanceImportProgress };
+export type JobHandler = { kind: string; plan(client: PoolClient, job: MaintenanceJob): Promise<JobPlan>; step(client: PoolClient, job: MaintenanceJob, onProgress?: (progress: JobProgress) => void): Promise<JobStep> };
 const handlers = new Map<string, JobHandler>();
 export function registerJobHandler(handler: JobHandler) { handlers.set(handler.kind, handler); }
 for (const kind of ["masterlist_presence_rebuild", "masterlist_reconcile"]) {
@@ -64,7 +65,7 @@ function safeError(error: unknown) {
   const code = typeof raw?.code === "string" && /^[0-9A-Z]{5}$/.test(raw.code) ? ` (${raw.code})` : "";
   return raw?.expose && raw.message ? `${raw.message}${code}` : `Maintenance step failed${code}. Press Resume to continue from the saved checkpoint.`;
 }
-export async function runJob(id: string, onProgress?: (progress: MasterlistProgress) => void, isCancelled: () => boolean = () => false, claimed?: MaintenanceJob): Promise<MaintenanceJob> {
+export async function runJob(id: string, onProgress?: (progress: JobProgress) => void, isCancelled: () => boolean = () => false, claimed?: MaintenanceJob): Promise<MaintenanceJob> {
   let job = claimed ?? await claimJob(id);
   const token = job.runner_token;
   const handler = requireHandler(job.kind);
@@ -86,7 +87,7 @@ export async function runJob(id: string, onProgress?: (progress: MasterlistProgr
           // Plan has its own checkpoint; no plan or step is replayed after commit.
           const step: JobStep = current.phase === "queued"
             ? {...await handler.plan(client,current),done:false,processed:0,percent:0,message:"Maintenance planned."}
-            : await handler.step(client,current);
+            : await handler.step(client,current,onProgress);
           return (await client.query<MaintenanceJob>(`UPDATE maintenance_jobs SET phase=$3,cursor=$4::jsonb,state=$5::jsonb,processed=$6,total=$7,percent=CASE WHEN $10 THEN 100 ELSE GREATEST(percent,$8) END,message=$9,heartbeat_at=clock_timestamp(),updated_at=clock_timestamp(),status=CASE WHEN $10 THEN 'completed' ELSE 'running' END,completed_at=CASE WHEN $10 THEN NOW() ELSE completed_at END,runner_token=CASE WHEN $10 THEN NULL ELSE runner_token END,result=CASE WHEN $10 THEN $11::jsonb ELSE result END WHERE id=$1 AND runner_token=$2 RETURNING *`,[id,token,step.phase,JSON.stringify(step.cursor),JSON.stringify(step.state),step.processed,step.total,step.percent,step.message,step.done,JSON.stringify(step.result ?? null)])).rows[0];
         });
       } catch (error) {
@@ -144,7 +145,7 @@ export async function recoverMaintenanceJobs() {
   await jobPool.query("WITH stale AS (SELECT id FROM maintenance_jobs WHERE status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '5 minutes' FOR UPDATE SKIP LOCKED) UPDATE maintenance_jobs j SET status='paused',runner_token=NULL,updated_at=clock_timestamp() FROM stale WHERE j.id=stale.id");
 }
 
-export async function runSubmittedJob<T>(kind:string,schoolYearId:string|null,input:unknown,actor?:string,onProgress?:(progress:MasterlistProgress)=>void,isCancelled?:()=>boolean):Promise<T> {
+export async function runSubmittedJob<T>(kind:string,schoolYearId:string|null,input:unknown,actor?:string,onProgress?:(progress:JobProgress)=>void,isCancelled?:()=>boolean):Promise<T> {
   const job=await createOrGetJob(kind,schoolYearId,input,actor);
   const result=await runJob(job.id,onProgress,isCancelled);
   if(result.status!=="completed")throw bad("Operation paused. Resume the saved job.",409);

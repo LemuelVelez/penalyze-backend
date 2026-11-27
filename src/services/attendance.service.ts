@@ -1,5 +1,5 @@
 import { isPlaceholderStudentNumber, normalizeNameKey, normalizeStudentNumberKey } from "./masterlist-normalize";
-import { applyMasterlistReconciliation, reconcileAttendanceRow, resolveStudentAgainstMasterlist, upsertMasterlistStudent, reconcileMasterlistForAttendanceUpload, loadMasterlist, syncMasterlistAbsences, type MasterlistCache } from "./masterlist.service";
+import { applyMasterlistReconciliation, reconcileAttendanceRow, resolveStudentAgainstMasterlist, upsertMasterlistStudent, reconcileMasterlistForAttendanceUpload, loadMasterlist, syncMasterlistAbsences, type MasterlistCache, type MasterlistProgress } from "./masterlist.service";
 import path from "path";
 import { createHash } from "crypto";
 import { TextDecoder } from "util";
@@ -3963,6 +3963,10 @@ export async function saveAttendanceRowsWithClient(
   for (const n of Object.keys(input.rowMasterlistOverrides ?? {})) {
     if (!knownRowNumbers.has(n)) throw createValidationError(`Row ${n} was not found in ${preview.fileName}.`, 400);
   }
+  await emitAttendanceImportProgress(input.onProgress, {
+    stage: "saving", percent: 15, message: "Matching attendance rows against the masterlist...",
+    totalRows: preview.rows.length,
+  });
   const correctedRows: ParsedAttendanceRow[] = [];
   for (const row of preview.rows) {
     const studentNumber = input.rowMasterlistOverrides?.[String(row.rowNumber)];
@@ -4211,7 +4215,8 @@ export async function saveAttendanceRowsWithClient(
   });
 
   const schoolYearId = importRecord.school_year_id ?? undefined;
-  const hasMasterlist = schoolYearId
+  // Maintenance batches reconcile once per school year after every workbook is written.
+  const hasMasterlist = schoolYearId && !maintenance
     ? await reconcileMasterlistForAttendanceUpload(client, schoolYearId, masterlistCache)
     : false;
   // Exempt-only imports do not enter the existing post-commit refresh. A masterlist
@@ -4290,7 +4295,8 @@ export async function saveAttendanceRowsWithClient(
   };
 }
 
-export async function planCommittedImportMaintenance(client:PoolClient,imports:SavedAttendanceImportResult[]) {
+export async function planCommittedImportMaintenance(client:PoolClient,imports:SavedAttendanceImportResult[],onProgress?: (progress: MasterlistProgress) => void) {
+  const masterlistCache: MasterlistCache = new Map();
   const scopes:MaintenanceRefreshScope[]=[];
   const schoolYears=new Set<string|null>();
   const masterlistYears=new Set<string>();
@@ -4299,12 +4305,16 @@ export async function planCommittedImportMaintenance(client:PoolClient,imports:S
     const record=(await client.query<{school_year_id:string|null}>("SELECT school_year_id FROM attendance_imports WHERE id=$1 AND deleted_at IS NULL",[imported.importId])).rows[0];
     if(!record)throw createValidationError("Saved attendance import no longer exists.",404);
     const schoolYearId=record.school_year_id;
-    if(schoolYearId && (await loadMasterlist(client,schoolYearId)).rows.length){
+    if(schoolYearId && (await loadMasterlist(client,schoolYearId,masterlistCache)).rows.length){
       if(!masterlistYears.has(schoolYearId)){
         masterlistYears.add(schoolYearId);
+        onProgress?.({ stage: "reconciling_records", percent: 0, message: "Reconciling saved workbooks with the school-year masterlist..." });
+        await reconcileMasterlistForAttendanceUpload(client,schoolYearId,masterlistCache,onProgress);
         const ids=(await client.query<{student_id:string}>(`SELECT student_number AS student_id FROM student_masterlist WHERE school_year_id=$1 UNION SELECT DISTINCT ar.student_id FROM attendance_records ar WHERE school_year_id=$1 AND ${getAttendanceRecordVisibilitySql("ar")} AND ar.masterlist_status IS DISTINCT FROM 'unmatched'`,[schoolYearId])).rows.map(r=>r.student_id);
         scopes.push({schoolYearId,studentIds:uniqueCleanTextValues(ids),scopeFines:true});
       }
+      // The global reconciliation may update the source record snapshots.
+      imported.savedRecords = await listRecordsByIds(client, imported.savedRecords.map(row => row.id));
     } else if(imported.savedRecords.length){
       const keys=await getAttendanceRecordEventRosterCollegeKeys(client,imported.savedRecords.map(row=>row.id));
       for(const id of await getAttendanceStudentIdsByEventRosterCollegeKeys(client,keys))legacyStudents.add(id);
@@ -4691,6 +4701,8 @@ export async function savePreparedAttendanceFilesWithClient(client:PoolClient,pr
                   ...progress,
                   stage: "saving",
                   percent,
+                  processedRows: savedFiles.reduce((total, item) => total + (item.result?.rowsTotal ?? 0), 0) + progress.processedRows,
+                  totalRows: previews.reduce((total, item) => total + item.rowsTotal, 0),
                   savedRecords: savedFiles.reduce((total, item) => total + (item.result?.savedRecords.length ?? 0), 0) + progress.savedRecords,
                   message: `${file.originalname}: ${progress.message}`,
                 });

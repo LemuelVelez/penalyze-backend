@@ -1,4 +1,4 @@
-import { runSubmittedJob } from "../services/maintenance-jobs.service";
+import { runSubmittedJob, type JobProgress } from "../services/maintenance-jobs.service";
 import { pool } from "../lib/db";
 import { isMasterlistActiveForSchoolYear, masterlistActiveError, MANUAL_ATTENDANCE_MASTERLIST_MESSAGE, ZERO_ATTENDANCE_MASTERLIST_MESSAGE } from "../services/masterlist.service";
 import { NextFunction, Request, Response } from "express";
@@ -70,6 +70,7 @@ import {
 } from "../services/attendance.service";
 import {
   ACCEPTED_ATTENDANCE_EXTENSIONS,
+  type AttendanceImportProgress,
 } from "../database/model/schema.model";
 import type { AuthenticatedRequest } from "./auth.controller";
 import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
@@ -1024,6 +1025,27 @@ export async function saveImportWithProgress(
     const isCancelled = () =>
       clientCancelled || res.destroyed || res.writableEnded;
 
+    let lastProgress: AttendanceImportProgress = {
+      stage: "preparing", percent: 0, message: "Preparing attendance import...",
+      processedRows: 0, totalRows: 0, savedRecords: 0, createdFines: 0,
+    };
+    const report = (progress: AttendanceImportProgress) => {
+      lastProgress = { ...progress, percent: Math.max(lastProgress.percent, progress.percent) };
+      writeProgressStreamMessage(res, { type: "progress", progress: lastProgress });
+    };
+    const reportJob = (progress: JobProgress) => {
+      if (progress.attendance) {
+        report(progress.attendance);
+      } else {
+        report({ ...lastProgress,
+          stage: progress.percent >= 25 ? "syncing" : "saving",
+          percent: progress.percent,
+          message: progress.message,
+        });
+      }
+    };
+    report(lastProgress);
+
     if (files.length) {
       const fileOptions = files.map((file, index) => ({
         ...getEventPayloadForFile(req, file, index),
@@ -1032,8 +1054,8 @@ export async function saveImportWithProgress(
         uploadedBy: getAuthenticatedUserId(req),
         isCancelled,
       }));
-      const prepared=await prepareAttendanceFilesForSave(files,fileOptions.map(({isCancelled:_cancel,...option})=>option));
-      const result=await runSubmittedJob<Awaited<ReturnType<typeof saveAttendanceFiles>>>("attendance_import_save",null,{operation:"files",body:prepared},getAuthenticatedUserId(req),progress=>writeProgressStreamMessage(res,{type:"progress",progress:{stage:progress.percent<25?"saving":"syncing",percent:progress.percent,message:progress.message,processedRows:progress.processed??0,totalRows:progress.total??0,savedRecords:0,createdFines:0}}),isCancelled);
+      const prepared=await prepareAttendanceFilesForSave(files,fileOptions.map(({isCancelled:_cancel,...option})=>option),progress => report({ ...progress, percent: Math.round(progress.percent / 6) }));
+      const result=await runSubmittedJob<Awaited<ReturnType<typeof saveAttendanceFiles>>>("attendance_import_save",null,{operation:"files",body:prepared},getAuthenticatedUserId(req),reportJob,isCancelled);
 
       writeProgressStreamMessage(res, {
         type: "success",
@@ -1050,7 +1072,7 @@ export async function saveImportWithProgress(
       return;
     }
     const prepared=prepareAttendanceRowsForSave({...eventPayload,uploadedBy:getAuthenticatedUserId(req),fileName:req.body?.fileName??"preview-import",fileType:req.body?.fileType??"json",rows});
-    const result=await runSubmittedJob<Awaited<ReturnType<typeof saveAttendanceRows>>>("attendance_import_save",eventPayload.schoolYearId??null,{operation:"rows",body:prepared},getAuthenticatedUserId(req),progress=>writeProgressStreamMessage(res,{type:"progress",progress:{stage:progress.percent<25?"saving":"syncing",percent:progress.percent,message:progress.message,processedRows:progress.processed??0,totalRows:progress.total??0,savedRecords:0,createdFines:0}}),isCancelled);
+    const result=await runSubmittedJob<Awaited<ReturnType<typeof saveAttendanceRows>>>("attendance_import_save",eventPayload.schoolYearId??null,{operation:"rows",body:prepared},getAuthenticatedUserId(req),reportJob,isCancelled);
 
     writeProgressStreamMessage(res, {
       type: "success",
