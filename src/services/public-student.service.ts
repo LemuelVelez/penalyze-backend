@@ -1,6 +1,6 @@
 import { isPlaceholderStudentNumber, normalizeStudentNumberKey, placeholderStudentNumberMessage } from "./masterlist-normalize";
 import { getMasterlistStatus } from "./masterlist.service";
-import type { AttendanceRecord } from "../database/model/schema.model";
+import type { AttendanceFinalResultRecord, AttendanceRecord } from "../database/model/schema.model";
 import { query } from "../lib/db";
 import { lookupPublicStudentById } from "./attendance-requests.service";
 import {
@@ -12,6 +12,39 @@ import {
 import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
 import { listFines, listPenalties, listPenaltyResults } from "./fines.service";
 import { listSchoolYears } from "./school-years.service";
+
+const REFERENCE_CACHE_TTL_MS = 30_000;
+type ReferenceData = [Awaited<ReturnType<typeof listPenalties>>, Awaited<ReturnType<typeof listSchoolYears>>, Awaited<ReturnType<typeof listAttendanceEvents>>];
+let referenceCache: { expiresAt: number; value: Promise<ReferenceData> } | null = null;
+
+function getPublicReferenceData(): Promise<ReferenceData> {
+  const now = Date.now();
+  if (referenceCache && referenceCache.expiresAt > now) return referenceCache.value;
+  const value = Promise.all([listPenalties(), listSchoolYears(), listAttendanceEvents(500, 0)]) as Promise<ReferenceData>;
+  referenceCache = { expiresAt: now + REFERENCE_CACHE_TTL_MS, value };
+  value.catch(() => { if (referenceCache?.value === value) referenceCache = null; });
+  return value;
+}
+
+async function attachFinalResultEventDetails(studentId: string, rows: AttendanceFinalResultRecord[]) {
+  const schoolYearIds = [...new Set(rows.map((row) => row.school_year_id).filter((id): id is string => Boolean(id)))];
+  const detailsById = new Map<string, Pick<AttendanceFinalResultRecord, "missed_events" | "event_details">>();
+  for (const schoolYearId of schoolYearIds) {
+    try {
+      const detailed = await listAttendanceFinalResults({
+        schoolYearId, studentId, limit: 1000, offset: 0,
+        includeMissedEvents: true, includeEventDetails: true,
+      });
+      for (const row of detailed) detailsById.set(String(row.id), { missed_events: row.missed_events, event_details: row.event_details });
+    } catch (error) {
+      console.error(`Public student event details failed for school year ${schoolYearId}; returning summary only.`, error);
+    }
+  }
+  return rows.map((row) => {
+    const details = detailsById.get(String(row.id));
+    return details ? { ...row, ...details } : row;
+  });
+}
 
 // Explicitly allow only fields used by the public result and its existing dialogs.
 // An allowlist prevents newly added SQL columns from becoming public by default.
@@ -54,8 +87,8 @@ function redactPersonal<T extends { name: string }>(record: T): T {
   return redacted as T;
 }
 
-async function listCollegeEventStubs(college: string): Promise<AttendanceRecord[]> {
-  if (!college.trim()) return [];
+async function listCollegeEventStubs(college: string, schoolYearIds: string[]): Promise<AttendanceRecord[]> {
+  if (!college.trim() || schoolYearIds.length === 0) return [];
 
   // Only one synthetic record per event, never other students' attendance rows.
   // The college resolution and hidden/deleted import rules mirror listAttendanceRecords.
@@ -86,13 +119,15 @@ async function listCollegeEventStubs(college: string): Promise<AttendanceRecord[
     FROM attendance_records ar
     JOIN attendance_events ae ON ae.id = ar.event_id
     LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
+    LEFT JOIN student_masterlist m ON m.school_year_id = ar.school_year_id AND m.student_number_key = public.masterlist_student_number_key(ar.student_id)
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
+      AND ar.school_year_id = ANY($2::uuid[])
       AND NOT (COALESCE(ar.masterlist_status, '')='unmatched' AND public.is_masterlist_school_year(ar.school_year_id))
-      AND LOWER(TRIM(COALESCE(CASE WHEN public.is_masterlist_school_year(ar.school_year_id) THEN (SELECT m.college FROM student_masterlist m WHERE m.school_year_id=ar.school_year_id AND m.student_number_key=public.masterlist_student_number_key(ar.student_id)) END, NULLIF(TRIM(s.college), ''), ar.college, ''))) = LOWER(TRIM($1))
+      AND LOWER(TRIM(COALESCE(CASE WHEN public.is_masterlist_school_year(ar.school_year_id) THEN m.college END, NULLIF(TRIM(s.college), ''), ar.college, ''))) = LOWER(TRIM($1))
       AND LOWER(TRIM(COALESCE(ar.remarks, ''))) NOT LIKE '%zero attendance%'
     GROUP BY ae.id, ar.event_id
     ORDER BY ae.event_order ASC NULLS LAST, ae.event_start_at ASC NULLS LAST, ae.id
-  `, [college]);
+  `, [college, schoolYearIds]);
   return result.rows;
 }
 
@@ -104,24 +139,17 @@ export async function getPublicStudentRecords(studentId: string) {
     throw Object.assign(new Error("Enter a valid Student ID."), { statusCode: 400 });
   }
 
-  const [fallbackProfile, attendance, manualAttendance, finalResults, fines, penaltyResults,
-    penalties, schoolYears, attendanceEvents] = await Promise.all([
+  const [fallbackProfile, attendance, manualAttendance, baseFinalResults, fines, penaltyResults] = await Promise.all([
     lookupPublicStudentById(cleanStudentId),
     listAttendanceRecords(1000, 0, cleanStudentId, undefined, undefined, undefined, [], false, true),
     listManualAttendanceRecords({ studentId: cleanStudentId, limit: 500, offset: 0, excludeUnresolved: true }),
-    listAttendanceFinalResults({
-      studentId: cleanStudentId,
-      limit: 1000,
-      offset: 0,
-      includeMissedEvents: true,
-      includeEventDetails: true,
-    }),
+    listAttendanceFinalResults({ studentId: cleanStudentId, limit: 1000, offset: 0 }),
     listFines({ studentId: cleanStudentId, limit: 1000, offset: 0 }),
     listPenaltyResults({ studentId: cleanStudentId, limit: 1000, offset: 0 }),
-    listPenalties(),
-    listSchoolYears(),
-    listAttendanceEvents(500, 0),
   ]);
+
+  const finalResults = await attachFinalResultEventDetails(cleanStudentId, baseFinalResults);
+  const [penalties, schoolYears, attendanceEvents] = await getPublicReferenceData();
 
   const { active, schoolYearId } = await getMasterlistStatus();
   const master = schoolYearId ? (await query<{student_id:string;course:string|null;year_level:string|null;college:string|null}>(`SELECT student_number AS student_id, program AS course, year_level, college FROM student_masterlist WHERE school_year_id=$1 AND student_number_key=public.masterlist_student_number_key($2)`, [schoolYearId, cleanStudentId])).rows[0] : undefined;
@@ -130,7 +158,15 @@ export async function getPublicStudentRecords(studentId: string) {
     manualAttendance.find((row) => row.college)?.college ||
     finalResults.find((row) => row.college)?.college ||
     penaltyResults.find((row) => row.college)?.college || "";
-  const collegeEventRecords = await listCollegeEventStubs(college);
+  const stubSchoolYearIds = [...new Set([
+    ...attendance.map((row) => row.school_year_id),
+    ...manualAttendance.map((row) => row.school_year_id),
+    ...finalResults.map((row) => row.school_year_id),
+    ...penaltyResults.map((row) => row.school_year_id),
+    schoolYearId,
+    ...schoolYears.filter((row) => row.is_active).map((row) => row.id),
+  ].filter((id): id is string => Boolean(id)))];
+  const collegeEventRecords = await listCollegeEventStubs(college, stubSchoolYearIds);
 
   return {
     profile,

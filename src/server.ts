@@ -569,8 +569,9 @@ app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
     message: safeStatus === 400 ? "Invalid request." : safeStatus === 404 ? "Resource not found." : "Request failed.",
     requestId,
   };
+  const isReadRequest = req.method === "GET" || req.method === "HEAD" || req.path === "/api/public/student-records";
   const databaseMessages: Record<string, string> = {
-    "57014": req.method === "GET" || req.method === "HEAD"
+    "57014": isReadRequest
       ? "The database read timed out. Attendance data may still be rebuilding. Try again shortly."
       : "The save took too long and was cancelled. Try again.",
     "55P03": "Another attendance update is still running. Try again in a moment.",
