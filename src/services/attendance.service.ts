@@ -1,5 +1,5 @@
 import { isPlaceholderStudentNumber, normalizeNameKey, normalizeStudentNumberKey } from "./masterlist-normalize";
-import { reconcileAttendanceRow, resolveStudentAgainstMasterlist, upsertMasterlistStudent, reconcileMasterlistForAttendanceUpload, loadMasterlist, syncMasterlistAbsences, type MasterlistCache } from "./masterlist.service";
+import { applyMasterlistReconciliation, reconcileAttendanceRow, resolveStudentAgainstMasterlist, upsertMasterlistStudent, reconcileMasterlistForAttendanceUpload, loadMasterlist, syncMasterlistAbsences, type MasterlistCache } from "./masterlist.service";
 import path from "path";
 import { createHash } from "crypto";
 import { TextDecoder } from "util";
@@ -97,6 +97,7 @@ type SaveRowsInput = {
   rowEventsReviewed?: boolean;
   college?: string;
   rowCollegeOverrides?: Record<string, string>;
+  rowMasterlistOverrides?: Record<string, string>;
   schoolYearId?: string;
   uploadedBy?: string;
   eventId?: string;
@@ -3958,8 +3959,17 @@ export async function saveAttendanceRowsWithClient(
       validRows.find((row) => row.scannedAt)?.scannedAt,
     ]));
 
+  const knownRowNumbers = new Set(preview.rows.map(row => String(row.rowNumber)));
+  for (const n of Object.keys(input.rowMasterlistOverrides ?? {})) {
+    if (!knownRowNumbers.has(n)) throw createValidationError(`Row ${n} was not found in ${preview.fileName}.`, 400);
+  }
   const correctedRows: ParsedAttendanceRow[] = [];
-  for (const row of preview.rows) correctedRows.push(await reconcileAttendanceRow(client, resolvedSchoolYearId, row, masterlistCache));
+  for (const row of preview.rows) {
+    const studentNumber = input.rowMasterlistOverrides?.[String(row.rowNumber)];
+    correctedRows.push(studentNumber
+      ? await applyMasterlistReconciliation(client, resolvedSchoolYearId, row, studentNumber, masterlistCache)
+      : await reconcileAttendanceRow(client, resolvedSchoolYearId, row, masterlistCache));
+  }
   preview = { ...preview, rows: correctedRows, rowsValid: correctedRows.filter(row => !row.errors.length).length, rowsInvalid: correctedRows.filter(row => row.errors.length).length };
   assertNoInvalidAttendanceColleges(preview);
   validRows = preview.rows.filter(row => !row.errors.length);

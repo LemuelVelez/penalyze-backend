@@ -276,11 +276,29 @@ function parseOptionalIndex(value: unknown) {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
+function sanitizeRowMasterlistOverrides(value: unknown): Record<string, string> | undefined {
+  let parsed: unknown = value;
+  if (typeof parsed === "string") {
+    try { parsed = JSON.parse(parsed); } catch { return undefined; }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const prototype = Object.getPrototypeOf(parsed);
+  if (prototype !== Object.prototype && prototype !== null) return undefined;
+  const overrides: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!/^[1-9]\d*$/.test(key) || typeof value !== "string") continue;
+    const studentNumber = value.trim();
+    if (studentNumber && studentNumber.length <= 64) overrides[key] = studentNumber;
+  }
+  return Object.keys(overrides).length ? overrides : undefined;
+}
+
 function getEventPayload(req: Request) {
   return {
     schoolYearId: req.body?.schoolYearId ?? req.body?.school_year_id,
     college: req.body?.college,
     rowCollegeOverrides: req.body?.rowCollegeOverrides,
+    rowMasterlistOverrides: sanitizeRowMasterlistOverrides(req.body?.rowMasterlistOverrides),
     rowEventOverrides: req.body?.rowEventOverrides,
     rowEventsReviewed: parseOptionalBoolean(req.body?.rowEventsReviewed),
     eventId: req.body?.eventId,
@@ -337,6 +355,7 @@ function getEventPayloadForFile(
     schoolYearId: filePayload.schoolYearId ?? commonPayload.schoolYearId,
     college: filePayload.college ?? commonPayload.college,
     rowCollegeOverrides: filePayload.rowCollegeOverrides ?? commonPayload.rowCollegeOverrides,
+    rowMasterlistOverrides: sanitizeRowMasterlistOverrides(filePayload.rowMasterlistOverrides) ?? commonPayload.rowMasterlistOverrides,
     rowEventOverrides: filePayload.rowEventOverrides ?? commonPayload.rowEventOverrides,
     rowEventsReviewed: parseOptionalBoolean(filePayload.rowEventsReviewed) ?? commonPayload.rowEventsReviewed,
     eventId: filePayload.eventId ?? commonPayload.eventId,

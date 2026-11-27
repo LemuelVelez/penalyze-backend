@@ -390,7 +390,7 @@ export type StudentMasterlistImportRecord = {
 
 export type ParsedAttendanceRow = AttendanceImportInput & {
   masterlist_status?: MasterlistStatus;
-  masterlist_original?: { studentId: string; name: string; college?: string; program?: string; yearLevel?: string };
+  masterlist_original?: { studentId: string; name: string; college?: string; program?: string; yearLevel?: string; reconciledStudentNumber?: string };
   // Derived by the server from reviewed row assignments; never trusted from the source workbook.
   eventForceCreate?: boolean;
   rowNumber: number;
