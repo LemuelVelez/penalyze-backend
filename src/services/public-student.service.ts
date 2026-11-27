@@ -1,7 +1,7 @@
 import { isPlaceholderStudentNumber, normalizeStudentNumberKey, placeholderStudentNumberMessage } from "./masterlist-normalize";
 import { getMasterlistStatus } from "./masterlist.service";
 import type { AttendanceFinalResultRecord, AttendanceRecord } from "../database/model/schema.model";
-import { query } from "../lib/db";
+import { query, withTransaction } from "../lib/db";
 import { lookupPublicStudentById } from "./attendance-requests.service";
 import {
   listAttendanceEvents,
@@ -26,14 +26,37 @@ function getPublicReferenceData(): Promise<ReferenceData> {
   return value;
 }
 
-async function attachFinalResultEventDetails(studentId: string, rows: AttendanceFinalResultRecord[]) {
+// Event enrichment is optional; do not make a public lookup wait for multiple
+// full database statement timeouts when the semester roster is rebuilding.
+const EVENT_DETAIL_BUDGET_MS = 6_000;
+const EVENT_DETAIL_QUERY_TIMEOUT_MS = 3_000;
+
+async function attachFinalResultEventDetails(
+  studentId: string,
+  rows: AttendanceFinalResultRecord[],
+  activeSchoolYearId: string | null,
+) {
   const schoolYearIds = [...new Set(rows.map((row) => row.school_year_id).filter((id): id is string => Boolean(id)))];
+  if (activeSchoolYearId && schoolYearIds.includes(activeSchoolYearId)) {
+    schoolYearIds.splice(schoolYearIds.indexOf(activeSchoolYearId), 1);
+    schoolYearIds.unshift(activeSchoolYearId);
+  }
+  const deadline = Date.now() + EVENT_DETAIL_BUDGET_MS;
   const detailsById = new Map<string, Pick<AttendanceFinalResultRecord, "missed_events" | "event_details">>();
   for (const schoolYearId of schoolYearIds) {
+    if (Date.now() >= deadline) break;
     try {
-      const detailed = await listAttendanceFinalResults({
-        schoolYearId, studentId, limit: 1000, offset: 0,
-        includeMissedEvents: true, includeEventDetails: true,
+      const detailed = await withTransaction(async (client) => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return [];
+        // SET LOCAL is scoped to this transaction and cannot affect other pool users.
+        await client.query("SELECT set_config('statement_timeout', $1, true)", [
+          `${Math.min(remaining, EVENT_DETAIL_QUERY_TIMEOUT_MS)}ms`,
+        ]);
+        return listAttendanceFinalResults({
+          schoolYearId, studentId, limit: 1000, offset: 0,
+          includeMissedEvents: true, includeEventDetails: true,
+        }, client);
       });
       for (const row of detailed) detailsById.set(String(row.id), { missed_events: row.missed_events, event_details: row.event_details });
     } catch (error) {
@@ -93,6 +116,10 @@ async function listCollegeEventStubs(college: string, schoolYearIds: string[]): 
   // Only one synthetic record per event, never other students' attendance rows.
   // The college resolution and hidden/deleted import rules mirror listAttendanceRecords.
   const result = await query<AttendanceRecord>(`
+    WITH year_scope AS MATERIALIZED (
+      SELECT school_year_id, public.is_masterlist_school_year(school_year_id) AS masterlist_year
+      FROM unnest($2::uuid[]) AS years(school_year_id)
+    )
     SELECT
       ae.id AS id,
       ae.school_year_id,
@@ -117,13 +144,14 @@ async function listCollegeEventStubs(college: string, schoolYearIds: string[]): 
       MIN(ar.created_at) AS created_at,
       MAX(ar.updated_at) AS updated_at
     FROM attendance_records ar
+    JOIN year_scope ys ON ys.school_year_id = ar.school_year_id
     JOIN attendance_events ae ON ae.id = ar.event_id
     LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
-    LEFT JOIN student_masterlist m ON m.school_year_id = ar.school_year_id AND m.student_number_key = public.masterlist_student_number_key(ar.student_id)
+    LEFT JOIN student_masterlist m ON ys.masterlist_year AND m.school_year_id = ar.school_year_id AND m.student_number_key = public.masterlist_student_number_key(ar.student_id)
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
       AND ar.school_year_id = ANY($2::uuid[])
-      AND NOT (COALESCE(ar.masterlist_status, '')='unmatched' AND public.is_masterlist_school_year(ar.school_year_id))
-      AND LOWER(TRIM(COALESCE(CASE WHEN public.is_masterlist_school_year(ar.school_year_id) THEN m.college END, NULLIF(TRIM(s.college), ''), ar.college, ''))) = LOWER(TRIM($1))
+      AND NOT (COALESCE(ar.masterlist_status, '')='unmatched' AND ys.masterlist_year)
+      AND LOWER(TRIM(COALESCE(CASE WHEN ys.masterlist_year THEN m.college END, NULLIF(TRIM(s.college), ''), ar.college, ''))) = LOWER(TRIM($1))
       AND LOWER(TRIM(COALESCE(ar.remarks, ''))) NOT LIKE '%zero attendance%'
     GROUP BY ae.id, ar.event_id
     ORDER BY ae.event_order ASC NULLS LAST, ae.event_start_at ASC NULLS LAST, ae.id
@@ -139,16 +167,19 @@ export async function getPublicStudentRecords(studentId: string) {
     throw Object.assign(new Error("Enter a valid Student ID."), { statusCode: 400 });
   }
 
-  const [fallbackProfile, attendance, manualAttendance, baseFinalResults, fines, penaltyResults] = await Promise.all([
+  // Keep each batch small enough that concurrent public searches leave pool
+  // capacity for other requests and the semester maintenance jobs.
+  const [fallbackProfile, attendance, manualAttendance] = await Promise.all([
     lookupPublicStudentById(cleanStudentId),
     listAttendanceRecords(1000, 0, cleanStudentId, undefined, undefined, undefined, [], false, true),
     listManualAttendanceRecords({ studentId: cleanStudentId, limit: 500, offset: 0, excludeUnresolved: true }),
+  ]);
+  const [baseFinalResults, fines, penaltyResults] = await Promise.all([
     listAttendanceFinalResults({ studentId: cleanStudentId, limit: 1000, offset: 0 }),
     listFines({ studentId: cleanStudentId, limit: 1000, offset: 0 }),
     listPenaltyResults({ studentId: cleanStudentId, limit: 1000, offset: 0 }),
   ]);
 
-  const finalResults = await attachFinalResultEventDetails(cleanStudentId, baseFinalResults);
   const [penalties, schoolYears, attendanceEvents] = await getPublicReferenceData();
 
   const { active, schoolYearId } = await getMasterlistStatus();
@@ -156,17 +187,18 @@ export async function getPublicStudentRecords(studentId: string) {
   const profile = active && master ? {...master, status: fallbackProfile?.status ?? null} : fallbackProfile;
   const college = profile?.college || attendance.find((row) => row.college)?.college ||
     manualAttendance.find((row) => row.college)?.college ||
-    finalResults.find((row) => row.college)?.college ||
+    baseFinalResults.find((row) => row.college)?.college ||
     penaltyResults.find((row) => row.college)?.college || "";
   const stubSchoolYearIds = [...new Set([
     ...attendance.map((row) => row.school_year_id),
     ...manualAttendance.map((row) => row.school_year_id),
-    ...finalResults.map((row) => row.school_year_id),
+    ...baseFinalResults.map((row) => row.school_year_id),
     ...penaltyResults.map((row) => row.school_year_id),
     schoolYearId,
     ...schoolYears.filter((row) => row.is_active).map((row) => row.id),
   ].filter((id): id is string => Boolean(id)))];
   const collegeEventRecords = await listCollegeEventStubs(college, stubSchoolYearIds);
+  const finalResults = await attachFinalResultEventDetails(cleanStudentId, baseFinalResults, schoolYearId);
 
   return {
     profile,
