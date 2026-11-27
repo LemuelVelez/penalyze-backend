@@ -1,7 +1,7 @@
 import { isPlaceholderStudentNumber, normalizeStudentNumberKey, placeholderStudentNumberMessage } from "./masterlist-normalize";
 import { getMasterlistStatus } from "./masterlist.service";
 import type { AttendanceFinalResultRecord, AttendanceRecord } from "../database/model/schema.model";
-import { query, withTransaction } from "../lib/db";
+import { query } from "../lib/db";
 import { lookupPublicStudentById } from "./attendance-requests.service";
 import {
   listAttendanceEvents,
@@ -26,42 +26,44 @@ function getPublicReferenceData(): Promise<ReferenceData> {
   return value;
 }
 
-// Event enrichment is optional; do not make a public lookup wait for multiple
-// full database statement timeouts when the semester roster is rebuilding.
-const EVENT_DETAIL_BUDGET_MS = 6_000;
-const EVENT_DETAIL_QUERY_TIMEOUT_MS = 3_000;
+export type PublicStudentRecordsProgress = {
+  percent: number;
+  message: string;
+  detail: string;
+};
+type ProgressCallback = (progress: PublicStudentRecordsProgress) => void;
 
 async function attachFinalResultEventDetails(
   studentId: string,
   rows: AttendanceFinalResultRecord[],
   activeSchoolYearId: string | null,
+  report: ProgressCallback,
 ) {
   const schoolYearIds = [...new Set(rows.map((row) => row.school_year_id).filter((id): id is string => Boolean(id)))];
   if (activeSchoolYearId && schoolYearIds.includes(activeSchoolYearId)) {
     schoolYearIds.splice(schoolYearIds.indexOf(activeSchoolYearId), 1);
     schoolYearIds.unshift(activeSchoolYearId);
   }
-  const deadline = Date.now() + EVENT_DETAIL_BUDGET_MS;
   const detailsById = new Map<string, Pick<AttendanceFinalResultRecord, "missed_events" | "event_details">>();
+  let completed = 0;
+  let unavailable = 0;
   for (const schoolYearId of schoolYearIds) {
-    if (Date.now() >= deadline) break;
     try {
-      const detailed = await withTransaction(async (client) => {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) return [];
-        // SET LOCAL is scoped to this transaction and cannot affect other pool users.
-        await client.query("SELECT set_config('statement_timeout', $1, true)", [
-          `${Math.min(remaining, EVENT_DETAIL_QUERY_TIMEOUT_MS)}ms`,
-        ]);
-        return listAttendanceFinalResults({
-          schoolYearId, studentId, limit: 1000, offset: 0,
-          includeMissedEvents: true, includeEventDetails: true,
-        }, client);
+      const detailed = await listAttendanceFinalResults({
+        schoolYearId, studentId, limit: 1000, offset: 0,
+        includeMissedEvents: true, includeEventDetails: true,
       });
       for (const row of detailed) detailsById.set(String(row.id), { missed_events: row.missed_events, event_details: row.event_details });
     } catch (error) {
+      unavailable++;
       console.error(`Public student event details failed for school year ${schoolYearId}; returning summary only.`, error);
     }
+    completed++;
+    report({
+      percent: 66 + Math.round(14 * completed / schoolYearIds.length),
+      message: "Checking event details...",
+      detail: `${completed} of ${schoolYearIds.length} school year(s) checked.${unavailable ? " Saved summaries will be used where details are unavailable." : ""}`,
+    });
   }
   return rows.map((row) => {
     const details = detailsById.get(String(row.id));
@@ -159,7 +161,7 @@ async function listCollegeEventStubs(college: string, schoolYearIds: string[]): 
   return result.rows;
 }
 
-export async function getPublicStudentRecords(studentId: string) {
+export async function getPublicStudentRecords(studentId: string, onProgress?: ProgressCallback) {
   if (!/^[A-Za-z0-9-]{4,36}$/.test(studentId.trim())) throw Object.assign(new Error("Enter a valid Student ID."), { statusCode: 400 });
   const cleanStudentId = normalizeStudentNumberKey(studentId);
   if (isPlaceholderStudentNumber(cleanStudentId)) throw Object.assign(new Error(placeholderStudentNumberMessage(studentId.trim())), { statusCode: 400 });
@@ -167,20 +169,34 @@ export async function getPublicStudentRecords(studentId: string) {
     throw Object.assign(new Error("Enter a valid Student ID."), { statusCode: 400 });
   }
 
-  // Keep each batch small enough that concurrent public searches leave pool
-  // capacity for other requests and the semester maintenance jobs.
+  let percent = 4;
+  const report: ProgressCallback = (progress) => {
+    percent = Math.max(percent, progress.percent);
+    onProgress?.({ ...progress, percent });
+  };
+  const completed = <T>(request: Promise<T>, weight: number, message: string, detail: string): Promise<T> =>
+    request.then((value) => {
+      report({ percent: percent + weight, message, detail });
+      return value;
+    });
+  report({ percent, message: "Searching student records...", detail: "Checking your student profile and attendance history." });
+
+  // Report each completed read, while keeping concurrent pool usage bounded.
   const [fallbackProfile, attendance, manualAttendance] = await Promise.all([
-    lookupPublicStudentById(cleanStudentId),
-    listAttendanceRecords(1000, 0, cleanStudentId, undefined, undefined, undefined, [], false, true),
-    listManualAttendanceRecords({ studentId: cleanStudentId, limit: 500, offset: 0, excludeUnresolved: true }),
+    completed(lookupPublicStudentById(cleanStudentId), 6, "Student profile checked...", "Matching your Student ID."),
+    completed(listAttendanceRecords(1000, 0, cleanStudentId, undefined, undefined, undefined, [], false, true), 9, "Attendance history checked...", "Uploaded attendance records have been checked."),
+    completed(listManualAttendanceRecords({ studentId: cleanStudentId, limit: 500, offset: 0, excludeUnresolved: true }), 6, "Manual attendance checked...", "Manual attendance records have been checked."),
   ]);
+  report({ percent: 25, message: "Checking absences and fines...", detail: "Loading saved attendance results and penalties." });
   const [baseFinalResults, fines, penaltyResults] = await Promise.all([
-    listAttendanceFinalResults({ studentId: cleanStudentId, limit: 1000, offset: 0 }),
-    listFines({ studentId: cleanStudentId, limit: 1000, offset: 0 }),
-    listPenaltyResults({ studentId: cleanStudentId, limit: 1000, offset: 0 }),
+    completed(listAttendanceFinalResults({ studentId: cleanStudentId, limit: 1000, offset: 0 }), 8, "Attendance results checked...", "Saved absence totals have been checked."),
+    completed(listFines({ studentId: cleanStudentId, limit: 1000, offset: 0 }), 6, "Fines checked...", "Student fine records have been checked."),
+    completed(listPenaltyResults({ studentId: cleanStudentId, limit: 1000, offset: 0 }), 6, "Penalty results checked...", "Calculated penalties have been checked."),
   ]);
 
+  report({ percent: 45, message: "Loading reference data...", detail: "Checking school years, penalties, and attendance events." });
   const [penalties, schoolYears, attendanceEvents] = await getPublicReferenceData();
+  report({ percent: 53, message: "Checking masterlist...", detail: "Resolving your school year and college." });
 
   const { active, schoolYearId } = await getMasterlistStatus();
   const master = schoolYearId ? (await query<{student_id:string;course:string|null;year_level:string|null;college:string|null}>(`SELECT student_number AS student_id, program AS course, year_level, college FROM student_masterlist WHERE school_year_id=$1 AND student_number_key=public.masterlist_student_number_key($2)`, [schoolYearId, cleanStudentId])).rows[0] : undefined;
@@ -197,8 +213,11 @@ export async function getPublicStudentRecords(studentId: string) {
     schoolYearId,
     ...schoolYears.filter((row) => row.is_active).map((row) => row.id),
   ].filter((id): id is string => Boolean(id)))];
+  report({ percent: 58, message: "Checking college events...", detail: "Finding attendance events for your college and school years." });
   const collegeEventRecords = await listCollegeEventStubs(college, stubSchoolYearIds);
-  const finalResults = await attachFinalResultEventDetails(cleanStudentId, baseFinalResults, schoolYearId);
+  report({ percent: 66, message: "Checking event details...", detail: "Matching event details and missed events by school year." });
+  const finalResults = await attachFinalResultEventDetails(cleanStudentId, baseFinalResults, schoolYearId, report);
+  report({ percent: 82, message: "Student records checked...", detail: "Preparing the attendance records for delivery." });
 
   return {
     profile,
