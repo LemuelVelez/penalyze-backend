@@ -1,3 +1,4 @@
+import { normalizeStudentNumberKey } from "./masterlist-normalize";
 import {
   AttendanceRecord,
   FineRecord,
@@ -394,7 +395,8 @@ export async function listFines(
 
   if (options.studentId) {
     params.push(options.studentId);
-    clauses.push(`LOWER(TRIM(f.student_id)) = LOWER(TRIM($${params.length}))`);
+    clauses.push(`NOT (COALESCE(ar.masterlist_status, '')='unmatched' AND public.is_masterlist_school_year(ar.school_year_id))`);
+    clauses.push(/^TC-\d{2}-[A-Z]-\d{5}$/.test(normalizeStudentNumberKey(options.studentId)) ? `public.masterlist_student_number_key(f.student_id) = public.masterlist_student_number_key($${params.length}::text)` : `LOWER(TRIM(f.student_id)) = LOWER(TRIM($${params.length}))`);
   }
 
   params.push(options.limit ?? 100);
@@ -796,7 +798,7 @@ export async function listPenaltyResults(
 
   if (options.studentId) {
     params.push(options.studentId);
-    clauses.push(`LOWER(TRIM(pr.student_id)) = LOWER(TRIM($${params.length}))`);
+    clauses.push(/^TC-\d{2}-[A-Z]-\d{5}$/.test(normalizeStudentNumberKey(options.studentId)) ? `public.masterlist_student_number_key(pr.student_id) = public.masterlist_student_number_key($${params.length}::text)` : `LOWER(TRIM(pr.student_id)) = LOWER(TRIM($${params.length}))`);
   }
 
   params.push(options.limit ?? 5000);

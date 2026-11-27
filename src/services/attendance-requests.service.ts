@@ -1,3 +1,4 @@
+import { isPlaceholderStudentNumber, normalizeStudentNumberKey, placeholderStudentNumberMessage } from "./masterlist-normalize";
 import { isMasterlistActiveForSchoolYear, masterlistActiveError, ZERO_ATTENDANCE_MASTERLIST_MESSAGE } from "./masterlist.service";
 import type { PoolClient } from "pg";
 
@@ -609,12 +610,14 @@ async function findCountedEventParticipationForStudent(
 export async function createAttendanceRequest(input: AttendanceRequestInput) {
   const requestType = normalizeRequestType(input.requestType);
   const inputSchoolYearId = cleanText(input.schoolYearId);
-  const studentId = cleanText(input.studentId);
+  const rawStudentId = cleanText(input.studentId);
+  const studentId = normalizeStudentNumberKey(rawStudentId);
+  if (rawStudentId && isPlaceholderStudentNumber(studentId)) throw createHttpError(placeholderStudentNumberMessage(studentId), 400);
 
   if (inputSchoolYearId && !isUuid(inputSchoolYearId)) {
     throw createHttpError("School year / semester ID is invalid.");
   }
-  if (!studentId || !/^[A-Za-z0-9-]{4,36}$/.test(studentId)) throw createHttpError("Invalid student information.");
+  if (!rawStudentId || !/^[A-Za-z0-9-]{4,36}$/.test(rawStudentId)) throw createHttpError("Invalid student information.");
   if (cleanText(input.honeypot)) throw createHttpError("Invalid submission.");
   const fillTime = Date.now() - Number(input.formStartedAt);
   if (!Number.isFinite(fillTime) || fillTime < 3000 || fillTime > 24 * 60 * 60 * 1000) {
@@ -1220,8 +1223,9 @@ export type PublicStudentLookup = {
 };
 
 export async function lookupPublicStudentById(studentId: string): Promise<PublicStudentLookup | null> {
-  const id = studentId.trim();
-  if (!/^[A-Za-z0-9-]{4,36}$/.test(id)) return null;
+  if (!/^[A-Za-z0-9-]{4,36}$/.test(studentId.trim())) return null;
+  const id = normalizeStudentNumberKey(studentId);
+  if (isPlaceholderStudentNumber(id)) return null;
 
   // Select only the four approved profile fields. Prefer the maintained student
   // profile, but support older attendance records that predate student upserts.
@@ -1233,15 +1237,22 @@ export async function lookupPublicStudentById(studentId: string): Promise<Public
   }>(`
     SELECT student_id, course, year_level, college
     FROM (
+      SELECT m.student_number AS student_id, m.program AS course, m.year_level, m.college, -1 AS priority, m.updated_at
+      FROM student_masterlist m JOIN school_years sy ON sy.id=m.school_year_id
+      WHERE sy.is_active AND public.is_masterlist_school_year(sy.id) AND m.student_number_key=public.masterlist_student_number_key($1)
+      UNION ALL
       SELECT student_id, NULLIF(TRIM(program), '') AS course,
         NULLIF(TRIM(year_level), '') AS year_level,
         NULLIF(TRIM(college), '') AS college, 0 AS priority, updated_at
-      FROM students WHERE LOWER(TRIM(student_id)) = LOWER($1)
+      FROM students WHERE public.masterlist_student_number_key(student_id) = public.masterlist_student_number_key($1)
+      AND NOT EXISTS (SELECT 1 FROM attendance_records a WHERE public.masterlist_student_number_key(a.student_id)=public.masterlist_student_number_key($1) AND a.masterlist_status='unmatched' AND public.is_masterlist_school_year(a.school_year_id)
+        UNION ALL SELECT 1 FROM manual_attendance_records a WHERE public.masterlist_student_number_key(a.student_id)=public.masterlist_student_number_key($1) AND a.masterlist_status='unmatched' AND public.is_masterlist_school_year(a.school_year_id))
       UNION ALL
       SELECT student_id, NULLIF(TRIM(program), ''),
         NULLIF(TRIM(year_level), ''), NULLIF(TRIM(college), ''), 1, updated_at
-      FROM attendance_records
-      WHERE LOWER(TRIM(student_id)) = LOWER($1) AND deleted_at IS NULL
+      FROM attendance_records ar
+      WHERE public.masterlist_student_number_key(student_id) = public.masterlist_student_number_key($1) AND ${getAttendanceRecordVisibilitySql("ar")}
+      AND NOT (COALESCE(masterlist_status, '')='unmatched' AND public.is_masterlist_school_year(school_year_id))
     ) profiles
     ORDER BY priority, updated_at DESC
     LIMIT 1
@@ -1251,7 +1262,7 @@ export async function lookupPublicStudentById(studentId: string): Promise<Public
 
   const latest = await query<{ status: AttendanceRequestStatus }>(`
     SELECT status FROM attendance_requests
-    WHERE LOWER(TRIM(student_id)) = LOWER($1)
+    WHERE public.masterlist_student_number_key(student_id) = public.masterlist_student_number_key($1)
     ORDER BY created_at DESC, id DESC LIMIT 1
   `, [id]);
   return {
@@ -1280,10 +1291,11 @@ export async function listPublicAttendanceRequestsForStudent(
   verifiedRequestIds: string[],
   studentId?: string,
 ): Promise<PublicStudentAttendanceRequestStatus[]> {
-  const cleanStudentId = studentId?.trim() || null;
-  if (cleanStudentId && !/^[A-Za-z0-9-]{4,36}$/.test(cleanStudentId)) {
+  const cleanStudentId = studentId ? normalizeStudentNumberKey(studentId) : null;
+  if (studentId && !/^[A-Za-z0-9-]{4,36}$/.test(studentId.trim())) {
     throw createHttpError("Enter a valid Student ID.", 400);
   }
+  if (cleanStudentId && isPlaceholderStudentNumber(cleanStudentId)) throw createHttpError(placeholderStudentNumberMessage(cleanStudentId), 400);
   const receiptIds = verifiedRequestIds.length <= 20 &&
     verifiedRequestIds.every((id) => isUuid(id)) ? verifiedRequestIds : [];
   if (!cleanStudentId && !receiptIds.length) return [];
@@ -1299,7 +1311,7 @@ export async function listPublicAttendanceRequestsForStudent(
     FROM attendance_requests ar
     JOIN school_years sy ON sy.id = ar.school_year_id
     WHERE (
-      $2::text IS NOT NULL AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM($2::text))
+      $2::text IS NOT NULL AND public.masterlist_student_number_key(ar.student_id) = public.masterlist_student_number_key($2::text)
     ) OR (
       $2::text IS NULL AND ar.id = ANY($1::uuid[])
     )

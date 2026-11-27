@@ -1,3 +1,5 @@
+import { isPlaceholderStudentNumber, normalizeStudentNumberKey, placeholderStudentNumberMessage } from "./masterlist-normalize";
+import { getMasterlistStatus } from "./masterlist.service";
 import type { AttendanceRecord } from "../database/model/schema.model";
 import { query } from "../lib/db";
 import { lookupPublicStudentById } from "./attendance-requests.service";
@@ -85,7 +87,8 @@ async function listCollegeEventStubs(college: string): Promise<AttendanceRecord[
     JOIN attendance_events ae ON ae.id = ar.event_id
     LEFT JOIN students s ON LOWER(TRIM(s.student_id)) = LOWER(TRIM(ar.student_id))
     WHERE ${getAttendanceRecordVisibilitySql("ar")}
-      AND LOWER(TRIM(COALESCE(NULLIF(TRIM(s.college), ''), ar.college, ''))) = LOWER(TRIM($1))
+      AND NOT (COALESCE(ar.masterlist_status, '')='unmatched' AND public.is_masterlist_school_year(ar.school_year_id))
+      AND LOWER(TRIM(COALESCE(CASE WHEN public.is_masterlist_school_year(ar.school_year_id) THEN (SELECT m.college FROM student_masterlist m WHERE m.school_year_id=ar.school_year_id AND m.student_number_key=public.masterlist_student_number_key(ar.student_id)) END, NULLIF(TRIM(s.college), ''), ar.college, ''))) = LOWER(TRIM($1))
       AND LOWER(TRIM(COALESCE(ar.remarks, ''))) NOT LIKE '%zero attendance%'
     GROUP BY ae.id, ar.event_id
     ORDER BY ae.event_order ASC NULLS LAST, ae.event_start_at ASC NULLS LAST, ae.id
@@ -94,16 +97,18 @@ async function listCollegeEventStubs(college: string): Promise<AttendanceRecord[
 }
 
 export async function getPublicStudentRecords(studentId: string) {
-  const cleanStudentId = studentId.trim();
+  if (!/^[A-Za-z0-9-]{4,36}$/.test(studentId.trim())) throw Object.assign(new Error("Enter a valid Student ID."), { statusCode: 400 });
+  const cleanStudentId = normalizeStudentNumberKey(studentId);
+  if (isPlaceholderStudentNumber(cleanStudentId)) throw Object.assign(new Error(placeholderStudentNumberMessage(studentId.trim())), { statusCode: 400 });
   if (!/^[A-Za-z0-9-]{4,36}$/.test(cleanStudentId)) {
     throw Object.assign(new Error("Enter a valid Student ID."), { statusCode: 400 });
   }
 
-  const [profile, attendance, manualAttendance, finalResults, fines, penaltyResults,
+  const [fallbackProfile, attendance, manualAttendance, finalResults, fines, penaltyResults,
     penalties, schoolYears, attendanceEvents] = await Promise.all([
     lookupPublicStudentById(cleanStudentId),
-    listAttendanceRecords(1000, 0, cleanStudentId),
-    listManualAttendanceRecords({ studentId: cleanStudentId, limit: 500, offset: 0 }),
+    listAttendanceRecords(1000, 0, cleanStudentId, undefined, undefined, undefined, [], false, true),
+    listManualAttendanceRecords({ studentId: cleanStudentId, limit: 500, offset: 0, excludeUnresolved: true }),
     listAttendanceFinalResults({
       studentId: cleanStudentId,
       limit: 1000,
@@ -118,6 +123,9 @@ export async function getPublicStudentRecords(studentId: string) {
     listAttendanceEvents(500, 0),
   ]);
 
+  const { active, schoolYearId } = await getMasterlistStatus();
+  const master = schoolYearId ? (await query<{student_id:string;course:string|null;year_level:string|null;college:string|null}>(`SELECT student_number AS student_id, program AS course, year_level, college FROM student_masterlist WHERE school_year_id=$1 AND student_number_key=public.masterlist_student_number_key($2)`, [schoolYearId, cleanStudentId])).rows[0] : undefined;
+  const profile = active && master ? {...master, status: fallbackProfile?.status ?? null} : fallbackProfile;
   const college = profile?.college || attendance.find((row) => row.college)?.college ||
     manualAttendance.find((row) => row.college)?.college ||
     finalResults.find((row) => row.college)?.college ||
@@ -126,6 +134,8 @@ export async function getPublicStudentRecords(studentId: string) {
 
   return {
     profile,
+    masterlist: { active, schoolYearId, onMasterlist: !!master },
+    resolvedCollege: college,
     attendance: attendance.map(redactPersonal),
     manualAttendance: manualAttendance.map(redactPersonal),
     finalResults: finalResults.map(redactPersonal),

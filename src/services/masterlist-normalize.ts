@@ -174,3 +174,19 @@ export function collegeForProgram(value: unknown): string | null {
   if (/^(?:BSCrim|BSCRIM|BSCRIMINOLOGY|BACHELOROFSCIENCEINCRIMINOLOGY)$/.test(p)) return "School of Criminal Justice Education";
   return null;
 }
+
+export function studentIdSimilarity(given: unknown, masterNumber: unknown): number {
+  const a = parseStudentNumberParts(given), b = parseStudentNumberParts(masterNumber);
+  if (!a || !b) return 0;
+  if (a.serial === b.serial) return a.year && a.year === b.year ? 3 : 2;
+  if (!a.year || a.year !== b.year || !a.letter || a.letter !== b.letter || a.serial.length !== b.serial.length) return 0;
+  const differences = [...a.serial].map((digit, i) => digit === b.serial[i] ? -1 : i).filter(i => i >= 0);
+  if (differences.length === 1) return 1;
+  const [i, j] = differences;
+  return differences.length === 2 && j === i + 1 && a.serial[i] === b.serial[j] && a.serial[j] === b.serial[i] ? 1 : 0;
+}
+export function programInitials(value: unknown): string {
+  const text = String(value ?? "").trim().toUpperCase();
+  return /\s/.test(text) ? text.split(/\s+/).filter(w => !["OF", "IN", "AND", "THE", "MAJOR"].includes(w)).map(w => w.replace(/[^A-Z]/g, "")[0] ?? "").join("") : text.replace(/[^A-Z]/g, "");
+}
+export const placeholderStudentNumberMessage = (studentId: string) => `${studentId} is a placeholder ID recorded when a QR code was not scanned. It is not a real Student ID. Search using your own Student ID. Attendance recorded under a wrong or placeholder ID is moved to your real Student ID when your name matches the masterlist; if it is still missing, submit an Attendance Review using your real Student ID.`;

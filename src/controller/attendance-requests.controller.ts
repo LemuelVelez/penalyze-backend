@@ -1,3 +1,4 @@
+import { isPlaceholderStudentNumber, placeholderStudentNumberMessage } from "../services/masterlist-normalize";
 import { runSubmittedJob } from "../services/maintenance-jobs.service";
 import { randomUUID } from "crypto";
 import type { NextFunction, Request, Response } from "express";
@@ -78,6 +79,7 @@ export async function publicStudentLookup(req: Request, res: Response, next: Nex
       res.status(400).json({ message: "Enter a valid Student ID." });
       return;
     }
+    if (isPlaceholderStudentNumber(studentId)) { res.status(400).json({ message: placeholderStudentNumberMessage(studentId.trim()) }); return; }
     const data = await lookupPublicStudentById(studentId);
     res.setHeader("Cache-Control", "no-store");
     res.json({ data });
@@ -100,6 +102,7 @@ export async function publicStudentRequests(
       return;
     }
     const studentId = typeof rawStudentId === "string" ? rawStudentId.trim() : undefined;
+    if (studentId && isPlaceholderStudentNumber(studentId)) { res.status(400).json({ message: placeholderStudentNumberMessage(studentId) }); return; }
     const ids = getReceiptIds(req.body?.receipts);
     const rows = await listPublicAttendanceRequestsForStudent(ids, studentId);
     res.json({ data: rows });

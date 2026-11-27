@@ -2,7 +2,7 @@ import { pool } from "../lib/db";
 import type { Request, Response, NextFunction } from "express";
 import type { AuthenticatedRequest } from "./auth.controller";
 import { prepareProgressStream, writeProgressStreamMessage } from "../lib/progress-stream";
-import { getMasterlistStatus, uploadMasterlist, resumeMasterlistUpload, discardMasterlistUpload, listMasterlist, reconcileMasterlist, deleteMasterlist, getFinalAttendance, getFinalAttendanceUnmatched, exportFinalAttendance, type MasterlistFilters, type MasterlistProgress } from "../services/masterlist.service";
+import { getMasterlistStatus, uploadMasterlist, resumeMasterlistUpload, discardMasterlistUpload, listMasterlist, reconcileMasterlist, deleteMasterlist, getFinalAttendance, getFinalAttendanceUnmatched, getAutoCorrectedStudents, reassignStudentAttendance, exportFinalAttendance, type MasterlistFilters, type MasterlistProgress } from "../services/masterlist.service";
 function filters(req:Request):MasterlistFilters {
   const text=(key:string)=>typeof req.query[key]==="string" ? String(req.query[key]).trim() || undefined : undefined;
   const schoolYearId=text("schoolYearId");
@@ -87,3 +87,12 @@ export async function status(req: AuthenticatedRequest, res: Response) {
   res.json({...status,rebuildJob});
 }
 export async function publicStatus(_req: Request, res: Response) { const { active } = await getMasterlistStatus(); res.json({ active }); }
+
+export async function reassign(req:Request,res:Response) {
+  const text=(key:string)=>typeof req.body?.[key]==="string" ? req.body[key].trim() : "";
+  const schoolYearId=text("schoolYearId"), originalStudentId=text("originalStudentId"), originalName=text("originalName"), studentNumber=text("studentNumber");
+  if (!schoolYearId || !originalStudentId || !originalName || !studentNumber) {res.status(400).json({message:"schoolYearId, originalStudentId, originalName and studentNumber are required."});return;}
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(schoolYearId)) {res.status(400).json({message:"Invalid schoolYearId."});return;}
+  res.json(await reassignStudentAttendance({schoolYearId,originalStudentId,originalName,studentNumber}));
+}
+export async function finalAttendanceCorrected(req:Request,res:Response) {res.json(await getAutoCorrectedStudents(filters(req)));}

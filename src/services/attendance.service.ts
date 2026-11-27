@@ -2168,6 +2168,7 @@ async function findOrCreateAttendanceEvent(
 
 async function upsertStudent(client: PoolClient, row: ParsedAttendanceRow) {
   const studentId = cleanText(row.studentId);
+  if (isPlaceholderStudentNumber(studentId) || row.masterlist_status === "unmatched") return;
 
   if (!studentId) {
     throw createValidationError("Student ID is required.");
@@ -4836,6 +4837,8 @@ function getManualRecordSelectSql() {
     mar.institution,
     mar.no_of_absences,
     mar.remarks,
+    mar.masterlist_status,
+    mar.masterlist_original,
     mar.scanned_at,
     mar.created_at,
     mar.updated_at
@@ -7505,13 +7508,15 @@ export async function listAttendanceRecords(
   schoolYearId?: string,
   importIds: string[] = [],
   zeroAttendanceOnly = false,
+  excludeUnresolved = false,
 ) {
   const clauses: string[] = [getAttendanceRecordVisibilitySql("ar")];
   const params: unknown[] = [];
 
+  if (excludeUnresolved) clauses.push(`NOT (COALESCE(ar.masterlist_status, '') = 'unmatched' AND public.is_masterlist_school_year(ar.school_year_id))`);
   if (studentId) {
     params.push(studentId);
-    clauses.push(`LOWER(TRIM(ar.student_id)) = LOWER(TRIM($${params.length}))`);
+    clauses.push(/^TC-\d{2}-[A-Z]-\d{5}$/.test(normalizeStudentNumberKey(studentId)) ? `public.masterlist_student_number_key(ar.student_id) = public.masterlist_student_number_key($${params.length}::text)` : `LOWER(TRIM(ar.student_id)) = LOWER(TRIM($${params.length}))`);
   }
 
   if (eventId) {
@@ -10577,7 +10582,7 @@ type AttendanceFinalResultsFilter = {
   schoolYearId?: string;
   importId?: string;
   studentId?: string;
-  studentProfile?: { name: string; college?: string; program?: string };
+  studentProfile?: { name: string; college?: string; program?: string; yearLevel?: string };
   studentKeys?: string[];
   college?: string;
   includeMissedEvents?: boolean;
@@ -11476,8 +11481,12 @@ export async function updateAttendanceFinalResultProfile(
         : cleanText(destinationProfile?.institution ?? canonicalStudent?.institution ?? finalResult.institution),
     };
 
+    const allowProfile = !isPlaceholderStudentNumber(targetStudentId) && !(await client.query<{blocked:boolean}>(`SELECT public.is_masterlist_school_year($1::uuid) AND EXISTS (
+      SELECT 1 FROM attendance_records a WHERE a.school_year_id=$1 AND public.masterlist_student_number_key(a.student_id)=public.masterlist_student_number_key($2) AND a.masterlist_status='unmatched' AND ${getAttendanceRecordVisibilitySql("a")} AND LOWER(TRIM(a.name))=LOWER(TRIM($3))
+      UNION ALL SELECT 1 FROM manual_attendance_records a WHERE a.school_year_id=$1 AND public.masterlist_student_number_key(a.student_id)=public.masterlist_student_number_key($2) AND a.masterlist_status='unmatched' AND LOWER(TRIM(a.name))=LOWER(TRIM($3))
+    ) AND NOT EXISTS (SELECT 1 FROM student_masterlist m WHERE m.school_year_id=$1 AND m.student_number_key=public.masterlist_student_number_key($2) AND LOWER(TRIM(m.full_name))=LOWER(TRIM($3))) AS blocked`,[finalResult.school_year_id,targetStudentId,profileValues.name])).rows[0]?.blocked;
     emit(30, "Saving the canonical student profile.");
-    if (canonicalStudent) {
+    if (allowProfile && canonicalStudent) {
       await client.query(
         `
           UPDATE students
@@ -11513,7 +11522,7 @@ export async function updateAttendanceFinalResultProfile(
         // then remove the source identity after its records have been merged.
         await client.query(`DELETE FROM students WHERE id = $1`, [existingStudent.id]);
       }
-    } else {
+    } else if (allowProfile) {
       await client.query(
         `
           INSERT INTO students (
@@ -12441,11 +12450,12 @@ export async function listAttendanceFinalResults(
 }
 
 export async function listManualAttendanceRecords(
-  options: AttendanceFinalResultsFilter & { eventId?: string } = {},
+  options: AttendanceFinalResultsFilter & { eventId?: string; excludeUnresolved?: boolean } = {},
 ) {
   const clauses: string[] = [];
   const params: unknown[] = [];
 
+  if (options.excludeUnresolved) clauses.push(`NOT (COALESCE(mar.masterlist_status, '') = 'unmatched' AND public.is_masterlist_school_year(mar.school_year_id))`);
   if (options.schoolYearId) {
     params.push(options.schoolYearId);
     clauses.push(`mar.school_year_id = $${params.length}`);
@@ -12454,7 +12464,7 @@ export async function listManualAttendanceRecords(
   if (options.studentId) {
     params.push(options.studentId);
     clauses.push(
-      `LOWER(TRIM(mar.student_id)) = LOWER(TRIM($${params.length}))`,
+      /^TC-\d{2}-[A-Z]-\d{5}$/.test(normalizeStudentNumberKey(options.studentId)) ? `public.masterlist_student_number_key(mar.student_id) = public.masterlist_student_number_key($${params.length}::text)` : `LOWER(TRIM(mar.student_id)) = LOWER(TRIM($${params.length}))`,
     );
   }
 

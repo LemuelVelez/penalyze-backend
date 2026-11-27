@@ -337,6 +337,8 @@ app.post("/api/masterlist/reconcile/progress", requireAuth, requireAdmin, master
 app.delete("/api/masterlist", requireAuth, requireAdmin, masterlist.remove);
 app.get("/api/attendance/final-attendance", requireAuth, requireAdmin, masterlist.finalAttendance);
 app.get("/api/attendance/final-attendance/unmatched", requireAuth, requireAdmin, masterlist.finalAttendanceUnmatched);
+app.get("/api/attendance/final-attendance/corrected", requireAuth, requireAdmin, masterlist.finalAttendanceCorrected);
+app.post("/api/masterlist/reassign", requireAuth, requireAdmin, masterlist.reassign);
 app.get("/api/attendance/final-attendance/export", requireAuth, requireAdmin, masterlist.download);
 app.get("/api/attendance/colleges", requireAuth, attendanceColleges);
 app.get("/api/attendance/event-exemptions", requireAuth, requireAdmin, attendanceEventExemptions);

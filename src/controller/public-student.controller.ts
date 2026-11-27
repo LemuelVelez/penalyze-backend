@@ -1,3 +1,4 @@
+import { isPlaceholderStudentNumber, placeholderStudentNumberMessage } from "../services/masterlist-normalize";
 import type { NextFunction, Request, Response } from "express";
 import { getPublicStudentRecords } from "../services/public-student.service";
 
@@ -9,6 +10,7 @@ export async function publicStudentRecords(req: Request, res: Response, next: Ne
       return;
     }
 
+    if (isPlaceholderStudentNumber(studentId)) { res.status(400).json({ message: placeholderStudentNumberMessage(studentId.trim()) }); return; }
     const data = await getPublicStudentRecords(studentId);
     const found = data.profile || data.attendance.length || data.manualAttendance.length ||
       data.finalResults.length || data.fines.length || data.penaltyResults.length;

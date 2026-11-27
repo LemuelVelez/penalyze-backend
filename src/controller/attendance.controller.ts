@@ -1177,10 +1177,11 @@ export async function finalResults(
       studentId: req.query.studentId
         ? String(req.query.studentId).trim()
         : undefined,
-      studentProfile: req.query.studentName !== undefined || req.query.studentCollege !== undefined || req.query.studentProgram !== undefined ? {
+      studentProfile: req.query.studentName !== undefined || req.query.studentCollege !== undefined || req.query.studentProgram !== undefined || req.query.studentYearLevel !== undefined ? {
         name: String(req.query.studentName ?? ""),
         college: String(req.query.studentCollege ?? ""),
         program: String(req.query.studentProgram ?? ""),
+        yearLevel: String(req.query.studentYearLevel ?? ""),
       } : undefined,
       college: req.query.college ? String(req.query.college).trim() : undefined,
       includeMissedEvents:

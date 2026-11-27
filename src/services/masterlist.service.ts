@@ -5,7 +5,7 @@ import type { MasterlistStatus, SchoolYearRecord, StudentMasterlistRecord, Stude
 import { pool, withTransaction } from "../lib/db";
 import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelKey, normalizeCollegeKey, lockAttendanceAbsenceSync, refreshDerivedAttendanceResultsForSchoolYearsWithClient, refreshAttendanceFinalResultsWithClient, refreshCalculationResultsWithClient, prepareMasterlistDerivedRefresh, finishMasterlistDerivedRefresh, refreshPenaltyResultsForSchoolYearWithClient, listAttendanceFinalResults, listFinalAttendanceEventRoster, syncAbsencesForStudents, attendanceEventRosterScopeCteSql, attendanceEventParticipationCteSql } from "./attendance.service";
 import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
-import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram, parseStudentNumberParts, isPlaceholderStudentNumber, nameTokens, nameTokensAgree, nameKeysAgree, sharedNameTokenCount, nameTokenSignatures, repairNameMojibake, surnameTokensOverlap, joinedGivenNamesAgree, masterlistNameMatchRank, masterlistNameSignatures } from "./masterlist-normalize";
+import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram, parseStudentNumberParts, isPlaceholderStudentNumber, nameTokens, nameTokensAgree, nameKeysAgree, sharedNameTokenCount, nameTokenSignatures, repairNameMojibake, surnameTokensOverlap, joinedGivenNamesAgree, masterlistNameMatchRank, masterlistNameSignatures, studentIdSimilarity, programInitials } from "./masterlist-normalize";
 
 const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, expose: true });
 export type MasterlistProgress = {
@@ -79,7 +79,7 @@ function checkFilename(file: string, year: SchoolYearRecord) {
   const years = [...file.matchAll(/(\d{4})\s*[-–—]\s*(\d{4})/g)];
   if (semesters.some(m => !/^(1ST|FIRST)$/i.test(m[1])) || years.some(m => m[1] !== "2026" || m[2] !== "2027")) throw bad("The filename conflicts with the active school year.");
 }
-type Profile = { studentId: string; name: string; program?: string | null; college?: string | null; reconciledStudentNumber?: string };
+type Profile = { studentId: string; name: string; program?: string | null; college?: string | null; yearLevel?: string | null; reconciledStudentNumber?: string };
 type Resolution = { status: MasterlistStatus; master?: StudentMasterlistRecord; reason?: string };
 type MasterIndex = { rows: StudentMasterlistRecord[]; ids: Map<string, StudentMasterlistRecord>; names: Map<string, StudentMasterlistRecord[]>; tokens: Map<string, StudentMasterlistRecord[]>; serials: Map<string, StudentMasterlistRecord[]> };
 export type MasterlistCache = Map<string, MasterIndex>;
@@ -115,15 +115,33 @@ function resolve(index: MasterIndex, profile: Profile): Resolution {
   const owner = isPlaceholderStudentNumber(profile.studentId) ? undefined : index.ids.get(id);
   const rank = (r: StudentMasterlistRecord) => masterlistNameMatchRank(profile.name, r.last_name, r.given_name);
   // An exact name candidate takes precedence over a merely fuzzy ID/name match.
-  // The complete ID may disambiguate people with the same name; partial IDs
-  // and self-reported college/program cannot disambiguate conflicting people.
+  // Only candidates at the best name rank are eligible for tie-breaking.
   const possible = new Set(masterlistNameSignatures(profile.name).flatMap(signature => index.tokens.get(signature) ?? []));
   if (owner) possible.add(owner);
   const ranked = [...possible].map(master => ({ master, rank: rank(master) })).filter(r => r.rank > 0);
   const best = ranked.reduce((max, r) => Math.max(max, r.rank), 0);
-  const candidates = ranked.filter(r => r.rank === best).map(r => r.master);
+  let candidates = ranked.filter(r => r.rank === best).map(r => r.master);
   if (owner && (!normalizeNameKey(profile.name) || candidates.some(r => r.id === owner.id))) {
     return { status: "matched_by_id", master: owner };
+  }
+  let similarity = 0;
+  const wasAmbiguous = candidates.length > 1;
+  if (wasAmbiguous) {
+    const narrow = (predicate: (m: StudentMasterlistRecord) => boolean) => {
+      if (candidates.length <= 1) return;
+      const filtered = candidates.filter(predicate);
+      if (filtered.length) candidates = filtered;
+    };
+    if (!isPlaceholderStudentNumber(profile.studentId)) {
+      similarity = Math.max(...candidates.map(m => studentIdSimilarity(profile.studentId, m.student_number)));
+      if (similarity > 0) narrow(m => studentIdSimilarity(profile.studentId, m.student_number) === similarity);
+    }
+    const college = normalizeCollegeKey(collegeForProgram(profile.program) ?? profile.college);
+    const year = normalizeYearLevelKey(profile.yearLevel);
+    const program = programInitials(profile.program);
+    if (college) narrow(m => normalizeCollegeKey(m.college) === college);
+    if (year) narrow(m => normalizeYearLevelKey(m.year_level) === year);
+    if (program) narrow(m => programInitials(m.program) === program);
   }
   if (candidates.length === 1) {
     const master = candidates[0];
@@ -131,7 +149,7 @@ function resolve(index: MasterIndex, profile: Profile): Resolution {
     const target = parseStudentNumberParts(master.student_number_key);
     const partialAgrees = !owner && parts && target && parts.serial === target.serial &&
       (!parts.year || parts.year === target.year) && (!parts.letter || parts.letter === target.letter);
-    return { status: owner && owner.id !== master.id ? "id_name_mismatch" : partialAgrees ? "matched_by_partial_id" : "matched_by_name", master };
+    return { status: owner && owner.id !== master.id ? "id_name_mismatch" : (wasAmbiguous ? similarity >= 2 : partialAgrees) ? "matched_by_partial_id" : "matched_by_name", master };
   }
   return { status: "unmatched", reason: candidates.length > 1
     ? "Ambiguous name: multiple masterlist students match. Correct the student ID and name."
@@ -178,7 +196,8 @@ function otherTermReferences(studentIdSql: string, schoolYearSql: string) {
 }
 // Never overwrite a global profile with evidence belonging to another term.
 export async function upsertMasterlistStudent(client: PoolClient, year: string, row: ParsedAttendanceRow) {
-  const matched = row.masterlist_status !== "unmatched";
+  if (isPlaceholderStudentNumber(row.studentId) || row.masterlist_status === "unmatched") return;
+  const matched = true;
   await client.query("SELECT set_config('penalyze.masterlist_school_year',$1,true)", [year]);
   await client.query(`INSERT INTO students(student_id,name,year_level,program,college,institution)
     SELECT $1,$2,$3,$4,$5,$6 WHERE NOT EXISTS (${otherTermReferences("$1::text", "$7::uuid")})
@@ -303,7 +322,7 @@ async function reconcileStep(client: PoolClient, schoolYear: SchoolYearRecord, p
       const rows: Existing[] = (await client.query<Existing>(`SELECT id,student_id,name,${isSource ? "masterlist_original,masterlist_status," : ""}${full ? "program,college,year_level" : "NULL::text AS program,NULL::text AS college,NULL::text AS year_level"} FROM ${table} WHERE school_year_id=$1${visibility} AND ($2::uuid IS NULL OR id>$2) ORDER BY id LIMIT ${MASTERLIST_CHUNK_SIZE}`, [schoolYear.id,cursor.id ?? null])).rows;
       for (const row of rows) {
         const original = row.masterlist_original ?? { studentId: row.student_id, name: row.name, program: row.program ?? undefined, college: row.college ?? undefined, yearLevel: row.year_level ?? undefined };
-        const profileKey = JSON.stringify([original.studentId, original.name, original.reconciledStudentNumber ?? ""]);
+        const profileKey = JSON.stringify([original.studentId, original.name, original.reconciledStudentNumber ?? "", original.college, original.program, original.yearLevel]);
         let resolution = resolutionCache.get(profileKey);
         if (!resolution) {
           resolution = resolve(index, original);
@@ -402,6 +421,13 @@ async function reconcileStep(client: PoolClient, schoolYear: SchoolYearRecord, p
     await client.query(`DELETE FROM students s USING jsonb_to_recordset($1::jsonb) AS m(old text,target text) WHERE LOWER(TRIM(s.student_id))=m.old AND m.old<>m.target AND NOT EXISTS (${scopedTables.map(t => `SELECT 1 FROM ${t} WHERE public.masterlist_student_number_key(student_id)=public.masterlist_student_number_key(m.old)`).join(" UNION ALL ")} UNION ALL SELECT 1 FROM attendance_student_event_overrides WHERE public.masterlist_student_number_key(student_key)=public.masterlist_student_number_key(m.old))`, [JSON.stringify(mapping)]);
   }
   await client.query("SELECT set_config('penalyze.masterlist_school_year','',true)");
+  await client.query(`DELETE FROM students s WHERE public.masterlist_student_number_key(s.student_id) LIKE '%-00000' OR TRIM(COALESCE(s.student_id,'')) = ''`);
+  const sources = ["attendance_records", "manual_attendance_records"];
+  const sourceReferences = (condition: string) => sources.map(t => `SELECT 1 FROM ${t} a WHERE a.school_year_id=$1 AND public.masterlist_student_number_key(a.student_id)=public.masterlist_student_number_key(s.student_id) AND ${condition}`).join(" UNION ALL ");
+  await client.query(`DELETE FROM students s WHERE NOT EXISTS (SELECT 1 FROM student_masterlist m WHERE m.school_year_id=$1 AND m.student_number_key=public.masterlist_student_number_key(s.student_id))
+    AND EXISTS (${sourceReferences("a.masterlist_status='unmatched'")})
+    AND NOT EXISTS (${sourceReferences("a.masterlist_status IS DISTINCT FROM 'unmatched'")})
+    AND NOT EXISTS (${otherTermReferences("s.student_id", "$1::uuid")})`, [schoolYear.id]);
   summary.studentsUpdated = changed.size;
     if (rebuild) { state.studentIds = await absenceStudentIds(client,schoolYear.id); nextPhase = "sync_absences"; nextCursor = {tableIndex:0,offset:0}; }
     else {done = true; nextPhase = "finalize";}
@@ -871,12 +897,21 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
   }, exportAll);
 }
 async function loadUnmatched(client: PoolClient, schoolYearId: string, index: MasterIndex, f: MasterlistFilters) {
-    const unmatched:Array<{student_id:string;name:string;college:string|null;program:string|null;year_level:string|null;reason:string}>=[];
+    const unmatched:Array<{student_id:string;name:string;college:string|null;program:string|null;year_level:string|null;reason:string;is_placeholder:boolean;id_owner:{student_number:string;full_name:string}|null;suggestions:Pick<StudentMasterlistRecord,"student_number"|"full_name"|"program"|"year_level"|"college">[]}>=[];
     if(index.rows.length) {
-      const source=(await client.query<Existing & { reconciled_student_number: string | null }>(`SELECT DISTINCT ON (LOWER(TRIM(student_id)),name,reconciled_student_number) * FROM (SELECT ar.id,COALESCE(ar.masterlist_original->>'studentId',ar.student_id) AS student_id,COALESCE(ar.masterlist_original->>'name',ar.name) AS name,COALESCE(ar.masterlist_original->>'college',ar.college) AS college,COALESCE(ar.masterlist_original->>'program',ar.program) AS program,COALESCE(ar.masterlist_original->>'yearLevel',ar.year_level) AS year_level,ar.masterlist_original->>'reconciledStudentNumber' AS reconciled_student_number FROM attendance_records ar WHERE ar.school_year_id=$1 AND ${getAttendanceRecordVisibilitySql("ar")} UNION ALL SELECT id,COALESCE(masterlist_original->>'studentId',student_id),COALESCE(masterlist_original->>'name',name),COALESCE(masterlist_original->>'college',college),COALESCE(masterlist_original->>'program',program),COALESCE(masterlist_original->>'yearLevel',year_level),masterlist_original->>'reconciledStudentNumber' FROM manual_attendance_records WHERE school_year_id=$1 UNION ALL SELECT id,student_id,name,college,program,year_level,NULL::text FROM attendance_final_results WHERE school_year_id=$1 AND import_id IS NULL UNION ALL SELECT id,student_id,name,college,program,year_level,NULL::text FROM attendance_requests WHERE school_year_id=$1 UNION ALL SELECT id,student_id,name,college,program,year_level,NULL::text FROM calculation_results WHERE school_year_id=$1 UNION ALL SELECT id,student_id,name,NULL::text,NULL::text,NULL::text,NULL::text FROM penalty_results WHERE school_year_id=$1 UNION ALL SELECT id,student_id,name,NULL::text,NULL::text,NULL::text,NULL::text FROM fines WHERE school_year_id=$1) q ORDER BY LOWER(TRIM(student_id)),name,reconciled_student_number,(college IS NOT NULL) DESC,(program IS NOT NULL) DESC`,[schoolYearId])).rows;
+      const source=(await client.query<Existing & { reconciled_student_number: string | null; stored_unmatched: boolean }>(`SELECT DISTINCT ON (LOWER(TRIM(student_id)),name,reconciled_student_number) * FROM (SELECT ar.id,COALESCE(ar.masterlist_original->>'studentId',ar.student_id) AS student_id,COALESCE(ar.masterlist_original->>'name',ar.name) AS name,COALESCE(ar.masterlist_original->>'college',ar.college) AS college,COALESCE(ar.masterlist_original->>'program',ar.program) AS program,COALESCE(ar.masterlist_original->>'yearLevel',ar.year_level) AS year_level,ar.masterlist_original->>'reconciledStudentNumber' AS reconciled_student_number, ar.masterlist_status='unmatched' AS stored_unmatched FROM attendance_records ar WHERE ar.school_year_id=$1 AND ${getAttendanceRecordVisibilitySql("ar")} UNION ALL SELECT id,COALESCE(masterlist_original->>'studentId',student_id),COALESCE(masterlist_original->>'name',name),COALESCE(masterlist_original->>'college',college),COALESCE(masterlist_original->>'program',program),COALESCE(masterlist_original->>'yearLevel',year_level),masterlist_original->>'reconciledStudentNumber',masterlist_status='unmatched' FROM manual_attendance_records WHERE school_year_id=$1 UNION ALL SELECT id,student_id,name,college,program,year_level,NULL::text,false FROM attendance_final_results WHERE school_year_id=$1 AND import_id IS NULL UNION ALL SELECT id,student_id,name,college,program,year_level,NULL::text,false FROM attendance_requests WHERE school_year_id=$1 UNION ALL SELECT id,student_id,name,college,program,year_level,NULL::text,false FROM calculation_results WHERE school_year_id=$1 UNION ALL SELECT id,student_id,name,NULL::text,NULL::text,NULL::text,NULL::text,false FROM penalty_results WHERE school_year_id=$1 UNION ALL SELECT id,student_id,name,NULL::text,NULL::text,NULL::text,NULL::text,false FROM fines WHERE school_year_id=$1) q ORDER BY LOWER(TRIM(student_id)),name,reconciled_student_number,stored_unmatched DESC NULLS LAST,(college IS NOT NULL) DESC,(program IS NOT NULL) DESC`,[schoolYearId])).rows;
       for (const row of source) {
-        const resolution = resolve(index, {studentId:row.student_id,name:row.name,college:row.college,program:row.program,reconciledStudentNumber:row.reconciled_student_number ?? undefined});
-        if (resolution.status === "unmatched") unmatched.push({student_id:row.student_id,name:row.name,college:row.college,program:row.program,year_level:row.year_level,reason:resolution.reason ?? "No unique masterlist match"});
+        const resolution = resolve(index, {studentId:row.student_id,name:row.name,college:row.college,program:row.program,yearLevel:row.year_level,reconciledStudentNumber:row.reconciled_student_number ?? undefined});
+        if (row.stored_unmatched || resolution.status === "unmatched") {
+          const owner = index.ids.get(normalizeStudentNumberKey(row.student_id));
+          const college = normalizeCollegeKey(collegeForProgram(row.program) ?? row.college);
+          const year = normalizeYearLevelKey(row.year_level);
+          const suggestions = [...new Set(masterlistNameSignatures(row.name).flatMap(signature => index.tokens.get(signature) ?? []))]
+            .map(m => ({m, rank: masterlistNameMatchRank(row.name,m.last_name,m.given_name), similarity: studentIdSimilarity(row.student_id,m.student_number), college: Number(!!college && normalizeCollegeKey(m.college)===college), year: Number(!!year && normalizeYearLevelKey(m.year_level)===year)}))
+            .filter(x => x.rank>0).sort((a,b)=>b.rank-a.rank || b.similarity-a.similarity || b.college-a.college || b.year-a.year).slice(0,5)
+            .map(({m})=>({student_number:m.student_number,full_name:m.full_name,program:m.program,year_level:m.year_level,college:m.college}));
+          unmatched.push({student_id:row.student_id,name:row.name,college:row.college,program:row.program,year_level:row.year_level,reason:resolution.reason ?? "Saved unmatched row; assign the correct student or reconcile again.",is_placeholder:isPlaceholderStudentNumber(row.student_id),id_owner:owner?{student_number:owner.student_number,full_name:owner.full_name}:null,suggestions});
+        }
       }
     }
     const filteredUnmatched=unmatched.filter(r=>(!f.college || normalizeCollegeKey(r.college)===normalizeCollegeKey(f.college)) && (!f.yearLevel || normalizeYearLevelKey(r.year_level)===normalizeYearLevelKey(f.yearLevel)) && (!f.program || normalizeProgram(r.program)===normalizeProgram(f.program)) && matchesSearch(r.student_id,r.name,f.search));
@@ -916,4 +951,77 @@ export async function exportFinalAttendance(f:MasterlistFilters) {
   }
   const buffer=cfb.write(archive,{type:"buffer",fileType:"zip",compression:true});
   return {buffer,filename:`final-attendance-${result.schoolYear.name}-${result.schoolYear.semester}.xlsx`.replace(/[^a-zA-Z0-9._ -]/g,"-")};
+}
+
+
+export async function reassignStudentAttendance(input: {schoolYearId:string; originalStudentId:string; originalName:string; studentNumber:string}) {
+  const {schoolYearId, originalStudentId, originalName, studentNumber} = input;
+  return withTransaction(async client => {
+    await lockAttendanceAbsenceSync(client);
+    const index = await loadMasterlist(client,schoolYearId);
+    const master = index.ids.get(normalizeStudentNumberKey(studentNumber));
+    if (!master) throw bad(`${studentNumber} is not in the masterlist for this school year.`);
+    const previousKeys = new Set<string>([originalStudentId]);
+    const previousNames = new Set<string>([normalizeNameKey(originalName)]);
+    let recordsUpdated = 0;
+    for (const table of ["attendance_records","manual_attendance_records"] as const) {
+      const rows = (await client.query<Existing>(`SELECT a.id,a.student_id,a.name,a.year_level,a.program,a.college,a.masterlist_original,a.masterlist_status FROM ${table} a
+        WHERE a.school_year_id=$1 AND public.masterlist_student_number_key(COALESCE(a.masterlist_original->>'studentId',a.student_id))=public.masterlist_student_number_key($2) ${table === "attendance_records" ? `AND ${getAttendanceRecordVisibilitySql("a")}` : ""} FOR UPDATE OF a`,[schoolYearId,originalStudentId])).rows
+        .filter(r=>normalizeNameKey(r.masterlist_original?.name ?? r.name)===normalizeNameKey(originalName));
+      for (const row of rows) {
+        previousKeys.add(row.student_id);
+        // Only the original name is safe for detached financial/request records.
+        // A previous auto-correction may share the current name of an innocent student.
+        if (table === "attendance_records" && row.masterlist_status === "unmatched") {
+          await client.query("DELETE FROM fines WHERE school_year_id=$1 AND attendance_record_id=$2",[schoolYearId,row.id]);
+        }
+        const original = {...(row.masterlist_original ?? {studentId:row.student_id,name:row.name,college:row.college,program:row.program,yearLevel:row.year_level}),reconciledStudentNumber:master.student_number};
+        const updated = await client.query(`UPDATE ${table} SET student_id=$2,name=$3,year_level=$4,program=$5,college=$6,masterlist_status='matched_by_id',masterlist_original=$7::jsonb,updated_at=NOW() WHERE id=$1`,[row.id,master.student_number,master.full_name,master.year_level,master.program,master.college,JSON.stringify(original)]);
+        recordsUpdated += updated.rowCount ?? 0;
+        if (table === "attendance_records") await client.query("UPDATE fines SET student_id=$2,name=$3,updated_at=NOW() WHERE school_year_id=$4 AND attendance_record_id=$1",[row.id,master.student_number,master.full_name,schoolYearId]);
+      }
+    }
+    const oldKeys = [...new Set([...previousKeys].map(normalizeStudentNumberKey))];
+    const sameNameIds = async (table: string, keys: string[]) => (await client.query<{id:string;name:string}>(`SELECT id,name FROM ${table} WHERE school_year_id=$1 AND public.masterlist_student_number_key(student_id)=ANY($2::text[]) FOR UPDATE`,[schoolYearId,keys])).rows.filter(r=>previousNames.has(normalizeNameKey(r.name))).map(r=>r.id);
+    const requests = await sameNameIds("attendance_requests",[normalizeStudentNumberKey(originalStudentId)]);
+    await client.query("UPDATE attendance_requests SET student_id=$2,name=$3,year_level=$4,program=$5,college=$6,updated_at=NOW() WHERE id=ANY($1::uuid[])",[requests,master.student_number,master.full_name,master.year_level,master.program,master.college]);
+    let derivedDeleted = 0;
+    for (const table of ["attendance_final_results","calculation_results"]) {
+      const ids = await sameNameIds(table,oldKeys);
+      const deleted = await client.query(`DELETE FROM ${table} WHERE id=ANY($1::uuid[])`,[ids]);
+      derivedDeleted += deleted.rowCount ?? 0;
+    }
+    const fineIds = await sameNameIds("fines",oldKeys);
+    await client.query("UPDATE fines SET student_id=$2,name=$3,updated_at=NOW() WHERE id=ANY($1::uuid[])",[fineIds,master.student_number,master.full_name]);
+    const penaltyIds = await sameNameIds("penalty_results",oldKeys);
+    if (penaltyIds.length) {
+      const ranked = `WITH ranked AS (SELECT id, ROW_NUMBER() OVER(ORDER BY CASE status WHEN 'paid' THEN 0 WHEN 'waived' THEN 1 ELSE 2 END,updated_at DESC,id DESC) AS rn FROM penalty_results WHERE school_year_id=$1 AND (id=ANY($2::uuid[]) OR public.masterlist_student_number_key(student_id)=public.masterlist_student_number_key($3)))`;
+      await client.query(`${ranked} DELETE FROM penalty_results p USING ranked r WHERE p.id=r.id AND r.rn>1`,[schoolYearId,penaltyIds,master.student_number]);
+      await client.query("UPDATE penalty_results SET student_id=$2,name=$3,updated_at=NOW() WHERE id=ANY($1::uuid[])",[penaltyIds,master.student_number,master.full_name]);
+    }
+    if (!recordsUpdated && !requests.length && !fineIds.length && !penaltyIds.length && !derivedDeleted) throw bad("No saved attendance or related records match this original ID and name.");
+    await client.query("SELECT set_config('penalyze.masterlist_school_year',$1,true)",[schoolYearId]);
+    await client.query(`INSERT INTO students(student_id,name,year_level,program,college) SELECT $1,$2,$3,$4,$5 WHERE NOT EXISTS (${otherTermReferences("$1::text", "$6::uuid")}) ON CONFLICT ((LOWER(TRIM(student_id)))) DO UPDATE SET name=EXCLUDED.name,year_level=EXCLUDED.year_level,program=EXCLUDED.program,college=EXCLUDED.college,updated_at=NOW()`,[master.student_number,master.full_name,master.year_level,master.program,master.college,schoolYearId]);
+    await client.query(`DELETE FROM students s WHERE public.masterlist_student_number_key(s.student_id)=ANY($2::text[]) AND NOT EXISTS (SELECT 1 FROM student_masterlist m WHERE m.school_year_id=$1 AND m.student_number_key=public.masterlist_student_number_key(s.student_id)) AND NOT EXISTS (${scopedTables.map(t=>`SELECT 1 FROM ${t} WHERE public.masterlist_student_number_key(student_id)=public.masterlist_student_number_key(s.student_id)`).join(" UNION ALL ")} UNION ALL SELECT 1 FROM attendance_student_event_overrides WHERE public.masterlist_student_number_key(student_key)=public.masterlist_student_number_key(s.student_id))`,[schoolYearId,oldKeys]);
+    await client.query("SELECT set_config('penalyze.masterlist_school_year','',true)");
+    const keys = [...new Set([master.student_number,...previousKeys].map(normalizeStudentNumberKey))].filter(k=>/^TC-\d{2}-[A-Z]-\d{5}$/.test(k) && !isPlaceholderStudentNumber(k));
+    await syncAbsencesForStudents(client,[master.student_number,...previousKeys].filter(id=>!isPlaceholderStudentNumber(id)),schoolYearId,true,true);
+    await refreshAttendanceFinalResultsWithClient(client,{schoolYearId,masterlistStudentKeys:keys,resolveUnattachedEvents:false});
+    await refreshCalculationResultsWithClient(client,{schoolYearId,masterlistStudentKeys:keys,resolveUnattachedEvents:false});
+    await refreshPenaltyResultsForSchoolYearWithClient(client,schoolYearId,undefined,keys);
+    return {studentNumber:master.student_number,name:master.full_name,recordsUpdated};
+  });
+}
+
+type CorrectedStudent = {original_student_id:string;original_name:string;corrected_student_id:string;corrected_name:string;college:string|null;program:string|null;year_level:string|null;masterlist_status:string;record_count:number;latest_scanned_at:string|null};
+export async function getAutoCorrectedStudents(f:MasterlistFilters) {
+  return withFinalAttendanceSnapshot(async client=>{
+    const schoolYear=await finalAttendanceSchoolYear(client,f);
+    const pending=await getUploadCheckpoint(client,schoolYear.id);
+    if (pending && pending.phase!=="staged") throw Object.assign(new Error("Final attendance is being rebuilt. Resume the unfinished masterlist upload before viewing results."),{statusCode:409,expose:true});
+    const source = (table:string,visibility:string) => `SELECT COALESCE(a.masterlist_original->>'studentId',a.student_id) AS original_student_id,COALESCE(a.masterlist_original->>'name',a.name) AS original_name,a.student_id AS corrected_student_id,a.name AS corrected_name,a.college,a.program,a.year_level,a.masterlist_status,a.scanned_at FROM ${table} a WHERE a.school_year_id=$1 AND a.masterlist_status IN ('matched_by_name','matched_by_partial_id','id_name_mismatch') ${visibility}`;
+    const rows=(await client.query<CorrectedStudent>(`WITH source AS (${source("attendance_records",`AND ${getAttendanceRecordVisibilitySql("a")}`)} UNION ALL ${source("manual_attendance_records","")}) SELECT original_student_id,original_name,corrected_student_id,MAX(corrected_name) AS corrected_name,MAX(college) AS college,MAX(program) AS program,MAX(year_level) AS year_level,MAX(masterlist_status) AS masterlist_status,COUNT(*)::int AS record_count,MAX(scanned_at) AS latest_scanned_at FROM source GROUP BY original_student_id,original_name,corrected_student_id ORDER BY MAX(scanned_at) DESC NULLS LAST,original_student_id,original_name,corrected_student_id`,[schoolYear.id])).rows.filter(r=>(!f.college || normalizeCollegeKey(r.college)===normalizeCollegeKey(f.college)) && (!f.yearLevel || normalizeYearLevelKey(r.year_level)===normalizeYearLevelKey(f.yearLevel)) && (!f.program || normalizeProgram(r.program)===normalizeProgram(f.program)) && (matchesSearch(r.original_student_id,r.original_name,f.search) || matchesSearch(r.corrected_student_id,r.corrected_name,f.search)));
+    const offset=f.offset??0;
+    return {rows:rows.slice(offset,offset+(f.limit??50)),total:rows.length};
+  });
 }
