@@ -1,5 +1,6 @@
 import * as maintenanceJobs from "./controller/maintenance-jobs.controller";
 import { recoverMaintenanceJobs } from "./services/maintenance-jobs.service";
+import { recoverApprovedAttendanceRequests } from "./services/attendance-requests.service";
 import * as masterlist from "./controller/masterlist.controller";
 import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
@@ -609,5 +610,7 @@ if (
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  void recoverMaintenanceJobs().catch(error => console.error("Maintenance job recovery failed:",error));
+  void recoverMaintenanceJobs()
+    .then(() => recoverApprovedAttendanceRequests())
+    .catch(error => console.error("Maintenance/approved attendance recovery failed:", error));
 });

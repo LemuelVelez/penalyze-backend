@@ -10,7 +10,7 @@ import type {
   AttendanceRequestType,
   SchoolSemester,
 } from "../database/model/schema.model";
-import { pool, query, withTransaction } from "../lib/db";
+import { pool, query, withTransaction, withJobTransaction } from "../lib/db";
 import {
   attendanceEventRosterScopeCteSql,
   attendanceStudentKeySql,
@@ -21,6 +21,7 @@ import {
   normalizeCollegeKey,
   normalizeYearLevelKey,
   tryLockAttendanceAbsenceSync,
+  lockAttendanceAbsenceSync,
   listAttendanceAbsenceSyncLockHolders,
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
   refreshDerivedAttendanceResultsForStudentsWithClient,
@@ -1048,6 +1049,34 @@ async function getApprovalMasterlistStudent(client: PoolClient, request: Attenda
   return rows[0];
 }
 
+// Save an explicit participant correction using the same identity and override
+// table as the officer's Events editor. Update any existing normalized alias
+// rather than creating a second, contradictory correction for the same event.
+async function confirmApprovedEventAttendance(
+  client: PoolClient,
+  schoolYearId: string,
+  studentId: string,
+  eventId: string,
+  reviewerId: string | null,
+) {
+  const existing = await client.query(
+    `UPDATE attendance_student_event_overrides
+     SET attended = TRUE, updated_by = $4::uuid, updated_at = NOW()
+     WHERE school_year_id = $1::uuid AND event_id = $3::uuid
+       AND ${attendanceStudentKeySql("student_key")} = ${attendanceStudentKeySql("$2::text")}`,
+    [schoolYearId, studentId, eventId, reviewerId],
+  );
+  if (existing.rowCount) return;
+  await client.query(
+    `INSERT INTO attendance_student_event_overrides AS existing
+       (school_year_id, student_key, event_id, attended, updated_by)
+     VALUES ($1::uuid, ${attendanceStudentKeySql("$2::text")}, $3::uuid, TRUE, $4::uuid)
+     ON CONFLICT (school_year_id, student_key, event_id) DO UPDATE
+       SET attended = TRUE, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+    [schoolYearId, studentId, eventId, reviewerId],
+  );
+}
+
 async function addApprovedManualAttendance(
   client: PoolClient,
   request: AttendanceRequestRecord,
@@ -1161,15 +1190,9 @@ async function addApprovedManualAttendance(
       [event.event_id, studentId, request.school_year_id, ZERO_ATTENDANCE_REMARK],
     );
 
-    // An explicit absent override takes precedence over source rows. An
-    // approved review must reverse it, even when a source row already exists.
-    await client.query(
-      `UPDATE attendance_student_event_overrides
-       SET attended = TRUE, updated_by = $4::uuid, updated_at = NOW()
-       WHERE school_year_id = $1::uuid AND ${attendanceStudentKeySql("student_key")} = ${attendanceStudentKeySql("$2::text")}
-         AND event_id = $3::uuid AND attended = FALSE`,
-      [request.school_year_id, studentId, event.event_id, reviewerId],
-    );
+    // Approval is authoritative even when an older import or manual source
+    // exists. The same correction is consumed by results, fines and event details.
+    await confirmApprovedEventAttendance(client, request.school_year_id, studentId, event.event_id, reviewerId);
     if (existingResult.rows[0]?.exists) continue;
 
     await client.query(
@@ -1209,6 +1232,13 @@ async function addApprovedManualAttendance(
     createdAttendanceCount += 1;
   }
 
+  await removeSupersededZeroAttendance(client, request.school_year_id, studentId);
+
+  return createdAttendanceCount;
+}
+
+
+async function removeSupersededZeroAttendance(client: PoolClient, schoolYearId: string, studentId: string) {
   const zeroManualResult = await client.query<{ id: string }>(
     `
       SELECT id
@@ -1217,7 +1247,7 @@ async function addApprovedManualAttendance(
         AND attendance_type = 'zero_attendance'
         AND ${attendanceStudentKeySql("student_id")} = ${attendanceStudentKeySql("$2::text")}
     `,
-    [request.school_year_id, studentId],
+    [schoolYearId, studentId],
   );
   const zeroManualIds = zeroManualResult.rows.map((row) => row.id);
 
@@ -1245,12 +1275,128 @@ async function addApprovedManualAttendance(
         AND ${attendanceStudentKeySql("student_id")} = ${attendanceStudentKeySql("$2::text")}
         AND remarks = $3
     `,
-    [request.school_year_id, studentId, ZERO_ATTENDANCE_REMARK],
+    [schoolYearId, studentId, ZERO_ATTENDANCE_REMARK],
   );
 
-  return createdAttendanceCount;
 }
 
+type ApprovedAttendanceRepairScope = { school_year_id: string; student_id: string };
+type ApprovedAttendanceRepairEvent = {
+  event_id: string;
+  college: string | null;
+  year_level: string | null;
+  reviewed_by: string | null;
+  reviewed_at: Date | string;
+  needs_confirmation: boolean;
+};
+
+// Requests approved by earlier releases may have an unresolved manual source or
+// a committed status whose maintenance job never finished. Repair from the
+// persisted approved event IDs, not from evidence names or client-supplied data.
+// A later explicit officer correction is authoritative and must not be reversed.
+function approvedAttendanceRepairCandidatesSql() {
+  return `WITH latest_approvals AS (
+    SELECT DISTINCT ON (ar.school_year_id, ${attendanceStudentKeySql("ar.student_id")}, are.event_id)
+      ar.school_year_id, ${attendanceStudentKeySql("ar.student_id")} AS student_key,
+      ar.student_id, are.event_id, ar.college, ar.year_level, ar.reviewed_by, ar.reviewed_at
+    FROM attendance_requests ar
+    JOIN attendance_request_events are ON are.request_id = ar.id
+    JOIN attendance_events ae ON ae.id = are.event_id AND ae.school_year_id = ar.school_year_id
+    WHERE ar.status = 'approved' AND ar.request_type = 'event_review' AND ar.reviewed_at IS NOT NULL
+      AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
+      AND ($2::text IS NULL OR ${attendanceStudentKeySql("ar.student_id")} = ${attendanceStudentKeySql("$2::text")})
+    ORDER BY ar.school_year_id, ${attendanceStudentKeySql("ar.student_id")}, are.event_id, ar.reviewed_at DESC, ar.id DESC
+  ), candidates AS (
+    SELECT approval.*,
+      NOT EXISTS (
+        SELECT 1 FROM attendance_student_event_overrides o
+        WHERE o.school_year_id = approval.school_year_id AND o.event_id = approval.event_id
+          AND ${attendanceStudentKeySql("o.student_key")} = approval.student_key AND o.attended = TRUE
+      ) OR EXISTS (
+        SELECT 1 FROM attendance_student_event_overrides o
+        WHERE o.school_year_id = approval.school_year_id AND o.event_id = approval.event_id
+          AND ${attendanceStudentKeySql("o.student_key")} = approval.student_key AND o.attended = FALSE
+      ) AS needs_confirmation
+    FROM latest_approvals approval
+    WHERE NOT EXISTS (
+      SELECT 1 FROM attendance_student_event_overrides o
+      WHERE o.school_year_id = approval.school_year_id AND o.event_id = approval.event_id
+        AND ${attendanceStudentKeySql("o.student_key")} = approval.student_key
+        AND o.attended = FALSE AND o.updated_at > approval.reviewed_at
+    )
+  ) SELECT * FROM candidates c
+  WHERE c.needs_confirmation OR NOT EXISTS (
+    SELECT 1 FROM attendance_final_results afr
+    WHERE afr.school_year_id = c.school_year_id AND afr.import_id IS NULL
+      AND ${attendanceStudentKeySql("afr.student_id")} = c.student_key AND afr.updated_at >= c.reviewed_at
+  ) OR NOT EXISTS (
+    SELECT 1 FROM calculation_results cr
+    WHERE cr.school_year_id = c.school_year_id
+      AND ${attendanceStudentKeySql("cr.student_id")} = c.student_key AND cr.calculated_at >= c.reviewed_at
+  )`;
+}
+
+async function repairApprovedAttendanceScope(client: PoolClient, scope: ApprovedAttendanceRepairScope) {
+  await client.query("SET LOCAL lock_timeout = '60s'");
+  await lockAttendanceAbsenceSync(client);
+  const { rows } = await client.query<ApprovedAttendanceRepairEvent>(`${approvedAttendanceRepairCandidatesSql()} ORDER BY reviewed_at DESC`, [scope.school_year_id, scope.student_id]);
+  if (!rows.length) return;
+
+  const masterlistActive = await isMasterlistActiveForSchoolYear(client, scope.school_year_id);
+  const master = masterlistActive ? (await client.query<StudentMasterlistRecord>(
+    `SELECT * FROM student_masterlist WHERE school_year_id = $1::uuid AND student_number_key = public.masterlist_student_number_key($2)`,
+    [scope.school_year_id, scope.student_id],
+  )).rows[0] : undefined;
+  if (masterlistActive && !master) return;
+  const studentId = master?.student_number ?? scope.student_id;
+  const savedProfile = !masterlistActive ? (await client.query<{ college: string | null; year_level: string | null }>(
+    `SELECT college, year_level FROM attendance_final_results
+     WHERE school_year_id = $1::uuid AND import_id IS NULL
+       AND ${attendanceStudentKeySql("student_id")} = ${attendanceStudentKeySql("$2::text")}
+     ORDER BY updated_at DESC LIMIT 1`, [scope.school_year_id, studentId],
+  )).rows[0] : undefined;
+  const collegeKey = normalizeCollegeKey(master ? master.college : savedProfile?.college ?? rows[0].college);
+  const yearLevelKey = normalizeYearLevelKey(master ? master.year_level : savedProfile?.year_level ?? rows[0].year_level);
+  if (!collegeKey || isPlaceholderStudentNumber(studentId)) return;
+  const eventIds = rows.map((row) => row.event_id);
+  const roster = await getRequestableEventIds(client, scope.school_year_id, studentId, collegeKey, eventIds, true);
+  const eligible = await client.query<{ id: string }>(
+    `SELECT ae.id FROM attendance_events ae WHERE ae.school_year_id = $1::uuid AND ae.id = ANY($2::uuid[])
+       AND ${getEventCollegeExemptionFilterSql("ae.id", "$3::text")}
+       AND ${getEventYearLevelExemptionFilterSql("ae.id", "$4::text", "$3::text")}`,
+    [scope.school_year_id, eventIds, collegeKey, yearLevelKey],
+  );
+  const eligibleIds = new Set(eligible.rows.map((event) => event.id));
+  const repairable = rows.filter((row) => roster.has(row.event_id) && eligibleIds.has(row.event_id));
+  if (!repairable.length) return;
+  for (const row of repairable) {
+    if (row.needs_confirmation) {
+      await confirmApprovedEventAttendance(client, scope.school_year_id, studentId, row.event_id, row.reviewed_by);
+    }
+  }
+  await removeSupersededZeroAttendance(client, scope.school_year_id, studentId);
+  await syncAbsencesForStudents(client, [studentId], scope.school_year_id, true, true);
+  await refreshDerivedAttendanceResultsForStudentsWithClient(client, [scope.school_year_id], [studentId]);
+}
+
+// Run once on server startup, with a separate locked transaction per student
+// and semester. A failed repair never commits a partially recalculated student;
+// subsequent restarts can retry the same persisted candidates safely.
+export async function recoverApprovedAttendanceRequests() {
+  const { rows } = await query<ApprovedAttendanceRepairScope>(
+    `SELECT DISTINCT school_year_id, student_key AS student_id
+     FROM (${approvedAttendanceRepairCandidatesSql()}) repair
+     ORDER BY school_year_id, student_id`,
+    [null, null],
+  );
+  for (const scope of rows) {
+    try {
+      await withJobTransaction((client) => repairApprovedAttendanceScope(client, scope));
+    } catch (error) {
+      console.error("Approved attendance recovery failed for a student scope:", error);
+    }
+  }
+}
 
 /** Minimal public lookup: no names, evidence, request notes or reviewer details. */
 export type PublicStudentLookup = {
@@ -1895,7 +2041,7 @@ export async function reviewAttendanceRequest(
         });
         if(context)context.defer({schoolYearId:request.school_year_id,studentIds:[request.student_id],scopeFines:true,studentKeysOnly:true});
         else {
-        await syncAbsencesForStudents(client, [request.student_id], request.school_year_id, true);
+        await syncAbsencesForStudents(client, [request.student_id], request.school_year_id, true, true);
         await refreshDerivedAttendanceResultsForStudentsWithClient(
           client, [request.school_year_id], [request.student_id], (progress) => {
             const stages = {
@@ -1955,12 +2101,12 @@ export async function reviewAttendanceRequest(
           percent: 42,
           message: "Recalculating the student's absences.",
         });
-        if(context)context.defer({schoolYearId:request.school_year_id,studentIds:[request.student_id],scopeFines:true,studentKeysOnly:true});
-        else {
+        // Commit the approved status only after its attendance and fines are current.
         await syncAbsencesForStudents(
           client,
           [request.student_id],
           request.school_year_id,
+          true,
           true,
         );
 
@@ -1993,7 +2139,6 @@ export async function reviewAttendanceRequest(
             });
           },
         );
-        }
       }
     }
 
@@ -2181,6 +2326,7 @@ export async function reviewAttendanceRequestGroup(
     const approvedIds: string[] = [];
     const approvedEventSchoolYearIds = new Set<string>();
     const detailSchoolYearIds = new Set<string>();
+    const eventApprovalYears = new Set<string>();
 
     if (status === "rejected") {
       emit({
@@ -2291,12 +2437,19 @@ export async function reviewAttendanceRequestGroup(
         );
         approvedIds.push(request.id);
         approvedEventSchoolYearIds.add(request.school_year_id);
+        eventApprovalYears.add(request.school_year_id);
       }
 
       if (approvedEventSchoolYearIds.size) {
-        if(context) for(const schoolYearId of approvedEventSchoolYearIds) context.defer({schoolYearId,studentIds:[studentId],scopeFines:true,studentKeysOnly:!detailSchoolYearIds.has(schoolYearId)});
-        else {
-        const schoolYearIds = [...approvedEventSchoolYearIds];
+        // Refresh approved events before their status commits. Details changes
+        // may also affect other students, so keep their full-year resumable job.
+        const schoolYearIds = [...approvedEventSchoolYearIds].filter((schoolYearId) => {
+          const hasEvents = eventApprovalYears.has(schoolYearId);
+          if (context && (!hasEvents || detailSchoolYearIds.has(schoolYearId))) {
+            context.defer({ schoolYearId, studentIds: [studentId], scopeFines: true, studentKeysOnly: !detailSchoolYearIds.has(schoolYearId) });
+          }
+          return !context || hasEvents;
+        });
         for (let index = 0; index < schoolYearIds.length; index += 1) {
           emit({
             stage: "syncing_absences",
@@ -2305,7 +2458,7 @@ export async function reviewAttendanceRequestGroup(
             completed: approvedIds.length,
             total,
           });
-          await syncAbsencesForStudents(client, [studentId], schoolYearIds[index], true);
+          await syncAbsencesForStudents(client, [studentId], schoolYearIds[index], true, true);
         }
         for (let index = 0; index < schoolYearIds.length; index += 1) {
           const schoolYearId = schoolYearIds[index];
@@ -2322,12 +2475,11 @@ export async function reviewAttendanceRequestGroup(
               total: schoolYearIds.length,
             });
           };
-          if (detailSchoolYearIds.has(schoolYearId)) {
+          if (!context && detailSchoolYearIds.has(schoolYearId)) {
             await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [schoolYearId], report);
           } else {
             await refreshDerivedAttendanceResultsForStudentsWithClient(client, [schoolYearId], [studentId], report);
           }
-        }
         }
       }
 

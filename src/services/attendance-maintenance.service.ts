@@ -1,6 +1,6 @@
 import { savePreparedAttendanceFilesWithClient, saveAttendanceRowsWithClient, planCommittedImportMaintenance, finishCommittedImportMaintenance, type PreparedAttendanceFiles, type AttendanceBatchSaveResult } from "./attendance.service";
 import type { AttendanceImportProgress, SavedAttendanceImportResult, FineRecord } from "../database/model/schema.model";
-import { reviewAttendanceRequest, reviewAttendanceRequestGroup } from "./attendance-requests.service";
+import { reviewAttendanceRequest, reviewAttendanceRequestGroup, type AttendanceRequestReviewProgress } from "./attendance-requests.service";
 import type { PoolClient } from "pg";
 import type { MaintenanceJob } from "../database/model/schema.model";
 import { createEventCollegeExemptions, createEventYearLevelExemptions, deleteEventExemptionsByIds, saveManualAttendanceRecords, writeStudentEventAttendancesWithClient, planStudentEventRefreshKeys, planScopedStudentRefreshKeys, isMasterlistDerivedRefreshScope, prepareMasterlistDerivedRefresh, finishMasterlistDerivedRefresh, refreshAttendanceFinalResultsWithClient, refreshCalculationResultsWithClient, refreshPenaltyResultsForSchoolYearWithClient, repairCalculationConsistency, acknowledgeCalculationInputChangesWithClient, resolveUnattachedAttendanceEventIdsWithClient, getCalculationStatus, syncAbsencesForStudents, type MaintenanceRefreshScope, type StudentEventAttendanceChange } from "./attendance.service";
@@ -72,8 +72,12 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
           } });
         });state.fines=[];
       } else if(kind === "request_group_review") {
-        if(input.operation === "single") state.result=await reviewAttendanceRequest(input.requestId,job.created_by,input.body as Parameters<typeof reviewAttendanceRequest>[2],undefined,undefined,primary);
-        else state.result=await reviewAttendanceRequestGroup(job.created_by,input.body as Parameters<typeof reviewAttendanceRequestGroup>[1],undefined,undefined,primary);
+        const report = (progress: AttendanceRequestReviewProgress) => {
+          const stage = progress.stage === "syncing_absences" || progress.stage === "refreshing_final_results" || progress.stage === "refreshing_calculations" || progress.stage === "refreshing_penalties" || progress.stage === "finalizing" ? progress.stage : "reconciling_records";
+          onProgress?.({stage,percent:Math.min(24,Math.floor(progress.percent*0.24)),message:progress.message,processed:progress.completed,total:progress.total});
+        };
+        if(input.operation === "single") state.result=await reviewAttendanceRequest(input.requestId,job.created_by,input.body as Parameters<typeof reviewAttendanceRequest>[2],report,undefined,primary);
+        else state.result=await reviewAttendanceRequestGroup(job.created_by,input.body as Parameters<typeof reviewAttendanceRequestGroup>[1],report,undefined,primary);
       } else if(kind === "derived_refresh") {
         if(input.operation === "repair") {state.result=await repairCalculationConsistency({...options,actor:input.actor},primary);done=true;}
         else if(input.operation === "calculations") {
@@ -88,7 +92,7 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
         else throw validation("Invalid derived refresh operation.");
       } else throw validation("Unsupported saved operation.");
       phase=state.scopes.length ? (kind === "derived_refresh" && input.operation === "penalties" ? "refresh_penalties" : "sync_absences") : "finalize";
-      percent=25;message="Primary changes saved.";
+      percent=kind === "request_group_review" && !state.scopes.length ? 95 : 25;message="Primary changes saved.";
     } else if(phase === "finalize") {
       if(kind==="attendance_import_save"){
         const imports=input.operation==="files"?(state.result as AttendanceBatchSaveResult).files.flatMap(file=>file.result?[file.result]:[]):[state.result as SavedAttendanceImportResult];
