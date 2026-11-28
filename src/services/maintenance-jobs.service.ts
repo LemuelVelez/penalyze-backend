@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { setImmediate, setTimeout } from "node:timers/promises";
 import type { PoolClient } from "pg";
 import type { AttendanceImportProgress, MaintenanceJob } from "../database/model/schema.model";
-import { jobPool, withJobTransaction } from "../lib/db";
+import { jobPool, query, withJobTransaction } from "../lib/db";
 import { tryLockAttendanceAbsenceSync } from "./attendance.service";
 import { planMasterlistMaintenance, stepMasterlistMaintenance, smallerMasterlistRefreshCursor, reconciliationStage, type MasterlistProgress } from "./masterlist.service";
 
@@ -46,12 +46,12 @@ export async function createOrGetJob(kind: string, schoolYearId: string | null, 
   });
 }
 export async function getJob(id: string) {
-  const job = (await jobPool.query<MaintenanceJob>("SELECT * FROM maintenance_jobs WHERE id=$1",[id])).rows[0];
+  const job = (await query<MaintenanceJob>("SELECT * FROM maintenance_jobs WHERE id=$1",[id])).rows[0];
   if (!job) throw bad("Maintenance job not found.",404);
   return normalized(job);
 }
 export async function listJobs(filters: { kind?: string; schoolYearId?: string; open?: boolean } = {}) {
-  const {rows} = await jobPool.query<MaintenanceJob>(`SELECT *, CASE WHEN status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '5 minutes' THEN 'paused' ELSE status END AS status FROM maintenance_jobs WHERE ($1::text IS NULL OR kind=$1) AND ($2::uuid IS NULL OR school_year_id=$2) AND (NOT $3::boolean OR ${openStatus}) ORDER BY updated_at DESC`,[filters.kind ?? null,filters.schoolYearId ?? null,filters.open ?? false]);
+  const {rows} = await query<MaintenanceJob>(`SELECT *, CASE WHEN status='running' AND heartbeat_at < clock_timestamp() - INTERVAL '5 minutes' THEN 'paused' ELSE status END AS status FROM maintenance_jobs WHERE ($1::text IS NULL OR kind=$1) AND ($2::uuid IS NULL OR school_year_id=$2) AND (NOT $3::boolean OR ${openStatus}) ORDER BY updated_at DESC`,[filters.kind ?? null,filters.schoolYearId ?? null,filters.open ?? false]);
   return rows.map(normalized);
 }
 export async function claimJob(id: string) {

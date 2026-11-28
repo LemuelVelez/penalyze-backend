@@ -1,8 +1,8 @@
+import "dotenv/config";
 import * as maintenanceJobs from "./controller/maintenance-jobs.controller";
 import { recoverMaintenanceJobs } from "./services/maintenance-jobs.service";
 import { recoverApprovedAttendanceRequests } from "./services/attendance-requests.service";
 import * as masterlist from "./controller/masterlist.controller";
-import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
 import multer from "multer";
 import crypto from "crypto";
@@ -157,30 +157,41 @@ const attendanceBatchUpload = attendanceUpload.fields([
 
 const PORT = Number(process.env.PORT ?? 3000);
 const DEFAULT_FRONTEND_ORIGINS = ["http://localhost:5173", "http://localhost:8081"];
-function parseAllowedOrigins(): string[] {
-  const fromEnv = (process.env.FRONTEND_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
-  const list = process.env.NODE_ENV === "production" ? fromEnv : [...fromEnv, ...DEFAULT_FRONTEND_ORIGINS];
-  for (const origin of list) {
-    try {
-      const parsed = new URL(origin);
-      if (parsed.origin !== origin || (process.env.NODE_ENV === "production" && parsed.protocol !== "https:")) {
-        throw new Error("Invalid origin");
-      }
+function normalizeConfiguredOrigin(value: string): string {
+  try {
+    const parsed = new URL(value);
+    if (parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash ||
+      !["http:", "https:"].includes(parsed.protocol) ||
+      (process.env.NODE_ENV === "production" && parsed.protocol !== "https:")) {
+      throw new Error("Invalid origin");
     }
-    catch { throw new Error(`Invalid FRONTEND_ORIGINS entry: ${origin}`); }
+    return parsed.origin;
+  } catch {
+    throw new Error(`Invalid configured origin: ${value}`);
   }
+}
+function parseAllowedOrigins(): string[] {
+  const configured = process.env.FRONTEND_ORIGINS?.trim() ||
+    process.env.FRONTEND_URL?.trim() || process.env.Frontend_URL?.trim() || "";
+  const fromEnv = configured.split(",").map((value) => value.trim()).filter(Boolean);
+  const list = process.env.NODE_ENV === "production" ? fromEnv : [...fromEnv, ...DEFAULT_FRONTEND_ORIGINS];
   if (process.env.NODE_ENV === "production" && !list.length) {
     throw new Error("FRONTEND_ORIGINS must be configured explicitly in production.");
   }
-  return Array.from(new Set(list));
+  return Array.from(new Set(list.map(normalizeConfiguredOrigin)));
 }
 const ALLOWED_ORIGINS = parseAllowedOrigins();
-const API_ORIGIN = process.env.BACKEND_URL?.trim() || "";
+const configuredApiOrigin = process.env.BACKEND_URL?.trim() || process.env.Backend_URL?.trim() || "";
+let API_ORIGIN = "";
+if (configuredApiOrigin) {
+  try { API_ORIGIN = normalizeConfiguredOrigin(configuredApiOrigin); }
+  catch { console.warn("Ignoring an invalid backend origin for CORS."); }
+}
 
 app.use((req: Request, res: Response, next: NextFunction) => {
   const origin = req.get("origin") ?? "";
   const allowed = ALLOWED_ORIGINS.includes(origin) || (API_ORIGIN !== "" && origin === API_ORIGIN);
-  res.setHeader("Vary", "Origin");
+  res.vary("Origin");
   if (origin && !allowed) {
     res.status(403).json({ message: "Origin not allowed." });
     return;
@@ -201,6 +212,26 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   }
   next();
 });
+
+// Liveness must not depend on a busy database or an authenticated session.
+// Keep /api/health as the database readiness endpoint.
+app.get("/api/live", (_req: Request, res: Response) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ ok: true });
+});
+
+app.get(
+  "/api/health",
+  async (_req: Request, res: Response, next: NextFunction) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      await query("SELECT 1");
+      res.json({ ok: true });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 // Verify the cookie against the database before any large request body is parsed.
 app.use(attachAuthUser);
@@ -231,17 +262,7 @@ app.get("/", (_req: Request, res: Response) => {
   });
 });
 
-app.get(
-  "/api/health",
-  async (_req: Request, res: Response, next: NextFunction) => {
-    try {
-      await query("SELECT 1");
-      res.json({ ok: true });
-    } catch (error) {
-      next(error);
-    }
-  },
-);
+
 
 
 // Student record lookups are often performed from shared school networks. Keep
@@ -547,7 +568,8 @@ app.use((_req: Request, res: Response) => {
   res.status(404).json({ message: "Route not found." });
 });
 
-app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
+app.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) { next(error); return; }
   const requestId = crypto.randomUUID();
   const raw = error as { statusCode?: number; status?: number; message?: string; stack?: string; expose?: boolean; code?: string };
   const status = error instanceof multer.MulterError ? 400 : Number(raw?.statusCode ?? raw?.status ?? 500);
@@ -611,6 +633,17 @@ if (
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
   void recoverMaintenanceJobs()
-    .then(() => recoverApprovedAttendanceRequests())
-    .catch(error => console.error("Maintenance/approved attendance recovery failed:", error));
+    .catch(error => console.error("Maintenance recovery failed:", error));
+  // Historical repairs are low-priority. Never start overlapping sweeps or
+  // immediately compete with maintenance jobs as the API comes online.
+  const sweepApprovedAttendance = async () => {
+    try {
+      await recoverApprovedAttendanceRequests();
+    } catch (error) {
+      console.error("Approved attendance recovery failed:", error);
+    } finally {
+      setTimeout(() => { void sweepApprovedAttendance(); }, 60_000).unref();
+    }
+  };
+  setTimeout(() => { void sweepApprovedAttendance(); }, 60_000).unref();
 });

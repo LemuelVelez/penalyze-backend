@@ -21,7 +21,6 @@ import {
   normalizeCollegeKey,
   normalizeYearLevelKey,
   tryLockAttendanceAbsenceSync,
-  lockAttendanceAbsenceSync,
   listAttendanceAbsenceSyncLockHolders,
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
   refreshDerivedAttendanceResultsForStudentsWithClient,
@@ -1336,18 +1335,26 @@ function approvedAttendanceRepairCandidatesSql() {
   )`;
 }
 
+const ACTIVE_ATTENDANCE_JOB_SQL = `SELECT EXISTS (
+  SELECT 1 FROM maintenance_jobs WHERE status = 'running'
+    AND heartbeat_at >= clock_timestamp() - INTERVAL '5 minutes'
+) AS busy`;
+
 async function repairApprovedAttendanceScope(client: PoolClient, scope: ApprovedAttendanceRepairScope) {
-  await client.query("SET LOCAL lock_timeout = '60s'");
-  await lockAttendanceAbsenceSync(client);
+  // Background repair must never queue behind the attendance writer lock.
+  // Give interactive maintenance priority, including between its checkpoints.
+  const busy = await client.query<{ busy: boolean }>(ACTIVE_ATTENDANCE_JOB_SQL);
+  if (busy.rows[0]?.busy || !(await tryLockAttendanceAbsenceSync(client))) return false;
+  await client.query("SET LOCAL application_name = 'penalyze: approved attendance recovery'");
   const { rows } = await client.query<ApprovedAttendanceRepairEvent>(`${approvedAttendanceRepairCandidatesSql()} ORDER BY reviewed_at DESC`, [scope.school_year_id, scope.student_id]);
-  if (!rows.length) return;
+  if (!rows.length) return true;
 
   const masterlistActive = await isMasterlistActiveForSchoolYear(client, scope.school_year_id);
   const master = masterlistActive ? (await client.query<StudentMasterlistRecord>(
     `SELECT * FROM student_masterlist WHERE school_year_id = $1::uuid AND student_number_key = public.masterlist_student_number_key($2)`,
     [scope.school_year_id, scope.student_id],
   )).rows[0] : undefined;
-  if (masterlistActive && !master) return;
+  if (masterlistActive && !master) return true;
   const studentId = master?.student_number ?? scope.student_id;
   const savedProfile = !masterlistActive ? (await client.query<{ college: string | null; year_level: string | null }>(
     `SELECT college, year_level FROM attendance_final_results
@@ -1357,7 +1364,7 @@ async function repairApprovedAttendanceScope(client: PoolClient, scope: Approved
   )).rows[0] : undefined;
   const collegeKey = normalizeCollegeKey(master ? master.college : savedProfile?.college ?? rows[0].college);
   const yearLevelKey = normalizeYearLevelKey(master ? master.year_level : savedProfile?.year_level ?? rows[0].year_level);
-  if (!collegeKey || isPlaceholderStudentNumber(studentId)) return;
+  if (!collegeKey || isPlaceholderStudentNumber(studentId)) return true;
   const eventIds = rows.map((row) => row.event_id);
   const roster = await getRequestableEventIds(client, scope.school_year_id, studentId, collegeKey, eventIds, true);
   const eligible = await client.query<{ id: string }>(
@@ -1368,7 +1375,7 @@ async function repairApprovedAttendanceScope(client: PoolClient, scope: Approved
   );
   const eligibleIds = new Set(eligible.rows.map((event) => event.id));
   const repairable = rows.filter((row) => roster.has(row.event_id) && eligibleIds.has(row.event_id));
-  if (!repairable.length) return;
+  if (!repairable.length) return true;
   for (const row of repairable) {
     if (row.needs_confirmation) {
       await confirmApprovedEventAttendance(client, scope.school_year_id, studentId, row.event_id, row.reviewed_by);
@@ -1377,12 +1384,13 @@ async function repairApprovedAttendanceScope(client: PoolClient, scope: Approved
   await removeSupersededZeroAttendance(client, scope.school_year_id, studentId);
   await syncAbsencesForStudents(client, [studentId], scope.school_year_id, true, true);
   await refreshDerivedAttendanceResultsForStudentsWithClient(client, [scope.school_year_id], [studentId]);
+  return true;
 }
 
-// Run once on server startup, with a separate locked transaction per student
-// and semester. A failed repair never commits a partially recalculated student;
-// subsequent restarts can retry the same persisted candidates safely.
+// Retry persisted candidates on later sweeps rather than waiting for the lock.
 export async function recoverApprovedAttendanceRequests() {
+  const busy = await query<{ busy: boolean }>(ACTIVE_ATTENDANCE_JOB_SQL);
+  if (busy.rows[0]?.busy) return;
   const { rows } = await query<ApprovedAttendanceRepairScope>(
     `SELECT DISTINCT school_year_id, student_key AS student_id
      FROM (${approvedAttendanceRepairCandidatesSql()}) repair
@@ -1391,10 +1399,15 @@ export async function recoverApprovedAttendanceRequests() {
   );
   for (const scope of rows) {
     try {
-      await withJobTransaction((client) => repairApprovedAttendanceScope(client, scope));
+      const finished = await withJobTransaction((client) => repairApprovedAttendanceScope(client, scope));
+      if (!finished) return;
     } catch (error) {
       console.error("Approved attendance recovery failed for a student scope:", error);
+      const code = (error as { code?: string })?.code;
+      if (code === "55P03") return;
     }
+    // Release the transaction and leave a window for interactive work.
+    await new Promise<void>((resolve) => setTimeout(resolve, 2000));
   }
 }
 
