@@ -91,15 +91,22 @@ const PUBLIC_EVENT_FIELDS = new Set([
   "attended", "source", "record_id", "scanned_at", "remarks",
 ]);
 
+function redactApprovalRemark(field: string, value: unknown): unknown {
+  if ((field === "remarks" || field === "attendance_remarks") && typeof value === "string" &&
+      /^Approved attendance request\. Evidence:/i.test(value.trim())) return "Approved attendance request.";
+  return value;
+}
+
 function redactPersonal<T extends { name: string }>(record: T): T {
   const redacted: Record<string, unknown> = { name: "" };
   for (const [key, value] of Object.entries(record)) {
-    if (PUBLIC_RECORD_FIELDS.has(key)) redacted[key] = value;
+    if (PUBLIC_RECORD_FIELDS.has(key)) redacted[key] = redactApprovalRemark(key, value);
     if ((key === "missed_events" || key === "event_details") && Array.isArray(value)) {
       redacted[key] = value.map((item: unknown) => {
         if (!item || typeof item !== "object" || Array.isArray(item)) return null;
         return Object.fromEntries(
-          Object.entries(item).filter(([field]) => PUBLIC_EVENT_FIELDS.has(field)),
+          Object.entries(item).filter(([field]) => PUBLIC_EVENT_FIELDS.has(field))
+            .map(([field, fieldValue]) => [field, redactApprovalRemark(field, fieldValue)]),
         );
       }).filter(Boolean);
     }

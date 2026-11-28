@@ -2598,7 +2598,7 @@ const MANUAL_ATTENDANCE_EVENT_ROSTER_COLLEGE_SQL =
   getCanonicalCollegeKeySql("mar");
 // TC identifiers use the same expression as migration 044's functional indexes.
 // Other identifiers keep their original case-insensitive, trimmed semantics.
-function attendanceStudentKeySql(value: string) {
+export function attendanceStudentKeySql(value: string) {
   return `(CASE WHEN public.masterlist_student_number_key(${value}) ~ '^TC-[0-9]{2}-[A-Z]-[0-9]{5}$'
     THEN LOWER(public.masterlist_student_number_key(${value})) ELSE LOWER(TRIM(${value})) END)`;
 }
@@ -2636,7 +2636,7 @@ function canonicalStudentJoinSql(alias: string, studentId: string, schoolYear: s
 
 // A record is visible for audit even when its identity is unresolved. It must
 // never contribute to another student's attendance or fines.
-function resolvedAttendanceSourceSql(alias: string) {
+export function resolvedAttendanceSourceSql(alias: string) {
   return `(${alias}.masterlist_status IS DISTINCT FROM 'unmatched' AND (
     NOT ${hasMasterlistScopeSql(`${alias}.school_year_id`)} OR (
       ${alias}.masterlist_status IN ('matched_by_id', 'matched_by_partial_id', 'matched_by_name', 'id_name_mismatch')

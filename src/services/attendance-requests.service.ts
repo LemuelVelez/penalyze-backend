@@ -4,6 +4,7 @@ import type { PoolClient } from "pg";
 
 import type {
   AttendanceRequestEventRecord,
+  StudentMasterlistRecord,
   AttendanceRequestRecord,
   AttendanceRequestStatus,
   AttendanceRequestType,
@@ -12,6 +13,8 @@ import type {
 import { pool, query, withTransaction } from "../lib/db";
 import {
   attendanceEventRosterScopeCteSql,
+  attendanceStudentKeySql,
+  resolvedAttendanceSourceSql,
   applyExemptionsToPendingAttendanceRequests,
   getEventCollegeExemptionFilterSql,
   getEventYearLevelExemptionFilterSql,
@@ -318,6 +321,7 @@ async function getRequestableEventIds(
   studentId: string,
   collegeKey: string,
   eventIds: string[],
+  allowAlreadyAttended = false,
 ): Promise<Set<string>> {
   if (!eventIds.length) return new Set<string>();
   const result = await client.query<{ id: string }>(
@@ -326,12 +330,12 @@ async function getRequestableEventIds(
      FROM event_roster_scope roster
      LEFT JOIN attendance_student_event_overrides correction
        ON correction.school_year_id IS NOT DISTINCT FROM roster.school_year_id
-      AND correction.student_key = LOWER(TRIM($2))
+      AND ${attendanceStudentKeySql("correction.student_key")} = ${attendanceStudentKeySql("$2::text")}
       AND correction.event_id = roster.event_id
      WHERE roster.school_year_id = $1::uuid
        AND roster.college_key = $3::text
        AND roster.event_id = ANY($4::uuid[])
-       AND (
+       AND ($6::boolean OR
          (correction.id IS NOT NULL AND correction.attended = FALSE)
          OR (
            correction.id IS NULL
@@ -341,21 +345,23 @@ async function getRequestableEventIds(
                ON attended_import.id = attended_record.import_id
               AND attended_import.deleted_at IS NULL
              WHERE ${getAttendanceRecordVisibilitySql("attended_record")}
+               AND ${resolvedAttendanceSourceSql("attended_record")}
                AND attended_record.school_year_id = $1::uuid
-               AND LOWER(TRIM(attended_record.student_id)) = LOWER(TRIM($2))
+               AND ${attendanceStudentKeySql("attended_record.student_id")} = ${attendanceStudentKeySql("$2::text")}
                AND COALESCE(attended_record.event_id, attended_import.event_id) = roster.event_id
            )
            AND NOT EXISTS (
              SELECT 1 FROM manual_attendance_records attended_manual
              WHERE attended_manual.school_year_id = $1::uuid
-               AND LOWER(TRIM(attended_manual.student_id)) = LOWER(TRIM($2))
+               AND ${attendanceStudentKeySql("attended_manual.student_id")} = ${attendanceStudentKeySql("$2::text")}
+               AND ${resolvedAttendanceSourceSql("attended_manual")}
                AND attended_manual.event_id = roster.event_id
                AND COALESCE(attended_manual.attendance_type, 'manual') <> 'zero_attendance'
                AND LOWER(TRIM(COALESCE(attended_manual.remarks, ''))) <> LOWER($5::text)
            )
          )
        )`,
-    [schoolYearId, studentId, collegeKey, eventIds, ZERO_ATTENDANCE_REMARK],
+    [schoolYearId, studentId, collegeKey, eventIds, ZERO_ATTENDANCE_REMARK, allowAlreadyAttended],
   );
 
   return new Set(result.rows.map((row) => row.id));
@@ -1032,6 +1038,16 @@ export async function listAttendanceRequests(
   return result.rows;
 }
 
+async function getApprovalMasterlistStudent(client: PoolClient, request: AttendanceRequestRecord) {
+  if (!(await isMasterlistActiveForSchoolYear(client, request.school_year_id))) return null;
+  const { rows } = await client.query<StudentMasterlistRecord>(`
+    SELECT * FROM student_masterlist
+    WHERE school_year_id = $1 AND student_number_key = public.masterlist_student_number_key($2)
+  `, [request.school_year_id, request.student_id]);
+  if (!rows[0]) throw createHttpError("The student is not on this school year's masterlist. Resolve the student identity before approving.", 409);
+  return rows[0];
+}
+
 async function addApprovedManualAttendance(
   client: PoolClient,
   request: AttendanceRequestRecord,
@@ -1043,58 +1059,70 @@ async function addApprovedManualAttendance(
     total: number,
   ) => void,
 ) {
-  const studentId = cleanText(request.student_id);
-  const studentValues = [
-    studentId,
-    request.name,
-    request.year_level ?? "",
-    request.college ?? "",
-    request.program ?? "",
-    request.institution ?? "",
-  ];
-  const updatedStudent = await client.query(
-    `
-      UPDATE students
-      SET name = $2,
-          year_level = COALESCE(NULLIF($3, ''), year_level),
-          college = COALESCE(NULLIF($4, ''), college),
-          program = COALESCE(NULLIF($5, ''), program),
-          institution = COALESCE(NULLIF($6, ''), institution),
-          updated_at = NOW()
-      WHERE id = (
-        SELECT id
-        FROM students
-        WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
-        ORDER BY updated_at DESC, created_at DESC, id DESC
-        LIMIT 1
-      )
-    `,
-    studentValues,
-  );
-
-  if (!updatedStudent.rowCount) {
-    await client.query(
+  const master = await getApprovalMasterlistStudent(client, request);
+  const studentId = master?.student_number ?? cleanText(request.student_id);
+  const name = master ? master.full_name : request.name;
+  const yearLevel = master ? master.year_level : request.year_level;
+  const college = master ? master.college : request.college;
+  const program = master ? master.program : request.program;
+  const original = master ? {
+    studentId: request.student_id, name: request.name,
+    yearLevel: request.year_level ?? undefined, college: request.college ?? undefined,
+    program: request.program ?? undefined, reconciledStudentNumber: master.student_number,
+  } : null;
+  if (!master) {
+    const studentValues = [
+      studentId,
+      request.name,
+      request.year_level ?? "",
+      request.college ?? "",
+      request.program ?? "",
+      request.institution ?? "",
+    ];
+    const updatedStudent = await client.query(
       `
-        INSERT INTO students (
-          student_id,
-          name,
-          year_level,
-          college,
-          program,
-          institution
+        UPDATE students
+        SET name = $2,
+            year_level = COALESCE(NULLIF($3, ''), year_level),
+            college = COALESCE(NULLIF($4, ''), college),
+            program = COALESCE(NULLIF($5, ''), program),
+            institution = COALESCE(NULLIF($6, ''), institution),
+            updated_at = NOW()
+        WHERE id = (
+          SELECT id
+          FROM students
+          WHERE LOWER(TRIM(student_id)) = LOWER(TRIM($1))
+          ORDER BY updated_at DESC, created_at DESC, id DESC
+          LIMIT 1
         )
-        VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''))
-        ON CONFLICT ((LOWER(TRIM(student_id))))
-        DO UPDATE SET
-          name = EXCLUDED.name,
-          year_level = COALESCE(EXCLUDED.year_level, students.year_level),
-          college = COALESCE(EXCLUDED.college, students.college),
-          program = COALESCE(EXCLUDED.program, students.program),
-          institution = COALESCE(EXCLUDED.institution, students.institution),
-          updated_at = NOW()
       `,
       studentValues,
     );
+
+    if (!updatedStudent.rowCount) {
+      await client.query(
+        `
+          INSERT INTO students (
+            student_id,
+            name,
+            year_level,
+            college,
+            program,
+            institution
+          )
+          VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''))
+          ON CONFLICT ((LOWER(TRIM(student_id))))
+          DO UPDATE SET
+            name = EXCLUDED.name,
+            year_level = COALESCE(EXCLUDED.year_level, students.year_level),
+            college = COALESCE(EXCLUDED.college, students.college),
+            program = COALESCE(EXCLUDED.program, students.program),
+            institution = COALESCE(EXCLUDED.institution, students.institution),
+            updated_at = NOW()
+        `,
+        studentValues,
+      );
+    }
   }
 
   let createdAttendanceCount = 0;
@@ -1114,17 +1142,23 @@ async function addApprovedManualAttendance(
         SELECT EXISTS (
           SELECT 1
           FROM attendance_records ar
-          WHERE ar.event_id = $1
-            AND ar.deleted_at IS NULL
-            AND LOWER(TRIM(ar.student_id)) = LOWER(TRIM($2))
+          LEFT JOIN attendance_imports ai ON ai.id = ar.import_id AND ai.deleted_at IS NULL
+          WHERE ar.school_year_id = $3::uuid
+            AND COALESCE(ar.event_id, ai.event_id) = $1
+            AND ${getAttendanceRecordVisibilitySql("ar")}
+            AND ${resolvedAttendanceSourceSql("ar")}
+            AND ${attendanceStudentKeySql("ar.student_id")} = ${attendanceStudentKeySql("$2::text")}
           UNION ALL
           SELECT 1
           FROM manual_attendance_records mar
-          WHERE mar.event_id = $1
-            AND LOWER(TRIM(mar.student_id)) = LOWER(TRIM($2))
+          WHERE mar.school_year_id = $3::uuid AND mar.event_id = $1
+            AND ${resolvedAttendanceSourceSql("mar")}
+            AND ${attendanceStudentKeySql("mar.student_id")} = ${attendanceStudentKeySql("$2::text")}
+            AND COALESCE(mar.attendance_type, 'manual') <> 'zero_attendance'
+            AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER($4::text)
         ) AS exists
       `,
-      [event.event_id, studentId],
+      [event.event_id, studentId, request.school_year_id, ZERO_ATTENDANCE_REMARK],
     );
 
     // An explicit absent override takes precedence over source rows. An
@@ -1132,7 +1166,7 @@ async function addApprovedManualAttendance(
     await client.query(
       `UPDATE attendance_student_event_overrides
        SET attended = TRUE, updated_by = $4::uuid, updated_at = NOW()
-       WHERE school_year_id = $1::uuid AND student_key = LOWER(TRIM($2::text))
+       WHERE school_year_id = $1::uuid AND ${attendanceStudentKeySql("student_key")} = ${attendanceStudentKeySql("$2::text")}
          AND event_id = $3::uuid AND attended = FALSE`,
       [request.school_year_id, studentId, event.event_id, reviewerId],
     );
@@ -1152,20 +1186,24 @@ async function addApprovedManualAttendance(
           institution,
           no_of_absences,
           remarks,
-          scanned_at
+          scanned_at,
+          masterlist_original,
+          masterlist_status
         )
-        VALUES ($1, $2, 'manual', $3, $4, NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), 0, $9, NULL)
+        VALUES ($1, $2, 'manual', $3, $4, NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), 0, $9, NULL, $10::jsonb, $11)
       `,
       [
         request.school_year_id,
         event.event_id,
         studentId,
-        request.name,
-        request.year_level ?? "",
-        request.college ?? "",
-        request.program ?? "",
+        name,
+        yearLevel ?? "",
+        college ?? "",
+        program ?? "",
         request.institution ?? "",
-        `Approved attendance request. Evidence: ${event.evidence_url}`,
+        `Approved attendance request (${request.id}).`,
+        original ? JSON.stringify(original) : null,
+        master ? "matched_by_id" : null,
       ],
     );
     createdAttendanceCount += 1;
@@ -1177,7 +1215,7 @@ async function addApprovedManualAttendance(
       FROM manual_attendance_records
       WHERE school_year_id = $1
         AND attendance_type = 'zero_attendance'
-        AND LOWER(TRIM(student_id)) = LOWER(TRIM($2))
+        AND ${attendanceStudentKeySql("student_id")} = ${attendanceStudentKeySql("$2::text")}
     `,
     [request.school_year_id, studentId],
   );
@@ -1204,7 +1242,7 @@ async function addApprovedManualAttendance(
       WHERE school_year_id = $1
         AND deleted_at IS NULL
         AND event_id IS NULL
-        AND LOWER(TRIM(student_id)) = LOWER(TRIM($2))
+        AND ${attendanceStudentKeySql("student_id")} = ${attendanceStudentKeySql("$2::text")}
         AND remarks = $3
     `,
     [request.school_year_id, studentId, ZERO_ATTENDANCE_REMARK],
@@ -1284,6 +1322,7 @@ export type PublicStudentAttendanceRequestStatus = {
   status: AttendanceRequestStatus;
   review_note: string | null;
   review_note_access: boolean;
+  approved_events: Array<{ event_id: string | null; event_name: string }>;
   reviewed_at: string | null;
   created_at: string;
 };
@@ -1301,13 +1340,18 @@ export async function listPublicAttendanceRequestsForStudent(
     verifiedRequestIds.every((id) => isUuid(id)) ? verifiedRequestIds : [];
   if (!cleanStudentId && !receiptIds.length) return [];
 
-  // Student ID lookups expose request status and reviewer notes.
+  // Student ID lookups expose status, reviewer notes and approved event names only.
   // Evidence and other request details stay private.
   const result = await query<PublicStudentAttendanceRequestStatus>(`
     SELECT ar.id, ar.school_year_id, sy.name AS school_year_name,
       sy.semester, ar.request_type, ar.status,
       ar.review_note,
       TRUE AS review_note_access,
+      CASE WHEN ar.status = 'approved' AND ar.request_type = 'event_review' THEN
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('event_id', e.event_id, 'event_name', e.event_name)
+          ORDER BY e.created_at, e.event_name, e.id)
+          FROM attendance_request_events e WHERE e.request_id = ar.id), '[]'::jsonb)
+        ELSE '[]'::jsonb END AS approved_events,
       ar.reviewed_at, ar.created_at
     FROM attendance_requests ar
     JOIN school_years sy ON sy.id = ar.school_year_id
@@ -1325,6 +1369,7 @@ async function resolveRequestEventsForApproval(
   client: PoolClient,
   request: AttendanceRequestRecord,
 ) {
+  const master = await getApprovalMasterlistStudent(client, request);
   const eventResult = await client.query<AttendanceRequestEventWithSchoolYear>(
     `
       SELECT are.*, ae.school_year_id
@@ -1364,41 +1409,11 @@ async function resolveRequestEventsForApproval(
       [request.school_year_id, event.event_name],
     );
 
-    let resolvedEvent = matchingEvent.rows[0];
-
-    if (!resolvedEvent) {
-      const restoredEvent = await client.query<{
-        id: string;
-        school_year_id: string | null;
-      }>(
-        `
-          INSERT INTO attendance_events (
-            school_year_id,
-            name,
-            description,
-            event_order
-          )
-          SELECT
-            $1,
-            $2,
-            $3,
-            COALESCE(MAX(event_order), 0) + 1
-          FROM attendance_events
-          WHERE school_year_id = $1
-          RETURNING id, school_year_id
-        `,
-        [
-          request.school_year_id,
-          event.event_name,
-          "Restored automatically from a pending attendance review request.",
-        ],
-      );
-      resolvedEvent = restoredEvent.rows[0];
-    }
+    const resolvedEvent = matchingEvent.rows[0];
 
     if (!resolvedEvent) {
       throw createHttpError(
-        `Unable to restore the requested event “${event.event_name}”.`,
+        `Unable to find the requested event “${event.event_name}”.`,
         409,
       );
     }
@@ -1430,6 +1445,13 @@ async function resolveRequestEventsForApproval(
     });
   }
 
+  if (master && !normalizeCollegeKey(master.college)) {
+    throw createHttpError("The student's masterlist college is unresolved. Correct the masterlist before approving.", 409);
+  }
+  if (master) {
+    await client.query(`UPDATE attendance_requests SET college = $2, year_level = $3 WHERE id = $1`,
+      [request.id, master.college, master.year_level]);
+  }
   const applied = await applyExemptionsToPendingAttendanceRequests(client, {
     schoolYearId: request.school_year_id,
     requestIds: [request.id],
@@ -1442,7 +1464,8 @@ async function resolveRequestEventsForApproval(
     ORDER BY are.created_at, are.event_name
   `, [request.id]);
 
-  const collegeKey = normalizeCollegeKey(request.college);
+  const collegeKey = normalizeCollegeKey(master ? master.college : request.college);
+  if (!collegeKey && remaining.rows.length) throw createHttpError("The student's college is unresolved. Correct the student details before approving.", 409);
   if (collegeKey) {
     const ids = remaining.rows
       .map((event) => event.event_id)
@@ -1453,13 +1476,14 @@ async function resolveRequestEventsForApproval(
       request.student_id,
       collegeKey,
       ids,
+      true,
     );
     const invalidEvents = remaining.rows.filter(
       (event) => !event.event_id || !requestableIds.has(event.event_id),
     );
     if (invalidEvents.length) {
       throw createHttpError(
-        `These events are not counted as missed for this student's college and cannot be approved: ${invalidEvents.map((event) => event.event_name).join(", ")}. Remove them from the request, then approve again.`,
+        `These events are not required for this student's college and cannot be approved: ${invalidEvents.map((event) => event.event_name).join(", ")}. Remove them from the request, then approve again.`,
         409,
       );
     }
@@ -2176,8 +2200,7 @@ export async function reviewAttendanceRequestGroup(
       );
       rejectedCount = total;
     } else {
-      const deferredDetailYears = context || (events.length === 0 && zeroRequests.length === 0)
-        ? detailSchoolYearIds : undefined;
+      const deferredDetailYears = detailSchoolYearIds;
       for (let index = 0; index < details.length; index += 1) {
         const request = details[index];
         const completed = index + 1;

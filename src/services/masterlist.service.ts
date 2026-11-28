@@ -232,6 +232,37 @@ type ReconcileState = {
   refreshKeys?: string[];
 };
 type ReconcileCursor = { id?: string; tableIndex: number; offset?: number; refreshOffset?: number; refreshBatchSize?: number };
+// Older approvals omitted masterlist_status. Recover only persisted manual rows
+// that can be tied to an approved request, event and exact masterlist identity.
+// Never recreate deleted rows or override a later officer attendance correction.
+async function repairApprovedAttendanceSources(client: PoolClient, schoolYearId: string) {
+  const result = await client.query(`
+    UPDATE manual_attendance_records mar
+    SET student_id = ml.student_number, name = ml.full_name, college = ml.college,
+        program = ml.program, year_level = ml.year_level, masterlist_status = 'matched_by_id',
+        masterlist_original = COALESCE(mar.masterlist_original, jsonb_build_object(
+          'studentId', mar.student_id, 'name', mar.name, 'college', mar.college,
+          'program', mar.program, 'yearLevel', mar.year_level))
+          || jsonb_build_object('reconciledStudentNumber', ml.student_number),
+        updated_at = NOW()
+    FROM student_masterlist ml
+    WHERE mar.school_year_id = $1 AND ml.school_year_id = mar.school_year_id
+      AND ml.student_number_key = public.masterlist_student_number_key(mar.student_id)
+      AND mar.attendance_type = 'manual' AND mar.event_id IS NOT NULL
+      AND (mar.masterlist_status IS NULL OR mar.masterlist_status = 'no_masterlist')
+      AND EXISTS (
+        SELECT 1 FROM attendance_requests ar
+        JOIN attendance_request_events are ON are.request_id = ar.id AND are.event_id = mar.event_id
+        JOIN attendance_events ae ON ae.id = are.event_id AND ae.school_year_id = ar.school_year_id
+        WHERE ar.school_year_id = mar.school_year_id AND ar.status = 'approved'
+          AND ar.request_type = 'event_review'
+          AND public.masterlist_student_number_key(ar.student_id) = ml.student_number_key
+          AND mar.remarks = 'Approved attendance request. Evidence: ' || are.evidence_url
+      )
+  `, [schoolYearId]);
+  return result.rowCount ?? 0;
+}
+
 async function planReconciliation(client: PoolClient, schoolYear: SchoolYearRecord, cache: MasterlistCache = new Map()): Promise<ReconcileState> {
   const index = await loadMasterlist(client, schoolYear.id, cache);
   if (!index.rows.length) throw bad("Upload a masterlist before reconciling.");
@@ -292,6 +323,9 @@ async function reconcileStep(client: PoolClient, schoolYear: SchoolYearRecord, p
   } else if (phase.startsWith("reconcile:") || phase.startsWith("dedupe:")) {
     const table = scopedTables[cursor.tableIndex];
     if (!table) throw new Error("Invalid reconciliation table checkpoint.");
+    if (phase === "reconcile:manual_attendance_records" && !cursor.id) {
+      summary.recordsUpdated += await repairApprovedAttendanceSources(client, schoolYear.id);
+    }
     const full = profileTables.includes(table);
     const isSource = table === "attendance_records" || table === "manual_attendance_records";
     const isDerived = derivedTables.some(value => value === table);
