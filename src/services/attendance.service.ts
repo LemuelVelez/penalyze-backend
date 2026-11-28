@@ -76,7 +76,7 @@ export type UploadedAttendanceFile = {
 };
 
 type RawImportRow = Record<string, unknown>;
-export type MaintenanceRefreshScope = { schoolYearId: string | null; studentIds?: string[]; scopeFines?: boolean; skipRefresh?:boolean };
+export type MaintenanceRefreshScope = { schoolYearId: string | null; studentIds?: string[]; scopeFines?: boolean; skipRefresh?: boolean; studentKeysOnly?: boolean };
 export type MaintenancePrimaryContext = { client: PoolClient; defer: (scope: MaintenanceRefreshScope) => void };
 function primaryTransaction<T>(context: MaintenancePrimaryContext | undefined, work: (client: PoolClient) => Promise<T>) {
   return context ? work(context.client) : withTransaction(work);
@@ -2897,6 +2897,54 @@ export async function refreshDerivedAttendanceResultsForSchoolYearsWithClient(
 
     onProgress?.({ ...progressBase, stage: "refreshing_penalties" });
     await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId);
+  }
+}
+
+export async function refreshDerivedAttendanceResultsForStudentsWithClient(
+  client: PoolClient,
+  schoolYearIds: Array<string | null | undefined>,
+  studentIds: string[],
+  onProgress?: (progress: DerivedAttendanceRefreshProgress) => void,
+) {
+  const hasUnscopedSchoolYear = schoolYearIds.some(
+    (schoolYearId) => !cleanText(schoolYearId),
+  );
+  const scopes: Array<string | undefined> = hasUnscopedSchoolYear
+    ? [undefined]
+    : uniqueCleanTextValues(schoolYearIds).map((schoolYearId) => schoolYearId);
+
+  for (let scopeIndex = 0; scopeIndex < scopes.length; scopeIndex += 1) {
+    const schoolYearId = scopes[scopeIndex];
+    const progressBase = {
+      schoolYearId,
+      scopeIndex: scopeIndex + 1,
+      scopeTotal: scopes.length,
+    };
+    const keys = schoolYearId
+      ? await planScopedStudentRefreshKeys(client, schoolYearId, studentIds)
+      : null;
+
+    if (!schoolYearId || keys === null) {
+      await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+        client,
+        [schoolYearId],
+        (progress) => onProgress?.({ ...progress, ...progressBase }),
+      );
+      continue;
+    }
+
+    const opts = { schoolYearId, masterlistStudentKeys: keys, resolveUnattachedEvents: false, logConsistencyViolation: false };
+
+    onProgress?.({ ...progressBase, stage: "refreshing_final_results" });
+    await refreshAttendanceFinalResultsWithClient(client, opts);
+    await finishMasterlistDerivedRefresh(client, schoolYearId, "attendance_final_results");
+
+    onProgress?.({ ...progressBase, stage: "refreshing_calculations" });
+    await refreshCalculationResultsWithClient(client, opts);
+    await finishMasterlistDerivedRefresh(client, schoolYearId, "calculation_results");
+
+    onProgress?.({ ...progressBase, stage: "refreshing_penalties" });
+    await refreshPenaltyResultsForSchoolYearWithClient(client, schoolYearId, undefined, keys);
   }
 }
 
@@ -11981,6 +12029,18 @@ export async function planStudentEventRefreshKeys(
     if (!rows[0]?.unchanged) return prepareMasterlistDerivedRefresh(client, schoolYearId, false);
   }
   return [normalizeStudentNumberKey(studentId)];
+}
+
+// Request approvals cannot introduce a new college event (requestable events are
+// validated before approval), so only the approved students' derived rows change.
+export async function planScopedStudentRefreshKeys(
+  client: PoolClient,
+  schoolYearId: string,
+  studentIds: string[],
+): Promise<string[] | null> {
+  if (!(await isMasterlistDerivedRefreshScope(client, schoolYearId))) return null;
+  const keys = Array.from(new Set(studentIds.map((id) => normalizeStudentNumberKey(id)).filter(Boolean))).sort();
+  return keys.length ? keys : null;
 }
 
 export async function isMasterlistDerivedRefreshScope(client: PoolClient, schoolYearId: string) {

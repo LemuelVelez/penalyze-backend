@@ -3,7 +3,7 @@ import type { AttendanceImportProgress, SavedAttendanceImportResult, FineRecord 
 import { reviewAttendanceRequest, reviewAttendanceRequestGroup } from "./attendance-requests.service";
 import type { PoolClient } from "pg";
 import type { MaintenanceJob } from "../database/model/schema.model";
-import { createEventCollegeExemptions, createEventYearLevelExemptions, deleteEventExemptionsByIds, saveManualAttendanceRecords, writeStudentEventAttendancesWithClient, planStudentEventRefreshKeys, isMasterlistDerivedRefreshScope, prepareMasterlistDerivedRefresh, finishMasterlistDerivedRefresh, refreshAttendanceFinalResultsWithClient, refreshCalculationResultsWithClient, refreshPenaltyResultsForSchoolYearWithClient, repairCalculationConsistency, acknowledgeCalculationInputChangesWithClient, resolveUnattachedAttendanceEventIdsWithClient, getCalculationStatus, syncAbsencesForStudents, type MaintenanceRefreshScope, type StudentEventAttendanceChange } from "./attendance.service";
+import { createEventCollegeExemptions, createEventYearLevelExemptions, deleteEventExemptionsByIds, saveManualAttendanceRecords, writeStudentEventAttendancesWithClient, planStudentEventRefreshKeys, planScopedStudentRefreshKeys, isMasterlistDerivedRefreshScope, prepareMasterlistDerivedRefresh, finishMasterlistDerivedRefresh, refreshAttendanceFinalResultsWithClient, refreshCalculationResultsWithClient, refreshPenaltyResultsForSchoolYearWithClient, repairCalculationConsistency, acknowledgeCalculationInputChangesWithClient, resolveUnattachedAttendanceEventIdsWithClient, getCalculationStatus, syncAbsencesForStudents, type MaintenanceRefreshScope, type StudentEventAttendanceChange } from "./attendance.service";
 import type { JobHandler } from "./maintenance-jobs.service";
 
 type DerivedOptions = Parameters<typeof refreshCalculationResultsWithClient>[1] & {importId?:string};
@@ -124,6 +124,8 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
             const saved=state.result as Awaited<ReturnType<typeof writeStudentEventAttendancesWithClient>>;
             state.refreshKeys=await planStudentEventRefreshKeys(client,schoolYearId,saved.studentId,saved.changes.filter(change=>change.updated));
             delete state.refreshPlanPending;
+          } else if (kind === "request_group_review" && scope.studentKeysOnly && scope.studentIds?.length) {
+            state.refreshKeys = await planScopedStudentRefreshKeys(client, schoolYearId, scope.studentIds);
           } else {
             state.refreshKeys=await isMasterlistDerivedRefreshScope(client,schoolYearId)
               ? await prepareMasterlistDerivedRefresh(client,schoolYearId,["attendance_import_save","request_group_review"].includes(kind)) : null;

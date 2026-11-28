@@ -20,6 +20,7 @@ import {
   tryLockAttendanceAbsenceSync,
   listAttendanceAbsenceSyncLockHolders,
   refreshDerivedAttendanceResultsForSchoolYearsWithClient,
+  refreshDerivedAttendanceResultsForStudentsWithClient,
   syncAbsencesForStudents,
   type MaintenancePrimaryContext,
 } from "./attendance.service";
@@ -1868,11 +1869,11 @@ export async function reviewAttendanceRequest(
           stage: "syncing_absences", percent: 45,
           message: "Calculating the student's missed events and fines.",
         });
-        if(context)context.defer({schoolYearId:request.school_year_id,studentIds:[request.student_id],scopeFines:true});
+        if(context)context.defer({schoolYearId:request.school_year_id,studentIds:[request.student_id],scopeFines:true,studentKeysOnly:true});
         else {
         await syncAbsencesForStudents(client, [request.student_id], request.school_year_id, true);
-        await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
-          client, [request.school_year_id], (progress) => {
+        await refreshDerivedAttendanceResultsForStudentsWithClient(
+          client, [request.school_year_id], [request.student_id], (progress) => {
             const stages = {
               refreshing_final_results: 60,
               refreshing_calculations: 75,
@@ -1930,7 +1931,7 @@ export async function reviewAttendanceRequest(
           percent: 42,
           message: "Recalculating the student's absences.",
         });
-        if(context)context.defer({schoolYearId:request.school_year_id,studentIds:[request.student_id],scopeFines:true});
+        if(context)context.defer({schoolYearId:request.school_year_id,studentIds:[request.student_id],scopeFines:true,studentKeysOnly:true});
         else {
         await syncAbsencesForStudents(
           client,
@@ -1939,9 +1940,10 @@ export async function reviewAttendanceRequest(
           true,
         );
 
-        await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
+        await refreshDerivedAttendanceResultsForStudentsWithClient(
           client,
           [request.school_year_id],
+          [request.student_id],
           (progress) => {
             const progressMap = {
               refreshing_final_results: {
@@ -2154,6 +2156,7 @@ export async function reviewAttendanceRequestGroup(
     let removedExemptedEventCount = 0;
     const approvedIds: string[] = [];
     const approvedEventSchoolYearIds = new Set<string>();
+    const detailSchoolYearIds = new Set<string>();
 
     if (status === "rejected") {
       emit({
@@ -2174,7 +2177,7 @@ export async function reviewAttendanceRequestGroup(
       rejectedCount = total;
     } else {
       const deferredDetailYears = context || (events.length === 0 && zeroRequests.length === 0)
-        ? approvedEventSchoolYearIds : undefined;
+        ? detailSchoolYearIds : undefined;
       for (let index = 0; index < details.length; index += 1) {
         const request = details[index];
         const completed = index + 1;
@@ -2204,6 +2207,7 @@ export async function reviewAttendanceRequestGroup(
         removedExemptedEventCount += exemptions.eventsRemoved;
         approvedIds.push(request.id);
       }
+      for (const schoolYearId of detailSchoolYearIds) approvedEventSchoolYearIds.add(schoolYearId);
 
       for (const request of zeroRequests) {
         emit({
@@ -2267,7 +2271,7 @@ export async function reviewAttendanceRequestGroup(
       }
 
       if (approvedEventSchoolYearIds.size) {
-        if(context) for(const schoolYearId of approvedEventSchoolYearIds) context.defer({schoolYearId,studentIds:[studentId],scopeFines:true});
+        if(context) for(const schoolYearId of approvedEventSchoolYearIds) context.defer({schoolYearId,studentIds:[studentId],scopeFines:true,studentKeysOnly:!detailSchoolYearIds.has(schoolYearId)});
         else {
         const schoolYearIds = [...approvedEventSchoolYearIds];
         for (let index = 0; index < schoolYearIds.length; index += 1) {
@@ -2280,10 +2284,9 @@ export async function reviewAttendanceRequestGroup(
           });
           await syncAbsencesForStudents(client, [studentId], schoolYearIds[index], true);
         }
-        await refreshDerivedAttendanceResultsForSchoolYearsWithClient(
-          client,
-          schoolYearIds,
-          (progress) => {
+        for (let index = 0; index < schoolYearIds.length; index += 1) {
+          const schoolYearId = schoolYearIds[index];
+          const report: NonNullable<Parameters<typeof refreshDerivedAttendanceResultsForSchoolYearsWithClient>[2]> = (progress) => {
             const mapped = {
               refreshing_final_results: { percent: 72, message: "Refreshing final attendance results." },
               refreshing_calculations: { percent: 83, message: "Refreshing attendance calculations." },
@@ -2292,11 +2295,16 @@ export async function reviewAttendanceRequestGroup(
             emit({
               stage: progress.stage,
               ...mapped[progress.stage],
-              completed: progress.scopeIndex,
-              total: progress.scopeTotal,
+              completed: index + 1,
+              total: schoolYearIds.length,
             });
-          },
-        );
+          };
+          if (detailSchoolYearIds.has(schoolYearId)) {
+            await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [schoolYearId], report);
+          } else {
+            await refreshDerivedAttendanceResultsForStudentsWithClient(client, [schoolYearId], [studentId], report);
+          }
+        }
         }
       }
 
