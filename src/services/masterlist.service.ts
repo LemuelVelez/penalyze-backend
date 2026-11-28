@@ -5,7 +5,7 @@ import type { MasterlistStatus, SchoolYearRecord, StudentMasterlistRecord, Stude
 import { pool, withTransaction } from "../lib/db";
 import { getSchoolYearMetadataLabels, validateXlsxContainer, normalizeYearLevelKey, normalizeCollegeKey, lockAttendanceAbsenceSync, refreshDerivedAttendanceResultsForSchoolYearsWithClient, refreshAttendanceFinalResultsWithClient, refreshCalculationResultsWithClient, prepareMasterlistDerivedRefresh, finishMasterlistDerivedRefresh, refreshPenaltyResultsForSchoolYearWithClient, listAttendanceFinalResults, listFinalAttendanceEventRoster, syncAbsencesForStudents, attendanceEventRosterScopeCteSql, attendanceEventParticipationCteSql } from "./attendance.service";
 import { getAttendanceRecordVisibilitySql } from "./attendance-result-visibility";
-import { normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram, parseStudentNumberParts, isPlaceholderStudentNumber, nameTokens, nameTokensAgree, nameKeysAgree, sharedNameTokenCount, nameTokenSignatures, repairNameMojibake, surnameTokensOverlap, joinedGivenNamesAgree, masterlistNameMatchRank, masterlistNameSignatures, studentIdSimilarity, programInitials } from "./masterlist-normalize";
+import { normalizeAttendanceStudentKey, normalizeStudentNumberKey, normalizeNameKey, normalizeProgram, cleanProgram, collegeForProgram, parseStudentNumberParts, isPlaceholderStudentNumber, nameTokens, nameTokensAgree, nameKeysAgree, sharedNameTokenCount, nameTokenSignatures, repairNameMojibake, surnameTokensOverlap, joinedGivenNamesAgree, masterlistNameMatchRank, masterlistNameSignatures, studentIdSimilarity, programInitials } from "./masterlist-normalize";
 
 const bad = (message: string) => Object.assign(new Error(message), { statusCode: 400, expose: true });
 export type MasterlistProgress = {
@@ -276,7 +276,7 @@ async function planReconciliation(client: PoolClient, schoolYear: SchoolYearReco
 }
 async function absenceStudentIds(client: PoolClient, schoolYearId: string) {
   const rows = (await client.query<{ student_id: string }>(`SELECT student_number AS student_id FROM student_masterlist WHERE school_year_id=$1 UNION SELECT DISTINCT ar.student_id FROM attendance_records ar WHERE school_year_id=$1 AND ${getAttendanceRecordVisibilitySql("ar")} AND ar.masterlist_status IS DISTINCT FROM 'unmatched'`, [schoolYearId])).rows;
-  const ids = [...new Set<string>(rows.map(row => normalizeStudentNumberKey(row.student_id).toLowerCase()).filter(Boolean))];
+  const ids = [...new Set<string>(rows.map(row => normalizeAttendanceStudentKey(row.student_id)).filter(Boolean))];
   return ids.sort();
 }
 function reconciliationStage(phase: string): MasterlistProgress["stage"] {
@@ -575,7 +575,7 @@ export async function syncMasterlistAbsences(client: PoolClient, schoolYearId: s
   const emit = progressReporter(onProgress, isCancelled);
   emit({ stage: "syncing_absences", percent: 68, message: "Preparing absence synchronization…" });
   const rows = (await client.query<{ student_id: string }>(`SELECT student_number AS student_id FROM student_masterlist WHERE school_year_id=$1 UNION SELECT DISTINCT ar.student_id FROM attendance_records ar WHERE school_year_id=$1 AND ${getAttendanceRecordVisibilitySql("ar")} AND ar.masterlist_status IS DISTINCT FROM 'unmatched'`, [schoolYearId])).rows;
-  const ids = [...new Set<string>(rows.map(row => normalizeStudentNumberKey(row.student_id).toLowerCase()).filter(Boolean))];
+  const ids = [...new Set<string>(rows.map(row => normalizeAttendanceStudentKey(row.student_id)).filter(Boolean))];
   type SyncResult = Awaited<ReturnType<typeof syncAbsencesForStudents>>;
   const records = new Map<string, SyncResult["records"][number]>();
   const fines = new Map<string, SyncResult["fines"][number]>();
@@ -865,7 +865,7 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
     const start=f.offset ?? 0, end=start+(f.limit ?? 50);
     const pageMaster=exportAll ? filteredMaster : filteredMaster.slice(start,end);
     const pageFinals=exportAll ? filteredFinals : filteredFinals.slice(start,end);
-    const studentKeys=[...new Set(hasMasterlist ? pageMaster.map(r=>normalizeStudentNumberKey(r.student_number)) : pageFinals.map(r=>normalizeStudentNumberKey(r.student_id)))];
+    const studentKeys=[...new Set(hasMasterlist ? pageMaster.map(r=>normalizeAttendanceStudentKey(r.student_number)) : pageFinals.map(r=>normalizeAttendanceStudentKey(r.student_id)))];
     // Calculate the event/college roster once for the selected semester, and
     // reuse it for every page student (and every batch when exporting).
     const eventRosterScope=hasMasterlist || studentKeys.length
@@ -880,7 +880,7 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
         // Do not fetch stored final rows and repeat the per-student event scans.
         const observed = await client.query<{normalized_student_id:string;event_id:string}>(
           `WITH ${attendanceEventParticipationCteSql(true)} SELECT normalized_student_id,event_id FROM event_participation`,
-          [keys.map(key => key.toLowerCase()), schoolYear.id],
+          [keys, schoolYear.id],
         );
         for (const record of observed.rows) {
           const eventIds = participation.get(record.normalized_student_id) ?? new Set<string>();
@@ -906,7 +906,7 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
       const detail=new Map((final?.event_details ?? []).map(d=>[d.id,d]));
       for(const event of events) {
         const d=detail.get(event.id);
-        const observed=studentKey ? participation.get(normalizeStudentNumberKey(studentKey).toLowerCase())?.has(event.id) === true : false;
+        const observed=studentKey ? participation.get(normalizeAttendanceStudentKey(studentKey))?.has(event.id) === true : false;
         const applies=roster.has(`${c}|${event.id}`) || (!hasMasterlist && !!d) || observed;
         const exempt=exemptions.some(x=>x.event_id===event.id && (x.college_key===null || normalizeCollegeKey(x.college_key)===c) && (x.year_level_key===null || normalizeYearLevelKey(x.year_level_key)===y));
         if(exempt && (applies || (!!c && exemptions.some(x=>x.event_id===event.id && x.college_key!==null && normalizeCollegeKey(x.college_key)===c)))) values[event.id]="E";
@@ -917,7 +917,7 @@ export async function getFinalAttendance(f:MasterlistFilters, exportAll=false) {
       return values;
     }
     const rows:FinalRow[]=hasMasterlist ? pageMaster.map(m=>{
-      const event_details=eventValues(m,undefined,m.student_number_key);
+      const event_details=eventValues(m,undefined,m.student_number);
       const values=Object.values(event_details);
       const attended_events=values.filter(value=>value==="P").length;
       const total_absences=values.filter(value=>value==="A").length;

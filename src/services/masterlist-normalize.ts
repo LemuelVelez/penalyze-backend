@@ -10,6 +10,16 @@ export function normalizeStudentNumberKey(value: unknown): string {
     : text.replace(/[^A-Z0-9-]/g, "");
 }
 
+// Mirrors attendanceStudentKeySql and the current SQL masterlist function
+// (migration 048). Only canonical TC IDs use the masterlist normalization;
+// all other attendance IDs retain their characters and internal whitespace.
+export function normalizeAttendanceStudentKey(value: unknown): string {
+  const raw = String(value ?? "");
+  const key = normalizeStudentNumberKey(raw);
+  return /^TC-[0-9]{2}-[A-Z]-[0-9]{5}$/.test(key)
+    ? key.toLowerCase() : raw.replace(/^ +| +$/g, "").toLowerCase();
+}
+
 export type StudentNumberParts = { year?: string; letter?: string; serial: string };
 function rawStudentNumberParts(value: unknown): StudentNumberParts | null {
   const text = cleanStudentNumber(value);

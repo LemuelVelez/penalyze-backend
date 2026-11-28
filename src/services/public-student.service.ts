@@ -1,4 +1,4 @@
-import { isPlaceholderStudentNumber, normalizeStudentNumberKey, placeholderStudentNumberMessage } from "./masterlist-normalize";
+import { isPlaceholderStudentNumber, normalizeAttendanceStudentKey, placeholderStudentNumberMessage } from "./masterlist-normalize";
 import { getMasterlistStatus } from "./masterlist.service";
 import type { AttendanceFinalResultRecord, AttendanceRecord } from "../database/model/schema.model";
 import { query } from "../lib/db";
@@ -67,7 +67,20 @@ async function attachFinalResultEventDetails(
   }
   return rows.map((row) => {
     const details = detailsById.get(String(row.id));
-    return details ? { ...row, ...details } : row;
+    if (!details) return row;
+    if (!Array.isArray(details.event_details)) return { ...row, ...details };
+    const eventDetails = details.event_details;
+    const missedEvents = eventDetails.filter((event) => !event.attended);
+    const attendedEvents = eventDetails.length - missedEvents.length;
+    return {
+      ...row, ...details,
+      missed_events: missedEvents,
+      attended_events: attendedEvents,
+      expected_events: eventDetails.length,
+      total_absences: missedEvents.length,
+      attendance_status: !row.college_key ? "unresolved_college"
+        : eventDetails.length > 0 && missedEvents.length === 0 ? "perfect_attendance" : "with_absences",
+    };
   });
 }
 
@@ -170,7 +183,7 @@ async function listCollegeEventStubs(college: string, schoolYearIds: string[]): 
 
 export async function getPublicStudentRecords(studentId: string, onProgress?: ProgressCallback) {
   if (!/^[A-Za-z0-9-]{4,36}$/.test(studentId.trim())) throw Object.assign(new Error("Enter a valid Student ID."), { statusCode: 400 });
-  const cleanStudentId = normalizeStudentNumberKey(studentId);
+  const cleanStudentId = normalizeAttendanceStudentKey(studentId);
   if (isPlaceholderStudentNumber(cleanStudentId)) throw Object.assign(new Error(placeholderStudentNumberMessage(studentId.trim())), { statusCode: 400 });
   if (!/^[A-Za-z0-9-]{4,36}$/.test(cleanStudentId)) {
     throw Object.assign(new Error("Enter a valid Student ID."), { statusCode: 400 });

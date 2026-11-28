@@ -1,4 +1,4 @@
-import { isPlaceholderStudentNumber, normalizeStudentNumberKey, placeholderStudentNumberMessage } from "./masterlist-normalize";
+import { isPlaceholderStudentNumber, normalizeAttendanceStudentKey, normalizeStudentNumberKey, placeholderStudentNumberMessage } from "./masterlist-normalize";
 import { isMasterlistActiveForSchoolYear, masterlistActiveError, ZERO_ATTENDANCE_MASTERLIST_MESSAGE } from "./masterlist.service";
 import type { PoolClient } from "pg";
 
@@ -1233,7 +1233,7 @@ async function addApprovedManualAttendance(
 
   await removeSupersededZeroAttendance(client, request.school_year_id, studentId);
 
-  return createdAttendanceCount;
+  return { createdAttendanceCount, studentId };
 }
 
 
@@ -1297,16 +1297,21 @@ function approvedAttendanceRepairCandidatesSql() {
   return `WITH latest_approvals AS (
     SELECT DISTINCT ON (ar.school_year_id, ${attendanceStudentKeySql("ar.student_id")}, are.event_id)
       ar.school_year_id, ${attendanceStudentKeySql("ar.student_id")} AS student_key,
-      ar.student_id, are.event_id, ar.college, ar.year_level, ar.reviewed_by, ar.reviewed_at
+      ar.student_id, are.event_id, ar.college, ar.year_level, ar.reviewed_by, COALESCE(ar.reviewed_at, ar.updated_at) AS reviewed_at
     FROM attendance_requests ar
     JOIN attendance_request_events are ON are.request_id = ar.id
     JOIN attendance_events ae ON ae.id = are.event_id AND ae.school_year_id = ar.school_year_id
-    WHERE ar.status = 'approved' AND ar.request_type = 'event_review' AND ar.reviewed_at IS NOT NULL
+    WHERE ar.status = 'approved' AND ar.request_type = 'event_review'
       AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
       AND ($2::text IS NULL OR ${attendanceStudentKeySql("ar.student_id")} = ${attendanceStudentKeySql("$2::text")})
-    ORDER BY ar.school_year_id, ${attendanceStudentKeySql("ar.student_id")}, are.event_id, ar.reviewed_at DESC, ar.id DESC
+    ORDER BY ar.school_year_id, ${attendanceStudentKeySql("ar.student_id")}, are.event_id, COALESCE(ar.reviewed_at, ar.updated_at) DESC, ar.id DESC
   ), candidates AS (
     SELECT approval.*,
+      GREATEST(approval.reviewed_at, (
+        SELECT MAX(o.updated_at) FROM attendance_student_event_overrides o
+        WHERE o.school_year_id = approval.school_year_id AND o.event_id = approval.event_id
+          AND ${attendanceStudentKeySql("o.student_key")} = approval.student_key AND o.attended = TRUE
+      )) AS refresh_after,
       NOT EXISTS (
         SELECT 1 FROM attendance_student_event_overrides o
         WHERE o.school_year_id = approval.school_year_id AND o.event_id = approval.event_id
@@ -1327,11 +1332,11 @@ function approvedAttendanceRepairCandidatesSql() {
   WHERE c.needs_confirmation OR NOT EXISTS (
     SELECT 1 FROM attendance_final_results afr
     WHERE afr.school_year_id = c.school_year_id AND afr.import_id IS NULL
-      AND ${attendanceStudentKeySql("afr.student_id")} = c.student_key AND afr.updated_at >= c.reviewed_at
+      AND ${attendanceStudentKeySql("afr.student_id")} = c.student_key AND afr.updated_at >= c.refresh_after
   ) OR NOT EXISTS (
     SELECT 1 FROM calculation_results cr
-    WHERE cr.school_year_id = c.school_year_id
-      AND ${attendanceStudentKeySql("cr.student_id")} = c.student_key AND cr.calculated_at >= c.reviewed_at
+    WHERE cr.school_year_id = c.school_year_id AND cr.calculation_scope_key = 'school_year'
+      AND ${attendanceStudentKeySql("cr.student_id")} = c.student_key AND cr.calculated_at >= c.refresh_after
   )`;
 }
 
@@ -1354,7 +1359,12 @@ async function repairApprovedAttendanceScope(client: PoolClient, scope: Approved
     `SELECT * FROM student_masterlist WHERE school_year_id = $1::uuid AND student_number_key = public.masterlist_student_number_key($2)`,
     [scope.school_year_id, scope.student_id],
   )).rows[0] : undefined;
-  if (masterlistActive && !master) return true;
+  const warnSkipped = (reason: string, eventId: string) =>
+    console.warn("Approved attendance recovery skipped:", { reason, ...scope, event_id: eventId });
+  if (masterlistActive && !master) {
+    for (const row of rows) warnSkipped("student not found on active masterlist", row.event_id);
+    return true;
+  }
   const studentId = master?.student_number ?? scope.student_id;
   const savedProfile = !masterlistActive ? (await client.query<{ college: string | null; year_level: string | null }>(
     `SELECT college, year_level FROM attendance_final_results
@@ -1364,7 +1374,10 @@ async function repairApprovedAttendanceScope(client: PoolClient, scope: Approved
   )).rows[0] : undefined;
   const collegeKey = normalizeCollegeKey(master ? master.college : savedProfile?.college ?? rows[0].college);
   const yearLevelKey = normalizeYearLevelKey(master ? master.year_level : savedProfile?.year_level ?? rows[0].year_level);
-  if (!collegeKey || isPlaceholderStudentNumber(studentId)) return true;
+  if (!collegeKey || isPlaceholderStudentNumber(studentId)) {
+    for (const row of rows) warnSkipped(!collegeKey ? "college unresolved" : "placeholder student ID", row.event_id);
+    return true;
+  }
   const eventIds = rows.map((row) => row.event_id);
   const roster = await getRequestableEventIds(client, scope.school_year_id, studentId, collegeKey, eventIds, true);
   const eligible = await client.query<{ id: string }>(
@@ -1374,7 +1387,17 @@ async function repairApprovedAttendanceScope(client: PoolClient, scope: Approved
     [scope.school_year_id, eventIds, collegeKey, yearLevelKey],
   );
   const eligibleIds = new Set(eligible.rows.map((event) => event.id));
-  const repairable = rows.filter((row) => roster.has(row.event_id) && eligibleIds.has(row.event_id));
+  const repairable = rows.filter((row) => {
+    if (!eligibleIds.has(row.event_id)) {
+      warnSkipped("event exempt or unavailable in school year", row.event_id);
+      return false;
+    }
+    if (!roster.has(row.event_id)) {
+      warnSkipped("event not in student college roster", row.event_id);
+      return false;
+    }
+    return true;
+  });
   if (!repairable.length) return true;
   for (const row of repairable) {
     if (row.needs_confirmation) {
@@ -1382,8 +1405,9 @@ async function repairApprovedAttendanceScope(client: PoolClient, scope: Approved
     }
   }
   await removeSupersededZeroAttendance(client, scope.school_year_id, studentId);
-  await syncAbsencesForStudents(client, [studentId], scope.school_year_id, true, true);
-  await refreshDerivedAttendanceResultsForStudentsWithClient(client, [scope.school_year_id], [studentId]);
+  const refreshStudentIds = [...new Set([scope.student_id, studentId])];
+  await syncAbsencesForStudents(client, refreshStudentIds, scope.school_year_id, true, true);
+  await refreshDerivedAttendanceResultsForStudentsWithClient(client, [scope.school_year_id], refreshStudentIds);
   return true;
 }
 
@@ -1422,7 +1446,7 @@ export type PublicStudentLookup = {
 
 export async function lookupPublicStudentById(studentId: string): Promise<PublicStudentLookup | null> {
   if (!/^[A-Za-z0-9-]{4,36}$/.test(studentId.trim())) return null;
-  const id = normalizeStudentNumberKey(studentId);
+  const id = normalizeAttendanceStudentKey(studentId);
   if (isPlaceholderStudentNumber(id)) return null;
 
   // Select only the four approved profile fields. Prefer the maintained student
@@ -1442,14 +1466,14 @@ export async function lookupPublicStudentById(studentId: string): Promise<Public
       SELECT student_id, NULLIF(TRIM(program), '') AS course,
         NULLIF(TRIM(year_level), '') AS year_level,
         NULLIF(TRIM(college), '') AS college, 0 AS priority, updated_at
-      FROM students WHERE public.masterlist_student_number_key(student_id) = public.masterlist_student_number_key($1)
-      AND NOT EXISTS (SELECT 1 FROM attendance_records a WHERE public.masterlist_student_number_key(a.student_id)=public.masterlist_student_number_key($1) AND a.masterlist_status='unmatched' AND public.is_masterlist_school_year(a.school_year_id)
-        UNION ALL SELECT 1 FROM manual_attendance_records a WHERE public.masterlist_student_number_key(a.student_id)=public.masterlist_student_number_key($1) AND a.masterlist_status='unmatched' AND public.is_masterlist_school_year(a.school_year_id))
+      FROM students WHERE ${attendanceStudentKeySql("student_id")} = $1::text
+      AND NOT EXISTS (SELECT 1 FROM attendance_records a WHERE ${attendanceStudentKeySql("a.student_id")} = $1::text AND a.masterlist_status='unmatched' AND public.is_masterlist_school_year(a.school_year_id)
+        UNION ALL SELECT 1 FROM manual_attendance_records a WHERE ${attendanceStudentKeySql("a.student_id")} = $1::text AND a.masterlist_status='unmatched' AND public.is_masterlist_school_year(a.school_year_id))
       UNION ALL
       SELECT student_id, NULLIF(TRIM(program), ''),
         NULLIF(TRIM(year_level), ''), NULLIF(TRIM(college), ''), 1, updated_at
       FROM attendance_records ar
-      WHERE public.masterlist_student_number_key(student_id) = public.masterlist_student_number_key($1) AND ${getAttendanceRecordVisibilitySql("ar")}
+      WHERE ${attendanceStudentKeySql("student_id")} = $1::text AND ${getAttendanceRecordVisibilitySql("ar")}
       AND NOT (COALESCE(masterlist_status, '')='unmatched' AND public.is_masterlist_school_year(school_year_id))
     ) profiles
     ORDER BY priority, updated_at DESC
@@ -1460,7 +1484,7 @@ export async function lookupPublicStudentById(studentId: string): Promise<Public
 
   const latest = await query<{ status: AttendanceRequestStatus }>(`
     SELECT status FROM attendance_requests
-    WHERE public.masterlist_student_number_key(student_id) = public.masterlist_student_number_key($1)
+    WHERE ${attendanceStudentKeySql("student_id")} = $1::text
     ORDER BY created_at DESC, id DESC LIMIT 1
   `, [id]);
   return {
@@ -2090,7 +2114,7 @@ export async function reviewAttendanceRequest(
           };
         }
 
-        createdAttendanceCount = await addApprovedManualAttendance(
+        const approvedAttendance = await addApprovedManualAttendance(
           client,
           request,
           resolved.events,
@@ -2109,6 +2133,9 @@ export async function reviewAttendanceRequest(
           },
         );
 
+        createdAttendanceCount = approvedAttendance.createdAttendanceCount;
+        const refreshStudentIds = [...new Set([request.student_id, approvedAttendance.studentId])];
+
         emit({
           stage: "syncing_absences",
           percent: 42,
@@ -2117,7 +2144,7 @@ export async function reviewAttendanceRequest(
         // Commit the approved status only after its attendance and fines are current.
         await syncAbsencesForStudents(
           client,
-          [request.student_id],
+          refreshStudentIds,
           request.school_year_id,
           true,
           true,
@@ -2126,7 +2153,7 @@ export async function reviewAttendanceRequest(
         await refreshDerivedAttendanceResultsForStudentsWithClient(
           client,
           [request.school_year_id],
-          [request.student_id],
+          refreshStudentIds,
           (progress) => {
             const progressMap = {
               refreshing_final_results: {
@@ -2340,6 +2367,13 @@ export async function reviewAttendanceRequestGroup(
     const approvedEventSchoolYearIds = new Set<string>();
     const detailSchoolYearIds = new Set<string>();
     const eventApprovalYears = new Set<string>();
+    const refreshIdsByYear = new Map<string, Set<string>>();
+    const addRefreshIds = (schoolYearId: string, ...ids: string[]) => {
+      const keys = refreshIdsByYear.get(schoolYearId) ?? new Set<string>([studentId]);
+      ids.forEach((id) => keys.add(id));
+      refreshIdsByYear.set(schoolYearId, keys);
+    };
+    const refreshIdsForYear = (schoolYearId: string) => [...(refreshIdsByYear.get(schoolYearId) ?? new Set([studentId]))];
 
     if (status === "rejected") {
       emit({
@@ -2435,7 +2469,7 @@ export async function reviewAttendanceRequestGroup(
           autoClosedCount += 1;
           continue;
         }
-        createdAttendanceCount += await addApprovedManualAttendance(
+        const approvedAttendance = await addApprovedManualAttendance(
           client,
           request,
           resolved.events,
@@ -2448,6 +2482,8 @@ export async function reviewAttendanceRequestGroup(
             total,
           }),
         );
+        createdAttendanceCount += approvedAttendance.createdAttendanceCount;
+        addRefreshIds(request.school_year_id, request.student_id, approvedAttendance.studentId);
         approvedIds.push(request.id);
         approvedEventSchoolYearIds.add(request.school_year_id);
         eventApprovalYears.add(request.school_year_id);
@@ -2459,7 +2495,7 @@ export async function reviewAttendanceRequestGroup(
         const schoolYearIds = [...approvedEventSchoolYearIds].filter((schoolYearId) => {
           const hasEvents = eventApprovalYears.has(schoolYearId);
           if (context && (!hasEvents || detailSchoolYearIds.has(schoolYearId))) {
-            context.defer({ schoolYearId, studentIds: [studentId], scopeFines: true, studentKeysOnly: !detailSchoolYearIds.has(schoolYearId) });
+            context.defer({ schoolYearId, studentIds: refreshIdsForYear(schoolYearId), scopeFines: true, studentKeysOnly: !detailSchoolYearIds.has(schoolYearId) });
           }
           return !context || hasEvents;
         });
@@ -2471,7 +2507,7 @@ export async function reviewAttendanceRequestGroup(
             completed: approvedIds.length,
             total,
           });
-          await syncAbsencesForStudents(client, [studentId], schoolYearIds[index], true, true);
+          await syncAbsencesForStudents(client, refreshIdsForYear(schoolYearIds[index]), schoolYearIds[index], true, true);
         }
         for (let index = 0; index < schoolYearIds.length; index += 1) {
           const schoolYearId = schoolYearIds[index];
@@ -2491,7 +2527,7 @@ export async function reviewAttendanceRequestGroup(
           if (!context && detailSchoolYearIds.has(schoolYearId)) {
             await refreshDerivedAttendanceResultsForSchoolYearsWithClient(client, [schoolYearId], report);
           } else {
-            await refreshDerivedAttendanceResultsForStudentsWithClient(client, [schoolYearId], [studentId], report);
+            await refreshDerivedAttendanceResultsForStudentsWithClient(client, [schoolYearId], refreshIdsForYear(schoolYearId), report);
           }
         }
       }

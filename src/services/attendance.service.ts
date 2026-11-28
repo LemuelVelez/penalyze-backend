@@ -1,4 +1,4 @@
-import { isPlaceholderStudentNumber, normalizeNameKey, normalizeStudentNumberKey } from "./masterlist-normalize";
+import { isPlaceholderStudentNumber, normalizeNameKey, normalizeAttendanceStudentKey, normalizeStudentNumberKey } from "./masterlist-normalize";
 import { applyMasterlistReconciliation, reconcileAttendanceRow, resolveStudentAgainstMasterlist, upsertMasterlistStudent, reconcileMasterlistForAttendanceUpload, loadMasterlist, syncMasterlistAbsences, type MasterlistCache, type MasterlistProgress } from "./masterlist.service";
 import path from "path";
 import { createHash } from "crypto";
@@ -2573,10 +2573,18 @@ export function getResolvedStudentYearLevelKeySql(
     (
       SELECT ${fallbackKey}
       FROM students year_scope_student
-      WHERE LOWER(TRIM(year_scope_student.student_id)) = LOWER(TRIM(${studentIdExpr}))
+      WHERE ${attendanceStudentIdsEqualSql("year_scope_student.student_id", studentIdExpr)}
       ORDER BY year_scope_student.updated_at DESC, year_scope_student.created_at DESC, year_scope_student.id DESC
       LIMIT 1
-    )
+    ),
+    (SELECT ${getYearLevelKeySql("approved.year_level")} FROM attendance_requests approved
+      WHERE approved.school_year_id IS NOT DISTINCT FROM ${schoolYearIdExpr}
+        AND approved.status = 'approved' AND approved.request_type = 'event_review'
+        AND ${attendanceStudentIdsEqualSql("approved.student_id", studentIdExpr)}
+        AND EXISTS (SELECT 1 FROM attendance_student_event_overrides o
+          WHERE o.school_year_id = approved.school_year_id
+            AND ${attendanceStudentIdsEqualSql("o.student_key", "approved.student_id")})
+      ORDER BY approved.reviewed_at DESC NULLS LAST, approved.id DESC LIMIT 1)
   )`;
   return masterlistProfileSql(studentIdExpr, schoolYearIdExpr, "year_level_key", fallback);
 }
@@ -2729,6 +2737,7 @@ export function attendanceEventParticipationCteSql(scoped = false) {
       ${attendanceStudentKeySql("correction.student_key")} AS normalized_student_id
     FROM attendance_student_event_overrides correction
     WHERE correction.attended = TRUE
+      AND ${getStudentEventOverrideExclusionSql("correction.school_year_id", "correction.student_key", "correction.event_id")}
       AND (NOT ${hasMasterlistScopeSql("correction.school_year_id")} OR EXISTS (
         SELECT 1 FROM student_masterlist override_ml
         WHERE override_ml.school_year_id = correction.school_year_id
@@ -3189,10 +3198,7 @@ export async function syncAbsencesForStudents(
   const uniqueStudentIds = Array.from(
     new Set(
       studentIds
-        .map((studentId) => {
-          const key = normalizeStudentNumberKey(studentId);
-          return /^TC-\d{2}-[A-Z]-\d{5}$/.test(key) ? key.toLowerCase() : cleanText(studentId).toLowerCase();
-        })
+        .map(normalizeAttendanceStudentKey)
         .filter(Boolean),
     ),
   );
@@ -3335,7 +3341,7 @@ export async function syncAbsencesForStudents(
 
   records.forEach((record) => {
     const scopeKey = [
-      cleanText(record.student_id).toLowerCase(),
+      normalizeAttendanceStudentKey(record.student_id),
       cleanText(record.attendance_event_roster_college_key),
       cleanText(record.attendance_school_year_id),
     ].join(":");
@@ -7563,8 +7569,8 @@ export async function listAttendanceRecords(
 
   if (excludeUnresolved) clauses.push(`NOT (COALESCE(ar.masterlist_status, '') = 'unmatched' AND public.is_masterlist_school_year(ar.school_year_id))`);
   if (studentId) {
-    params.push(studentId);
-    clauses.push(/^TC-\d{2}-[A-Z]-\d{5}$/.test(normalizeStudentNumberKey(studentId)) ? `public.masterlist_student_number_key(ar.student_id) = public.masterlist_student_number_key($${params.length}::text)` : `LOWER(TRIM(ar.student_id)) = LOWER(TRIM($${params.length}))`);
+    params.push(normalizeAttendanceStudentKey(studentId));
+    clauses.push(`${attendanceStudentKeySql("ar.student_id")} = $${params.length}::text`);
   }
 
   if (eventId) {
@@ -8185,7 +8191,8 @@ function getStudentEventScopeCteSql(keysCte: "selected_student_keys" | "student_
           THEN colleges.college_key
         ELSE NULL
       END AS college_key,
-      resolved_year_level.year_level_key
+      COALESCE(resolved_year_level.year_level_key,
+        ${getResolvedStudentYearLevelKeySql("keys.normalized_student_id", "keys.school_year_id")}) AS year_level_key
     FROM ${keysCte} keys
     LEFT JOIN student_masterlist scoped_master ON scoped_master.school_year_id=keys.school_year_id AND public.is_masterlist_school_year(scoped_master.school_year_id) AND scoped_master.student_number_key=public.masterlist_student_number_key(keys.normalized_student_id)
     LEFT JOIN canonical_students s
@@ -8329,6 +8336,7 @@ export function getDenominatorEventScopeCtesSql() {
           ${scopedAttendanceStudentKeySql("correction.student_key", "correction.school_year_id")} AS normalized_student_id
         FROM attendance_student_event_overrides correction
         WHERE correction.attended = TRUE
+      AND ${getStudentEventOverrideExclusionSql("correction.school_year_id", "correction.student_key", "correction.event_id")}
       AND (NOT ${hasMasterlistScopeSql("correction.school_year_id")} OR EXISTS (
         SELECT 1 FROM student_masterlist override_ml
         WHERE override_ml.school_year_id = correction.school_year_id
@@ -8436,7 +8444,7 @@ function masterlistRosterSourcesSql(schoolYearParam: string, eventIdsParam?: str
       AND LOWER(TRIM(COALESCE(mar.remarks, ''))) <> LOWER('${ZERO_ATTENDANCE_REMARK.replace("'", "''")}')
       AND ${getEventStudentExemptionFilterSql("mar.event_id", "ml.year_level_key", college)}
   ), masterlist_override_events AS MATERIALIZED (
-    SELECT correction.school_year_id, correction.event_id, ml.student_number_key, ${college} AS college_key
+    SELECT correction.school_year_id, correction.event_id, ml.student_number_key, correction.student_key, ${college} AS college_key
     FROM attendance_student_event_overrides correction
     JOIN student_masterlist ml ON ml.school_year_id = correction.school_year_id
       AND ml.student_number_key = public.masterlist_student_number_key(correction.student_key)
@@ -8457,8 +8465,9 @@ function masterlistRefreshDenominator(parameter: string) {
       AND NULLIF(TRIM(source.student_id), '') IS NOT NULL
       AND ${getStudentEventOverrideExclusionSql("source.school_year_id", "source.student_id", "source.event_id")}
     UNION
-    SELECT school_year_id, event_id, LOWER(student_number_key) FROM masterlist_override_events
-    WHERE student_number_key = ANY(${parameter}::text[])
+    SELECT correction.school_year_id, correction.event_id, LOWER(correction.student_number_key) FROM masterlist_override_events correction
+    WHERE correction.student_number_key = ANY(${parameter}::text[])
+      AND ${getStudentEventOverrideExclusionSql("correction.school_year_id", "correction.student_key", "correction.event_id")}
   )`;
 }
 
@@ -8560,6 +8569,48 @@ export function selectExpectedEventGroupRepairTargets(
       studentCount: matching.length,
     };
   });
+}
+
+function overrideOnlyAttendanceRecordsSql(batchParam?: string, fullScope = "TRUE") {
+  return `override_only_records AS (
+    SELECT correction.school_year_id,
+      ${scopedAttendanceStudentKeySql("COALESCE(profile.student_id, approval.student_id, correction.student_key)", "correction.school_year_id")} AS normalized_student_id,
+      COALESCE(profile.student_id, approval.student_id, correction.student_key) AS student_id,
+      COALESCE(NULLIF(TRIM(profile.name), ''), approval.name, correction.student_key) AS name,
+      COALESCE(NULLIF(TRIM(profile.year_level), ''), approval.year_level) AS year_level,
+      COALESCE(NULLIF(TRIM(profile.college), ''), approval.college) AS college,
+      COALESCE(NULLIF(TRIM(profile.program), ''), approval.program) AS program,
+      COALESCE(NULLIF(TRIM(profile.institution), ''), approval.institution) AS institution,
+      ${getCanonicalCollegeKeySql("resolved_profile", "resolved_profile")} AS college_key,
+      correction.event_id, 0::int AS no_of_absences,
+      LEAST(correction.updated_at, NOW()) AS scanned_at, correction.updated_at
+    FROM attendance_student_event_overrides correction
+    LEFT JOIN LATERAL (
+      SELECT s.* FROM students s
+      WHERE ${attendanceStudentIdsEqualSql("s.student_id", "correction.student_key")}
+      ORDER BY s.updated_at DESC, s.created_at DESC, s.id DESC LIMIT 1
+    ) profile ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT ar.* FROM attendance_requests ar
+      WHERE ar.school_year_id = correction.school_year_id AND ar.status = 'approved' AND ar.request_type = 'event_review'
+        AND ${attendanceStudentIdsEqualSql("ar.student_id", "correction.student_key")}
+      ORDER BY COALESCE(ar.reviewed_at, ar.updated_at) DESC, ar.id DESC LIMIT 1
+    ) approval ON TRUE
+    CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(TRIM(profile.college), ''), approval.college) AS college) resolved_profile
+    WHERE ${fullScope} AND (correction.attended = TRUE OR approval.id IS NOT NULL)
+      AND ($1::uuid IS NULL OR correction.school_year_id = $1::uuid)
+      ${masterlistRefreshFilter("correction", batchParam, "student_key")}
+      AND NOT ${hasMasterlistScopeSql("correction.school_year_id")}
+      AND (profile.student_id IS NOT NULL OR approval.student_id IS NOT NULL)
+      AND ${getEventStudentExemptionFilterSql("correction.event_id", getYearLevelKeySql("COALESCE(NULLIF(TRIM(profile.year_level), ''), approval.year_level)"), getCanonicalCollegeKeySql("resolved_profile", "resolved_profile"))}
+      AND NOT EXISTS (SELECT 1 FROM all_imported_records source
+        WHERE source.school_year_id = correction.school_year_id AND ${attendanceStudentIdsEqualSql("source.student_id", "correction.student_key")})
+      AND NOT EXISTS (SELECT 1 FROM manual_sources source
+        WHERE source.school_year_id = correction.school_year_id AND ${attendanceStudentIdsEqualSql("source.student_id", "correction.student_key")})
+  ), all_manual_records AS (
+    SELECT * FROM manual_sources
+    UNION ALL SELECT * FROM override_only_records
+  )`;
 }
 
 export async function refreshCalculationResultsWithClient(
@@ -8677,7 +8728,7 @@ export async function refreshCalculationResultsWithClient(
         WHERE ${getAttendanceRecordVisibilitySql("ar")} AND ${resolvedAttendanceSourceSql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
           ${masterlistRefreshFilter("ar", batchParam)}
-      ), all_manual_records AS (
+      ), manual_sources AS (
         SELECT
           mar.school_year_id,
           ${scopedAttendanceStudentKeySql("mar.student_id", "mar.school_year_id")} AS normalized_student_id,
@@ -8728,7 +8779,7 @@ export async function refreshCalculationResultsWithClient(
               getCanonicalCollegeKeySql("mar", "s"),
             )}
           )
-      ), imported_totals AS (
+      ), ${overrideOnlyAttendanceRecordsSql(batchParam, "$8::boolean")}, imported_totals AS (
         SELECT
           school_year_id,
           normalized_student_id,
@@ -8770,6 +8821,8 @@ export async function refreshCalculationResultsWithClient(
         SELECT school_year_id, normalized_student_id FROM selected_imported_records
         UNION
         SELECT school_year_id, normalized_student_id FROM selected_manual_records
+        UNION
+        SELECT school_year_id, normalized_student_id FROM override_only_records
         UNION
         SELECT m.school_year_id, m.normalized_student_id FROM masterlist_students m
         WHERE NOT EXISTS (
@@ -8903,7 +8956,10 @@ export async function refreshCalculationResultsWithClient(
           ) AS latest_scanned_at,
           GREATEST(
             COALESCE(imported.source_updated_at, '-infinity'::timestamptz),
-            COALESCE(manual.source_updated_at, '-infinity'::timestamptz)
+            COALESCE(manual.source_updated_at, '-infinity'::timestamptz),
+            COALESCE((SELECT MAX(o.updated_at) FROM attendance_student_event_overrides o
+              WHERE o.school_year_id = keys.school_year_id
+                AND ${attendanceStudentIdsEqualSql("o.student_key", "keys.normalized_student_id")}), '-infinity'::timestamptz)
           ) AS source_updated_at
         FROM selected_student_keys keys
         LEFT JOIN imported_totals imported
@@ -10700,7 +10756,7 @@ export async function refreshAttendanceFinalResultsWithClient(
         WHERE ${getAttendanceRecordVisibilitySql("ar")} AND ${resolvedAttendanceSourceSql("ar")}
           AND ($1::uuid IS NULL OR ar.school_year_id = $1::uuid)
           ${masterlistRefreshFilter("ar", batchParam)}
-      ), all_manual_records AS (
+      ), manual_sources AS (
         SELECT
           mar.school_year_id,
           ${scopedAttendanceStudentKeySql("mar.student_id", "mar.school_year_id")} AS normalized_student_id,
@@ -10751,7 +10807,7 @@ export async function refreshAttendanceFinalResultsWithClient(
               getCanonicalCollegeKeySql("mar", "s"),
             )}
           )
-      ), imported_totals AS (
+      ), ${overrideOnlyAttendanceRecordsSql(batchParam, "TRUE")}, imported_totals AS (
         SELECT
           school_year_id,
           normalized_student_id,
@@ -10900,7 +10956,10 @@ export async function refreshAttendanceFinalResultsWithClient(
           ) AS latest_scanned_at,
           GREATEST(
             COALESCE(imported.source_updated_at, '-infinity'::timestamptz),
-            COALESCE(manual.source_updated_at, '-infinity'::timestamptz)
+            COALESCE(manual.source_updated_at, '-infinity'::timestamptz),
+            COALESCE((SELECT MAX(o.updated_at) FROM attendance_student_event_overrides o
+              WHERE o.school_year_id = keys.school_year_id
+                AND ${attendanceStudentIdsEqualSql("o.student_key", "keys.normalized_student_id")}), '-infinity'::timestamptz)
           ) AS source_updated_at
         FROM student_keys keys
         LEFT JOIN imported_totals imported
@@ -11972,18 +12031,24 @@ export async function writeStudentEventAttendancesWithClient(
 
   emitProgress("saving_override", 42, `All ${label} checked. Saving corrections together without modifying uploads.`);
   const saved = await client.query<{ event_id: string }>(
-    `INSERT INTO attendance_student_event_overrides AS existing
-       (school_year_id, student_key, event_id, attended, updated_by)
-     SELECT $1::uuid, LOWER(TRIM($2::text)), updates.event_id, updates.attended, $5::uuid
-     FROM UNNEST($3::uuid[], $4::boolean[]) AS updates(event_id, attended)
-     WHERE TRUE
-     ON CONFLICT (school_year_id, student_key, event_id)
-     DO UPDATE SET
-       attended = EXCLUDED.attended,
-       updated_by = EXCLUDED.updated_by,
-       updated_at = NOW()
-     WHERE existing.attended IS DISTINCT FROM EXCLUDED.attended
-     RETURNING event_id`,
+    `WITH updates AS (
+       SELECT * FROM UNNEST($3::uuid[], $4::boolean[]) AS requested(event_id, attended)
+     ), changed AS (
+       UPDATE attendance_student_event_overrides o
+       SET attended = updates.attended, updated_by = $5::uuid, updated_at = NOW()
+       FROM updates WHERE o.school_year_id = $1::uuid AND o.event_id = updates.event_id
+         AND ${attendanceStudentIdsEqualSql("o.student_key", "$2::text")}
+         AND o.attended IS DISTINCT FROM updates.attended
+       RETURNING o.event_id
+     ), inserted AS (
+       INSERT INTO attendance_student_event_overrides
+         (school_year_id, student_key, event_id, attended, updated_by)
+       SELECT $1::uuid, ${attendanceStudentKeySql("$2::text")}, updates.event_id, updates.attended, $5::uuid
+       FROM updates WHERE NOT EXISTS (SELECT 1 FROM attendance_student_event_overrides o
+         WHERE o.school_year_id = $1::uuid AND o.event_id = updates.event_id
+           AND ${attendanceStudentIdsEqualSql("o.student_key", "$2::text")})
+       RETURNING event_id
+     ) SELECT event_id FROM changed UNION SELECT event_id FROM inserted`,
     [student.school_year_id, student.student_id, eventIds, attendedStatuses, updatedBy ?? null],
   );
   const updatedEventIds = new Set(saved.rows.map((row) => row.event_id.toLowerCase()));
@@ -12028,7 +12093,7 @@ export async function planStudentEventRefreshKeys(
       ) AS unchanged`, [schoolYearId, studentId, removed]);
     if (!rows[0]?.unchanged) return prepareMasterlistDerivedRefresh(client, schoolYearId, false);
   }
-  return [normalizeStudentNumberKey(studentId)];
+  return planScopedStudentRefreshKeys(client, schoolYearId, [studentId]);
 }
 
 // Request approvals cannot introduce a new college event (requestable events are
@@ -12039,8 +12104,16 @@ export async function planScopedStudentRefreshKeys(
   studentIds: string[],
 ): Promise<string[] | null> {
   if (!(await isMasterlistDerivedRefreshScope(client, schoolYearId))) return null;
-  const keys = Array.from(new Set(studentIds.map((id) => normalizeStudentNumberKey(id)).filter(Boolean))).sort();
-  return keys.length ? keys : null;
+  const attendanceKeys = [...new Set(studentIds.map(normalizeAttendanceStudentKey).filter(Boolean))];
+  if (!attendanceKeys.length) return null;
+  // The batched refresh queries use the indexed, uppercase masterlist key.
+  // Translate from the attendance key explicitly using the SQL implementation.
+  const { rows } = await client.query<{ student_key: string }>(`
+    SELECT DISTINCT public.masterlist_student_number_key(student_id) AS student_key
+    FROM unnest($1::text[]) AS requested(student_id)
+    WHERE public.masterlist_student_number_key(student_id) <> ''
+    ORDER BY student_key`, [attendanceKeys]);
+  return rows.length ? rows.map((row) => row.student_key) : null;
 }
 
 export async function isMasterlistDerivedRefreshScope(client: PoolClient, schoolYearId: string) {
@@ -12217,19 +12290,13 @@ export async function listAttendanceFinalResults(
         else if (resolution.status === "unmatched") return [];
       } finally { if (!client) lookupClient.release(); }
     }
-    params.push(studentId);
-    if (/^TC-\d{2}-[A-Z]-\d{5}$/.test(normalizeStudentNumberKey(studentId))) {
-      clauses.push(`public.masterlist_student_number_key(afr.student_id) = public.masterlist_student_number_key($${params.length}::text)`);
-    } else {
-      clauses.push(`LOWER(TRIM(afr.student_id)) = LOWER(TRIM($${params.length}::text))`);
-    }
+    params.push(normalizeAttendanceStudentKey(studentId));
+    clauses.push(`${attendanceStudentKeySql("afr.student_id")} = $${params.length}::text`);
   }
 
   if (options.studentKeys !== undefined) {
-    params.push(options.studentKeys);
-    clauses.push(`(CASE WHEN ${hasMasterlistScopeSql("afr.school_year_id")}
-      THEN LOWER(public.masterlist_student_number_key(afr.student_id)) = ANY(ARRAY(SELECT LOWER(public.masterlist_student_number_key(requested_key)) FROM unnest($${params.length}::text[]) AS requested_key))
-      ELSE public.masterlist_student_number_key(afr.student_id) = ANY($${params.length}::text[]) END)`);
+    params.push(options.studentKeys.map(normalizeAttendanceStudentKey));
+    clauses.push(`${attendanceStudentKeySql("afr.student_id")} = ANY($${params.length}::text[])`);
   }
 
   if (options.college) {
@@ -12309,10 +12376,13 @@ export async function listAttendanceFinalResults(
         ) AS missed_events
         FROM event_roster_scope roster
         JOIN attendance_events expected_event ON expected_event.id = roster.event_id
-        LEFT JOIN attendance_student_event_overrides correction
-          ON correction.school_year_id IS NOT DISTINCT FROM afr.school_year_id
-         AND ${attendanceStudentIdsEqualSql("correction.student_key", "afr.student_id")}
-         AND correction.event_id = roster.event_id
+        LEFT JOIN LATERAL (
+          SELECT o.* FROM attendance_student_event_overrides o
+          WHERE o.school_year_id IS NOT DISTINCT FROM afr.school_year_id
+            AND ${attendanceStudentIdsEqualSql("o.student_key", "afr.student_id")}
+            AND o.event_id = roster.event_id
+          ORDER BY o.attended ASC, o.updated_at DESC, o.id DESC LIMIT 1
+        ) correction ON TRUE
         WHERE roster.school_year_id IS NOT DISTINCT FROM afr.school_year_id
           AND roster.college_key = afr.college_key
           AND ${getEventYearLevelExemptionFilterSql(
@@ -12429,10 +12499,13 @@ export async function listAttendanceFinalResults(
             getResolvedStudentYearLevelKeySql("afr.student_id", "afr.school_year_id"),
             "afr.college_key",
           )}
-        LEFT JOIN attendance_student_event_overrides correction
-          ON correction.school_year_id ${schoolYearParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
-         AND ${attendanceStudentIdsEqualSql("correction.student_key", "afr.student_id")}
-         AND correction.event_id = roster.event_id
+        LEFT JOIN LATERAL (
+          SELECT o.* FROM attendance_student_event_overrides o
+          WHERE o.school_year_id ${schoolYearParam ? `= ${schoolYearParam}::uuid` : "IS NOT DISTINCT FROM afr.school_year_id"}
+            AND ${attendanceStudentIdsEqualSql("o.student_key", "afr.student_id")}
+            AND o.event_id = roster.event_id
+          ORDER BY o.attended ASC, o.updated_at DESC, o.id DESC LIMIT 1
+        ) correction ON TRUE
         LEFT JOIN LATERAL (
           SELECT source_record.source,
                  source_record.record_id,
@@ -12522,10 +12595,8 @@ export async function listManualAttendanceRecords(
   }
 
   if (options.studentId) {
-    params.push(options.studentId);
-    clauses.push(
-      /^TC-\d{2}-[A-Z]-\d{5}$/.test(normalizeStudentNumberKey(options.studentId)) ? `public.masterlist_student_number_key(mar.student_id) = public.masterlist_student_number_key($${params.length}::text)` : `LOWER(TRIM(mar.student_id)) = LOWER(TRIM($${params.length}))`,
-    );
+    params.push(normalizeAttendanceStudentKey(options.studentId));
+    clauses.push(`${attendanceStudentKeySql("mar.student_id")} = $${params.length}::text`);
   }
 
   if (options.college) {
