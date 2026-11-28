@@ -14,7 +14,7 @@ const EVENT_REFRESH_BATCH_SIZE = 50;
 const EVENT_REFRESH_PHASES = ["refresh_final_results", "refresh_calculations", "refresh_penalties"];
 type EventRefreshCursor = { scopeIndex?:number; offset?:number; refreshBatchSize?:number };
 export function smallerEventRefreshCursor(job: MaintenanceJob) {
-  if (!["final_result_event_batch", "attendance_import_save"].includes(job.kind) || !EVENT_REFRESH_PHASES.includes(job.phase)) return null;
+  if (!["final_result_event_batch", "attendance_import_save", "request_group_review"].includes(job.kind) || !EVENT_REFRESH_PHASES.includes(job.phase)) return null;
   const state = job.state as State;
   const cursor = job.cursor as EventRefreshCursor;
   const remaining = (state.refreshKeys?.length ?? 0) - (state.refreshOffset ?? 0);
@@ -111,7 +111,7 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
         state.offset+=chunk.length;
         percent=25+25*(ids.length ? state.offset/ids.length : 1);message=`Absences synchronized: ${state.offset} / ${ids.length}`;
         if(state.offset>=ids.length){if(scope.skipRefresh){state.scopeIndex++;state.offset=0;phase=state.scopeIndex<state.scopes.length?"sync_absences":"finalize";}else phase="refresh_final_results";}
-      } else if(["final_result_event_batch", "attendance_import_save"].includes(kind) && schoolYearId && EVENT_REFRESH_PHASES.includes(phase) && state.refreshKeys !== null) {
+      } else if(["final_result_event_batch", "attendance_import_save", "request_group_review"].includes(kind) && schoolYearId && EVENT_REFRESH_PHASES.includes(phase) && state.refreshKeys !== null) {
         const final=phase === "refresh_final_results";
         const calculations=phase === "refresh_calculations";
         const start=final?50:calculations?65:80;
@@ -126,7 +126,7 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
             delete state.refreshPlanPending;
           } else {
             state.refreshKeys=await isMasterlistDerivedRefreshScope(client,schoolYearId)
-              ? await prepareMasterlistDerivedRefresh(client,schoolYearId,kind === "attendance_import_save") : null;
+              ? await prepareMasterlistDerivedRefresh(client,schoolYearId,["attendance_import_save","request_group_review"].includes(kind)) : null;
           }
           state.refreshOffset=0;
           message=state.refreshKeys === null ? "Preparing legacy attendance refresh." : `Preparing ${label}: ${state.refreshKeys.length} students.`;
@@ -147,7 +147,7 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
           } else {
             if(final || calculations) await finishMasterlistDerivedRefresh(client,schoolYearId,final?"attendance_final_results":"calculation_results");
             phase=final?"refresh_calculations":calculations?"refresh_penalties":"finalize";
-            if (!final && !calculations && kind === "attendance_import_save") {
+            if (!final && !calculations && ["attendance_import_save","request_group_review"].includes(kind)) {
               state.scopeIndex++; state.offset=0;
               delete state.refreshKeys;
               phase=state.scopeIndex<state.scopes.length?"sync_absences":"finalize";
@@ -168,7 +168,7 @@ export function attendanceMaintenanceHandler(kind:string):JobHandler {
         state.scopeIndex++;state.offset=0;delete state.refreshKeys;delete state.refreshOffset;phase=state.scopeIndex<state.scopes.length?"sync_absences":"finalize";percent=95;message="Penalties refreshed.";
       } else throw validation("Invalid maintenance checkpoint.");
     }
-    const refreshCursor=["final_result_event_batch", "attendance_import_save"].includes(kind) && phase===job.phase ? {refreshBatchSize:(job.cursor as EventRefreshCursor).refreshBatchSize} : {};
+    const refreshCursor=["final_result_event_batch", "attendance_import_save", "request_group_review"].includes(kind) && phase===job.phase ? {refreshBatchSize:(job.cursor as EventRefreshCursor).refreshBatchSize} : {};
     return {done,phase,cursor:{scopeIndex:state.scopeIndex,offset:state.offset,...refreshCursor},state,processed:state.refreshOffset??state.offset,total:state.refreshKeys?.length??state.scopes[state.scopeIndex]?.studentIds?.length??0,percent,message,result:done?state.result:undefined};
   }};
 }

@@ -133,7 +133,13 @@ export async function runJob(id: string, onProgress?: (progress: JobProgress) =>
     catch (checkpointError) { console.error(`[maintenance-job ${id}] Unable to save failure`,checkpointError); }
     const raw = error as {statusCode?:number;expose?:boolean;code?:string};
     if(raw?.expose && raw.statusCode && raw.statusCode<500) throw error;
-    throw bad(`${message} Resume the job to continue.`,503);
+    const dbCode = typeof raw?.code === "string" ? raw.code : undefined;
+    const primaryCommitted = !["queued","primary"].includes(job.phase);
+    throw Object.assign(new Error(message), {
+      statusCode: 503, expose: true,
+      code: primaryCommitted ? "MAINTENANCE_RESUME_REQUIRED" : (dbCode ?? "MAINTENANCE_JOB_FAILED"),
+      dbCode, jobId: id, primaryCommitted,
+    });
   }
 }
 export async function cancelJob(id: string) {

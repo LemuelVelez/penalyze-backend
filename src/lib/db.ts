@@ -101,6 +101,9 @@ if (sslMode === "disable") {
   poolConnectionString = url.toString();
 }
 
+// Maintenance job statement timeout; keep below the 5-minute stale-heartbeat window.
+const jobStatementTimeoutMs = 270000;
+
 const poolOptions = {
   connectionString: poolConnectionString,
   ssl: sslMode === "verify-full" ? { rejectUnauthorized: true } : false as const,
@@ -111,7 +114,7 @@ const poolOptions = {
 };
 
 export const pool = new Pool(poolOptions);
-export const jobPool = new Pool({ ...poolOptions, max: 2, statement_timeout: 180000 });
+export const jobPool = new Pool({ ...poolOptions, max: 2, statement_timeout: jobStatementTimeoutMs });
 jobPool.on("error", error => console.error("Unexpected PostgreSQL job pool error:", error));
 
 pool.on("error", (error) => {
@@ -217,7 +220,7 @@ async function transaction<T>(handler: (client: PoolClient) => Promise<T>, dedic
       client = await retryTemporaryDnsFailure(() => (dedicated ? jobPool : pool).connect());
       await client.query("BEGIN");
       if (dedicated) {
-        await client.query("SET LOCAL statement_timeout = '180s'");
+        await client.query("SELECT set_config('statement_timeout', $1, true)", [`${jobStatementTimeoutMs}ms`]);
         await client.query("SET LOCAL lock_timeout = '5s'");
       } else await applyTransactionTimeouts(client);
 

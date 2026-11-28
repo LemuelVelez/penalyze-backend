@@ -138,7 +138,7 @@ export async function requests(
 }
 
 function sendReviewFailure(res: Response, error: unknown, fallback: string, stage?: string) {
-  const raw = error as { statusCode?: number; message?: string; code?: string; expose?: boolean } | null;
+  const raw = error as { statusCode?: number; message?: string; code?: string; expose?: boolean; dbCode?: string; primaryCommitted?: boolean } | null;
   const expected = raw?.expose === true && (!raw.code || raw.code === "MASTERLIST_ACTIVE") &&
     [400, 401, 403, 404, 409, 422].includes(raw.statusCode ?? 0) &&
     typeof raw.message === "string";
@@ -148,16 +148,20 @@ function sendReviewFailure(res: Response, error: unknown, fallback: string, stag
   if (!expected) {
     requestId = randomUUID();
     const code = raw?.code ?? "";
-    if (code === "ATTENDANCE_REVIEW_LOCK_TIMEOUT") {
+    const dbCode = raw?.dbCode ?? code;
+    if (code === "MAINTENANCE_RESUME_REQUIRED") {
+      status = 503;
+      message = `The approval was saved, but recalculating attendance results stopped${raw?.dbCode ? ` (database code ${raw.dbCode})` : ""}. Press Resume on the "Attendance request review" banner to finish. Do not cancel the saved operation.`;
+    } else if (dbCode === "ATTENDANCE_REVIEW_LOCK_TIMEOUT") {
       status = 503;
       message = "Another attendance operation still holds the database lock. This approval was not saved. Finish the ongoing import, masterlist reconciliation, or other attendance update before retrying.";
-    } else if (code === "55P03") {
+    } else if (dbCode === "55P03") {
       status = 503;
       message = "A database lock blocked the approval. No changes were saved. Finish the other attendance operation before trying again.";
-    } else if (["40P01", "40001", "53300", "57P03"].includes(code)) {
+    } else if (["40P01", "40001", "53300", "57P03"].includes(dbCode)) {
       status = 503;
       message = "Attendance processing is busy. Refresh the request list and try again shortly.";
-    } else if (code === "57014") {
+    } else if (dbCode === "57014") {
       status = 503;
       message = "Attendance processing exceeded its time limit. Refresh the request list before trying again.";
     }
@@ -170,11 +174,11 @@ function sendReviewFailure(res: Response, error: unknown, fallback: string, stag
   }
   if (res.destroyed || res.writableEnded) return;
   if (res.headersSent) {
-    writeProgressStreamMessage(res, { type: "error", message, ...(raw?.code === "MASTERLIST_ACTIVE" ? { code: raw.code } : {}) });
+    writeProgressStreamMessage(res, { type: "error", message, ...(raw?.code === "MASTERLIST_ACTIVE" || raw?.code === "MAINTENANCE_RESUME_REQUIRED" ? { code: raw.code } : {}) });
     res.end();
   } else {
     if (requestId) res.setHeader("X-Request-ID", requestId);
-    res.status(status).json({ message, ...(requestId ? { requestId } : {}), ...(raw?.code === "MASTERLIST_ACTIVE" ? { code: raw.code } : {}) });
+    res.status(status).json({ message, ...(requestId ? { requestId } : {}), ...(raw?.code === "MASTERLIST_ACTIVE" || raw?.code === "MAINTENANCE_RESUME_REQUIRED" ? { code: raw.code } : {}) });
   }
 }
 
